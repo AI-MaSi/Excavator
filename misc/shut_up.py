@@ -6,7 +6,7 @@
 from adafruit_servokit import ServoKit
 import sys
 
-sys.path.append('/home/pi/Masi_project_files/main/')
+sys.path.append('/home/pi/GitHub/Excavator/main')
 
 from config import CHANNEL_CONFIGS, center_val_servo
 
