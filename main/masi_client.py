@@ -171,10 +171,12 @@ def client_function(server_address, inputs, outputs):
 
     finally:
         # save_remaining_data()
+        controller.reset()
         client_socket.close()
 
 
 def main():
+    controller.reset()
     server_address = (host, port)
     print(f"\nConnecting to: {server_address}...")
 
