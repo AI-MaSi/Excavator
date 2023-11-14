@@ -32,7 +32,7 @@ image = Image.new("1", (width, height))
 
 # Get drawing object to draw on image.
 draw = ImageDraw.Draw(image)
-font_path = '/home/pi/Masi_project_files/misc_scripts/show_ip/Montserrat-VariableFont_wght.ttf'
+font_path = '/home/pi/GitHub/Excavator/misc/show_ip/Montserrat-VariableFont_wght.ttf'
 font_size = 11
 font_size_ip = 19
 
