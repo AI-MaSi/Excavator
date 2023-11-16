@@ -12,13 +12,14 @@ from config import host, port, inputs, outputs, multiplexer_channels
 import masi_driver
 import imu_sensor_manager
 
-controller = masi_driver.ExcavatorController(simulation_mode=False)
+controller = masi_driver.ExcavatorController(simulation_mode=True)
 imu_manager = imu_sensor_manager.IMUSensorManager(multiplexer_channels, simulation_mode=True)
 
 delay = 0.00
 data_save_lock = threading.Lock()
 data_buffer = []
 BUFFER_SIZE = 10
+expected_sequence_number = 0
 file_name = "../logging/masi_data.bin"
 
 
@@ -30,6 +31,7 @@ def compute_checksum(data):
 
 
 def receive_data(client_socket, num_inputs, data_type='<d'):
+    global expected_sequence_number
     sequence_bytes = struct.calcsize('<I')  # bytes for sequence number
     checksum_bytes = struct.calcsize('<B')  # bytes for checksum
 
@@ -42,25 +44,23 @@ def receive_data(client_socket, num_inputs, data_type='<d'):
 
     # Extract and validate sequence number
     sequence_received, = struct.unpack('<I', full_data[:sequence_bytes])
+    print(f"\nReceived sequence number: {sequence_received}")
 
-    # sequence check here
-
-    # print(f"\nReceived sequence number: {sequence_received}")
-
-    # Extract and validate checksum
-    received_checksum, = struct.unpack('<B', full_data[-checksum_bytes:])
-    computed_checksum = compute_checksum(full_data[:-checksum_bytes])
-
-    if received_checksum != computed_checksum:
-        print("Checksum mismatch!")
+    # Check if the received sequence number matches the expected sequence number
+    if sequence_received != expected_sequence_number:
+        print(f"Sequence number mismatch! Expected: {expected_sequence_number}, Received: {sequence_received}")
+        # Handle the sequence number mismatch here (e.g., log, discard packet, etc.)
+        # Optionally adjust the expected_sequence_number if necessary
         return None
+
+    # Increment the expected sequence number for the next packet
+    expected_sequence_number = (expected_sequence_number + 1) % (2**32)  # Wrap around at 2^32
 
     decoded_values = [round(struct.unpack(data_type, chunk)[0], 2)
                       for chunk in (full_data[sequence_bytes + i:sequence_bytes + i + struct.calcsize(data_type)]
                                     for i in range(0, len(full_data) - sequence_bytes - checksum_bytes,
                                                    struct.calcsize(data_type)))]
     return decoded_values
-
 
 def send_keep_alive(client_socket):
     try:
