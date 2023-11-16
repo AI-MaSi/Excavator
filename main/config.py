@@ -2,7 +2,8 @@
 # shut_up.py also uses this at the startup
 
 # masi_client.py
-host = '10.214.5.110'
+# host = '10.214.5.110'
+host = '127.0.0.1'
 port = 5111
 inputs = 20
 outputs = 0

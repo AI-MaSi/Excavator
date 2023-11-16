@@ -24,6 +24,7 @@ class IMUSensorManager:
     def __init__(self, multiplexer_channels=range(8), tca_address=0x71, bno08x_address=0x4a, simulation_mode=False):
         self.simulation_mode = simulation_mode
         self.multiplexer_channels = multiplexer_channels
+        self.bno08x = None
 
         if not self.simulation_mode and IMU_DRIVERS_AVAILABLE:
             self.i2c = board.I2C()
@@ -41,7 +42,7 @@ class IMUSensorManager:
                 self.sensors[channel] = ISM330DHCX(self.tca[channel])
                 print(f"ISM330DHCX on channel {channel} initialized.")
             except Exception as e:
-                print(f"An error occurred while initializing the sensor on channel {channel}: {e}")
+                raise ISM330InitializationError(f"Error initializing ISM330DHCX on channel {channel}: {e}")
 
     def initialize_bno08(self, address):
         try:
@@ -52,13 +53,12 @@ class IMUSensorManager:
             self.bno08x.enable_feature(BNO_REPORT_ROTATION_VECTOR)
             print(f"BNO08x sensor initialized.")
         except Exception as e:
-            print(f"An error occurred while initializing the BNO08x sensor: {e}")
-
-    def pack_data(self, data):
+            raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
+    @staticmethod
+    def pack_data(data):
         # little endian, doubles. Because Mevea.
         format_str = '<' + 'd' * len(data)
         return struct.pack(format_str, *data)
-
 
     # not tested
     def read_all_and_pack(self):
@@ -85,11 +85,9 @@ class IMUSensorManager:
                 data = accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
 
             except Exception as e:
-                print(f"An error occurred while reading from channel {channel}: {e}")
-                data = None
-
+                raise ISM330ReadError(f"Error reading from ISM330DHCX on channel {channel}: {e}")
         else:
-            data = None
+            raise ISM330ReadError("ISM330DHCX drivers are not available or simulation mode is not enabled.")
 
         return self.pack_data(data) if pack else data
 
@@ -114,14 +112,14 @@ class IMUSensorManager:
                 data = (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
                         mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
 
-            except Exception as e:
-                print(f"An error occurred while reading: {e}")
-                data = None
 
+            except Exception as e:
+                raise BNO08xReadError("Error reading from BNO08x sensor: {e}")
         else:
-            data = None
+            raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
 
         return self.pack_data(data) if pack else data
+
 
 '''
 print("Acceleration:")
@@ -146,3 +144,15 @@ print("Acceleration:")
      )
     print("")
      '''
+
+class ISM330InitializationError(Exception):
+    pass
+
+class ISM330ReadError(Exception):
+    pass
+
+class BNO08xInitializationError(Exception):
+    pass
+
+class BNO08xReadError(Exception):
+    pass
