@@ -1,12 +1,31 @@
 # here you can set some values for the masi_client.py and masi_driver.py script
 # shut_up.py also uses this at the startup
 
-# masi_client.py
+
 # host = '10.214.5.110'
-host = '127.0.0.1'
+local_addr = '127.0.0.1'
+connect_addr = '127.0.0.1'
 port = 5111
+identification_number = 0 # 0 excavator, 1 Mevea, 2 Motion Platform
 inputs = 20
 outputs = 0
+
+# '<QI20DB'
+# '<'  Little-endian
+endian_specifier = '<'
+# 'Q' 8 byte integer (UNIX-timestamp)
+unix_format = 'Q'
+# 'I'  Unsigned int (sequence number) 4 bytes
+sequence_format = 'I'
+# 'i' Signed int (handshake) 4 bytes
+handshake_format = 'i'
+# 'd'  doubles (data) 8 bytes
+data_format = 'd'
+# 'B'  Unsigned char (checksum) 1 byte
+checksum_format = 'B'
+
+file_path = "log/example_data.bin"
+BUFFER_SIZE = 10
 
 # ISM330 IMU's use these multiplexer channels
 multiplexer_channels = [1, 2, 3]

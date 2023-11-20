@@ -1,7 +1,6 @@
-
-from time import sleep
 import random
-import struct
+# import struct
+# drom time import sleep
 
 try:
     import board
@@ -14,25 +13,33 @@ try:
         BNO_REPORT_MAGNETOMETER,
         BNO_REPORT_ROTATION_VECTOR,
     )
-    IMU_DRIVERS_AVAILABLE = True
+    IMU_MODULES_AVAILABLE = True
 except ImportError:
-    IMU_DRIVERS_AVAILABLE = False
+    IMU_MODULES_AVAILABLE = False
 
+
+bno_features = [
+                "BNO_REPORT_ACCELEROMETER",
+                "BNO_REPORT_GYROSCOPE",
+                "BNO_REPORT_MAGNETOMETER",
+                "BNO_REPORT_ROTATION_VECTOR"
+            ]
 
 class IMUSensorManager:
-
     def __init__(self, multiplexer_channels=range(8), tca_address=0x71, bno08x_address=0x4a, simulation_mode=False):
         self.simulation_mode = simulation_mode
         self.multiplexer_channels = multiplexer_channels
         self.bno08x = None
 
-        if not self.simulation_mode and IMU_DRIVERS_AVAILABLE:
-            self.i2c = board.I2C()
-            self.tca = adafruit_tca9548a.TCA9548A(self.i2c, address=tca_address)
-            self.sensors = {}
-            self.initialize_ism330(multiplexer_channels)
-            self.initialize_bno08(bno08x_address)
-
+        if not self.simulation_mode:
+            if IMU_MODULES_AVAILABLE:
+                self.i2c = board.I2C()
+                self.tca = adafruit_tca9548a.TCA9548A(self.i2c, address=tca_address)
+                self.sensors = {}
+                self.initialize_ism330(multiplexer_channels)
+                self.initialize_bno08(bno08x_address)
+            else:
+                raise IMUmodulesNotAvailableError("IMU-modules are not available but required for non-simulation mode.")
         elif self.simulation_mode:
             print("Simulation mode activated! Simulated sensor values will be used.")
 
@@ -47,53 +54,72 @@ class IMUSensorManager:
     def initialize_bno08(self, address):
         try:
             self.bno08x = BNO08X_I2C(self.i2c, address=address)
-            self.bno08x.enable_feature(BNO_REPORT_ACCELEROMETER)
-            self.bno08x.enable_feature(BNO_REPORT_GYROSCOPE)
-            self.bno08x.enable_feature(BNO_REPORT_MAGNETOMETER)
-            self.bno08x.enable_feature(BNO_REPORT_ROTATION_VECTOR)
+
+            # not tested
+            for feature in bno_features:
+                self.bno08x.enable_feature(feature)
             print(f"BNO08x sensor initialized.")
+            # find right exception
         except Exception as e:
             raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
-    @staticmethod
-    def pack_data(data):
+
+    # @staticmethod
+    # def pack_data(data):
         # little endian, doubles. Because Mevea.
-        format_str = '<' + 'd' * len(data)
-        return struct.pack(format_str, *data)
+        # format_str = '<' + 'd' * len(data)
+        # return struct.pack(format_str, *data)
 
     # not tested
-    def read_all_and_pack(self):
-        all_ism330_data = bytearray()
-        for channel in self.multiplexer_channels:
-            ism330_data = self.read_ism330(channel, pack=True)
-            all_ism330_data.extend(ism330_data)
+    # def read_all_and_pack(self):
+        # all_ism330_data = bytearray()
+        # for channel in self.multiplexer_channels:
+            # ism330_data = self.read_ism330(channel, pack=True)
+            # all_ism330_data.extend(ism330_data)
 
-        bno08_data = self.read_bno08(pack=True)
-        return all_ism330_data + bno08_data
+       # bno08_data = self.read_bno08(pack=True)
+       # return all_ism330_data + bno08_data
 
-    def read_ism330(self, channel, pack=False):
+    def read_ism330(self, channel):
+        if not self.simulation_mode:
+            if IMU_MODULES_AVAILABLE:
+                try:
+                    sensor = self.sensors[channel]
+                    accel_x, accel_y, accel_z = sensor.acceleration
+                    gyro_x, gyro_y, gyro_z = sensor.gyro
+                    data = accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
 
-        if self.simulation_mode:
+                # adafruit sensor exception
+                except Exception as e:
+                    raise ISM330ReadError(f"Error reading from ISM330DHCX on channel {channel}: {e}")
+            else:
+                raise ISM330ReadError("ISM330DHCX drivers are not available or simulation mode is not enabled.")
+
+        else:
             accel_x, accel_y, accel_z = [random.uniform(0, 10) for _ in range(3)]
             gyro_x, gyro_y, gyro_z = [random.uniform(0, 10) for _ in range(3)]
             data = accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
 
-        elif not self.simulation_mode and IMU_DRIVERS_AVAILABLE:
-            try:
-                sensor = self.sensors[channel]
-                accel_x, accel_y, accel_z = sensor.acceleration
-                gyro_x, gyro_y, gyro_z = sensor.gyro
-                data = accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
+        #return self.pack_data(data) if pack else data
+        return data
 
-            except Exception as e:
-                raise ISM330ReadError(f"Error reading from ISM330DHCX on channel {channel}: {e}")
+    def read_bno08(self):
+
+        if not self.simulation_mode:
+            if IMU_MODULES_AVAILABLE:
+                try:
+                    accel_x, accel_y, accel_z = self.bno08x.acceleration  # pylint:disable=no-member
+                    gyro_x, gyro_y, gyro_z = self.bno08x.gyro  # pylint:disable=no-member
+                    mag_x, mag_y, mag_z = self.bno08x.magnetic  # pylint:disable=no-member
+                    quat_i, quat_j, quat_k, quat_real = self.bno08x.quaternion  # pylint:disable=no-member
+
+                    data = (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
+                            mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
+                #find specific exception
+                except Exception as e:
+                    raise BNO08xReadError("Error reading from BNO08x sensor: {e}")
+            else:
+                raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
         else:
-            raise ISM330ReadError("ISM330DHCX drivers are not available or simulation mode is not enabled.")
-
-        return self.pack_data(data) if pack else data
-
-    def read_bno08(self, pack=False):
-
-        if self.simulation_mode:
             accel_x, accel_y, accel_z = [random.uniform(0, 10) for _ in range(3)]
             gyro_x, gyro_y, gyro_z = [random.uniform(0, 10) for _ in range(3)]
             mag_x, mag_y, mag_z = [random.uniform(0, 10) for _ in range(3)]
@@ -102,23 +128,8 @@ class IMUSensorManager:
             data = (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
                     mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
 
-        elif not self.simulation_mode and IMU_DRIVERS_AVAILABLE:
-            try:
-                accel_x, accel_y, accel_z = self.bno08x.acceleration  # pylint:disable=no-member
-                gyro_x, gyro_y, gyro_z = self.bno08x.gyro  # pylint:disable=no-member
-                mag_x, mag_y, mag_z = self.bno08x.magnetic  # pylint:disable=no-member
-                quat_i, quat_j, quat_k, quat_real = self.bno08x.quaternion  # pylint:disable=no-member
-
-                data = (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
-                        mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
-
-
-            except Exception as e:
-                raise BNO08xReadError("Error reading from BNO08x sensor: {e}")
-        else:
-            raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
-
-        return self.pack_data(data) if pack else data
+        # return self.pack_data(data) if pack else data
+        return data
 
 
 '''
@@ -144,6 +155,9 @@ print("Acceleration:")
      )
     print("")
      '''
+
+class IMUmodulesNotAvailableError(Exception):
+    pass
 
 class ISM330InitializationError(Exception):
     pass
