@@ -66,6 +66,7 @@ def run_example():
         except Exception:
             # this is important!
             controller.reset()
+            return
 
 if __name__ == "__main__":
     setup_example()
