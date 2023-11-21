@@ -1,6 +1,7 @@
 import random
 # import struct
-# drom time import sleep
+
+from config import multiplexer_channels
 
 try:
     import board
@@ -63,21 +64,35 @@ class IMUSensorManager:
         except Exception as e:
             raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
 
-    # @staticmethod
-    # def pack_data(data):
+    """
+    @staticmethod
+    def pack_data(data):
         # little endian, doubles. Because Mevea.
-        # format_str = '<' + 'd' * len(data)
-        # return struct.pack(format_str, *data)
+        format_str = '<' + 'd' * len(data)
+        return struct.pack(format_str, *data)
+    """
+    def read_all(self):
+        # Combined data from all sensors
+        combined_data = []
 
-    # not tested
-    # def read_all_and_pack(self):
-        # all_ism330_data = bytearray()
-        # for channel in self.multiplexer_channels:
-            # ism330_data = self.read_ism330(channel, pack=True)
-            # all_ism330_data.extend(ism330_data)
+        # Read data from each ISM330 sensor
+        for channel in multiplexer_channels:
+            try:
+                ism330_data = self.read_ism330(channel)
+                combined_data.extend(ism330_data)  # extend assumes ism330_data is a tuple or list
+            except ISM330ReadError as e:
+                print(f"Failed to read from ISM330 sensor at channel {channel}: {e}")
+                # Optionally handle the error or re-raise it
 
-       # bno08_data = self.read_bno08(pack=True)
-       # return all_ism330_data + bno08_data
+        # Read data from the BNO08 sensor
+        try:
+            bno08_data = self.read_bno08()
+            combined_data.extend(bno08_data)
+        except BNO08xReadError as e:
+            print(f"Failed to read from BNO08 sensor: {e}")
+            # Optionally handle the error or re-raise it
+
+        return combined_data
 
     def read_ism330(self, channel):
         if not self.simulation_mode:
@@ -100,6 +115,7 @@ class IMUSensorManager:
             data = accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
 
         #return self.pack_data(data) if pack else data
+        # return list(data)
         return data
 
     def read_bno08(self):
@@ -129,6 +145,7 @@ class IMUSensorManager:
                     mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
 
         # return self.pack_data(data) if pack else data
+        # return list(data)
         return data
 
 

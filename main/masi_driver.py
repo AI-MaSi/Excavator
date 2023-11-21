@@ -24,12 +24,14 @@ class ExcavatorController:
         # self.channel_mapping = {config['input_channel']: output_channel for output_channel, config
             #                  in CHANNEL_CONFIGS.items() if config['type'] != 'none'}
 
-
-        if not self.simulation_mode and SERVOKIT_AVAILABLE:
-            self.kit = ServoKit(channels=16)
+        if not self.simulation_mode:
+            if SERVOKIT_AVAILABLE:
+                self.self.kit = ServoKit(channels=16)
+            else:
+                raise ServoKitNotAvailableError("ServoKit is not available but required for non-simulation mode.")
 
         elif self.simulation_mode:
-            print("Simulated values selected!")
+            print("Simulation mode activated! Simulated drive prints will be used.")
 
     def update_values(self, raw_values):
         if len(raw_values) != self.num_inputs:
@@ -83,7 +85,7 @@ class ExcavatorController:
         for channel_name, config in CHANNEL_CONFIGS.items():
             if config['type'] == 'angle':
                 value = config['offset'] + center_val_servo + (config['direction'] * values[config['output_channel']]
-                                                               * config['multiplier'])
+                                                            * config['multiplier'])
 
                 #if config['type'] == 'angle':
                 #print(channel_name,value)
@@ -111,3 +113,9 @@ class ExcavatorController:
 
         print("Reseted servos!")
         sleep(2)
+
+class ServoKitNotAvailableError(Exception):
+    pass
+
+class ServoKitWriteError(Exception):
+    pass

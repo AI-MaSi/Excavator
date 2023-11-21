@@ -10,13 +10,16 @@ identification_number = 0 # 0 excavator, 1 Mevea, 2 Motion Platform
 inputs = 20
 outputs = 0
 
+file_path = "log/example_data.bin"
+BUFFER_SIZE = 10
+
 # '<QI20DB'
 # '<'  Little-endian
 endian_specifier = '<'
 # 'Q' 8 byte integer (UNIX-timestamp)
 unix_format = 'Q'
-# 'I'  Unsigned int (sequence number) 4 bytes
-sequence_format = 'I'
+# REMOVED 'I'  Unsigned int (sequence number) 4 bytes
+# sequence_format = 'I'
 # 'i' Signed int (handshake) 4 bytes
 handshake_format = 'i'
 # 'd'  doubles (data) 8 bytes

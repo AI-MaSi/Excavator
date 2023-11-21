@@ -1,5 +1,6 @@
 import imu_sensor_manager
 import universal_socket_manager
+import masi_driver
 from time import sleep
 
 simulation_mode = True
@@ -11,47 +12,60 @@ except (imu_sensor_manager.BNO08xInitializationError, imu_sensor_manager.ISM330I
     imu_manager = None
     raise e
 
-try:
-    # init socket
-    manager = universal_socket_manager.MasiSocketManager()
-except Exception as e:
-    print("make exceptions!")
+# init socket
+manager = universal_socket_manager.MasiSocketManager()
+# exceptions soon...
+
+# init servo controller
+controller = masi_driver.ExcavatorController(simulation_mode=simulation_mode)
+
 
 
 def setup_example():
-    # these could be set in GUI
+    # these could be set in eg. GUI
     # manager.setup_socket(addr, port, client_type='server')
 
-    setup_result = manager.setup_socket(client_type='client')
+    setup_result = manager.setup_socket(socket_type='client')
     if not setup_result:
         print("could not setup socket!")
         sleep(3)
         return
-    print("starting handshake...")
-    sleep(2)
+
     handshake_result = manager.handshake()
     sleep(5)
     if not handshake_result:
-        print("could not setup socket!")
+        print("could not make handshake!")
         sleep(3)
         return
 
 
 def run_example():
-    # just set flags to True
-    manager.set_start_flag(True)
-    manager.set_record_flag(True)
-
     while True:
-        data_i_want_to_send = ''
-        # print(imu_manager.read_bno08())
-        manager.send_data(data_i_want_to_send)
+        try:
+            # I only want to send handshake
+            # outputs are set to 0, handshake is sent automatically
+            manager.send_data(data=None)
 
-        data_i_want_to_receive = manager.receive_data()
-        print(f"Received: {data_i_want_to_receive}")
+            # receive joystick values
+            data_i_want_to_receive = manager.receive_data()
 
-        sleep(1)
+            # use joystick values to control the excavator
+            controller.update_values(data_i_want_to_receive)
 
+            # get values from the sensors
+            data_i_want_to_save = imu_manager.read_all()
+            packed_data = manager.pack_data(data_i_want_to_save)
+            manager.add_data_to_buffer(packed_data)
+
+
+
+        except KeyboardInterrupt:
+            manager.close_socket()
+            return
+
+        except Exception:
+            # this is important!
+            controller.reset()
 
 if __name__ == "__main__":
     setup_example()
