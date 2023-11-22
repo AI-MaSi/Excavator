@@ -1,12 +1,15 @@
 import random
 # import struct
 
-from config import multiplexer_channels
+from config import multiplexer_channels, tca_address # bno08x_address
 
 try:
     import board
     import adafruit_tca9548a
     from adafruit_lsm6ds.ism330dhcx import ISM330DHCX
+
+    """
+    BNO HAS PROBLEMS!!!!!!!!
     from adafruit_bno08x.i2c import BNO08X_I2C  # Make sure you have this module
     from adafruit_bno08x import (
         BNO_REPORT_ACCELEROMETER,
@@ -14,6 +17,7 @@ try:
         BNO_REPORT_MAGNETOMETER,
         BNO_REPORT_ROTATION_VECTOR,
     )
+    """
     IMU_MODULES_AVAILABLE = True
 except ImportError:
     IMU_MODULES_AVAILABLE = False
@@ -27,7 +31,7 @@ bno_features = [
             ]
 
 class IMUSensorManager:
-    def __init__(self, multiplexer_channels=range(8), tca_address=0x71, bno08x_address=0x4a, simulation_mode=False):
+    def __init__(self, simulation_mode=False):
         self.simulation_mode = simulation_mode
         self.multiplexer_channels = multiplexer_channels
         self.bno08x = None
@@ -38,7 +42,7 @@ class IMUSensorManager:
                 self.tca = adafruit_tca9548a.TCA9548A(self.i2c, address=tca_address)
                 self.sensors = {}
                 self.initialize_ism330(multiplexer_channels)
-                self.initialize_bno08(bno08x_address)
+                # self.initialize_bno08(bno08x_address)
             else:
                 raise IMUmodulesNotAvailableError("IMU-modules are not available but required for non-simulation mode.")
         elif self.simulation_mode:
@@ -52,6 +56,7 @@ class IMUSensorManager:
             except Exception as e:
                 raise ISM330InitializationError(f"Error initializing ISM330DHCX on channel {channel}: {e}")
 
+    """
     def initialize_bno08(self, address):
         try:
             self.bno08x = BNO08X_I2C(self.i2c, address=address)
@@ -64,7 +69,6 @@ class IMUSensorManager:
         except Exception as e:
             raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
 
-    """
     @staticmethod
     def pack_data(data):
         # little endian, doubles. Because Mevea.
@@ -73,17 +77,19 @@ class IMUSensorManager:
     """
     def read_all(self):
         # Combined data from all sensors
+        # BNO has problems, skipping it
         combined_data = []
 
         # Read data from each ISM330 sensor
         for channel in multiplexer_channels:
             try:
                 ism330_data = self.read_ism330(channel)
-                combined_data.extend(ism330_data)  # extend assumes ism330_data is a tuple or list
+                combined_data.extend(ism330_data)
             except ISM330ReadError as e:
                 print(f"Failed to read from ISM330 sensor at channel {channel}: {e}")
-                # Optionally handle the error or re-raise it
 
+
+        """
         # Read data from the BNO08 sensor
         try:
             bno08_data = self.read_bno08()
@@ -91,6 +97,7 @@ class IMUSensorManager:
         except BNO08xReadError as e:
             print(f"Failed to read from BNO08 sensor: {e}")
             # Optionally handle the error or re-raise it
+        """
 
         return combined_data
 
@@ -132,7 +139,7 @@ class IMUSensorManager:
                             mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
                 #find specific exception
                 except Exception as e:
-                    raise BNO08xReadError("Error reading from BNO08x sensor: {e}")
+                    raise BNO08xReadError(f"Error reading from BNO08x sensor: {e}")
             else:
                 raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
         else:

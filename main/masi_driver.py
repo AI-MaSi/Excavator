@@ -18,20 +18,18 @@ class ExcavatorController:
         self.simulation_mode = simulation_mode
         self.num_inputs = num_inputs
         self.values = [0.0 for _ in range(num_inputs)]
-        # 16 channels in the PWM hat
-
-        # Match input / output channels
-        # self.channel_mapping = {config['input_channel']: output_channel for output_channel, config
-            #                  in CHANNEL_CONFIGS.items() if config['type'] != 'none'}
 
         if not self.simulation_mode:
             if SERVOKIT_AVAILABLE:
-                self.self.kit = ServoKit(channels=16)
+                # 16 channels in the PWM hat
+                self.kit = ServoKit(channels=16)
             else:
                 raise ServoKitNotAvailableError("ServoKit is not available but required for non-simulation mode.")
 
         elif self.simulation_mode:
             print("Simulation mode activated! Simulated drive prints will be used.")
+
+        self.reset()
 
     def update_values(self, raw_values):
         if len(raw_values) != self.num_inputs:
@@ -42,6 +40,16 @@ class ExcavatorController:
             if config['type'] != 'none':
                 input_channel = config['input_channel']
                 output_channel = config['output_channel']
+
+                """
+                # Check if the input_channel is within the valid range
+                if 0 <= input_channel < len(raw_values):
+                    # Check if the input value is out of bounds (-1 to 1) and cap it
+                    if raw_values[input_channel] > 1:
+                        raw_values[input_channel] = 1
+                    elif raw_values[input_channel] < -1:
+                        raw_values[input_channel] = -1
+                """
 
                 # Skip if input_channel is 'none' or if index is out of range
                 if input_channel == 'none' or input_channel >= len(raw_values):
@@ -87,8 +95,7 @@ class ExcavatorController:
                 value = config['offset'] + center_val_servo + (config['direction'] * values[config['output_channel']]
                                                             * config['multiplier'])
 
-                #if config['type'] == 'angle':
-                #print(channel_name,value)
+                # give the value to the servo
                 self.kit.servo[config['output_channel']].angle = value
 
 

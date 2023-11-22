@@ -2,13 +2,13 @@ import socket
 import struct
 import datetime
 import threading
+import os
 
 
 # using these directly now. Add to __init__ if more flexibility needed
-# from config import file_path, BUFFER_SIZE, local_addr,\
-#    connect_addr, port, endian_specifier, unix_format...
-
-from config import *
+from config import (file_path, local_addr, port, connect_addr, identification_number,
+                    inputs, outputs, endian_specifier, data_format, checksum_format,
+                    unix_format, handshake_format, BUFFER_SIZE)
 
 
 # make proper exceptions you lazy man
@@ -16,8 +16,6 @@ class MasiSocketManager:
     def __init__(self):
         # lock needed if using threading in the future...
         self.data_save_lock = threading.Lock()
-        # self.client_type = client_type # from config.py
-        #self.sequence_bytes = struct.calcsize((endian_specifier + sequence_format))
         self.checksum_bytes = struct.calcsize((endian_specifier + checksum_format))
 
         self.local_socket = None
@@ -26,13 +24,9 @@ class MasiSocketManager:
         self.recvd_id_number = None
         self.recvd_num_inputs = None
         self.recvd_num_outputs = None
-        self.start_flag = None
-        self.record_flag = None
+        self.recv_bytes = None
         self.socket_type = None
         self.data_buffer = []
-
-        # is this needed?
-        self.socket_setup_done = None
 
     @staticmethod
     def compute_checksum(packed_data):
@@ -48,59 +42,23 @@ class MasiSocketManager:
             pass
         # except (no file error find this):
 
-    def setup_socket(self, socket_type):
-        # add error checking
-        self.socket_type = socket_type
-        if not self.local_socket:
-            self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if self.socket_type == 'server':
-                self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.local_socket.bind((local_addr, port))
-                self.local_socket.listen(1)
-                print("Socket configured as a server!")
-                print(f"\nSocket listening on {local_addr}:{port}")
-                self.connected_socket, self.connected_addr = self.local_socket.accept()
-                self.socket_setup_done = True
-                return self.socket_setup_done
+    @staticmethod
+    def pack_data(data):
+        # using fixed data_format as Mevea only accepts doubles!
+        return struct.pack(endian_specifier + data_format * len(data), *data)
 
-            elif self.socket_type == 'client':
-                # TCP_NODELAY is apparently faster
-                self.local_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                print("Socket configured as a client!")
-                self.local_socket.connect((connect_addr, port))
-                self.connected_socket = self.local_socket
-                self.socket_setup_done = True
-                return self.socket_setup_done
+    @staticmethod
+    def print_bin_file(num_doubles):
+        format_str = endian_specifier + unix_format + data_format * num_doubles
+        total_size = struct.calcsize(format_str)
 
-            print("Check client type!")
-            self.socket_setup_done = False
-            return self.socket_setup_done
-        else:
-            # socket already made, do something?
-            print("socket already made!")
-            self.socket_setup_done = False
-            return self.socket_setup_done
+        # Add checksum byte if not divisible by 2
+        if total_size % 2 != 0:
+            format_str += checksum_format
 
-    def close_socket(self):
-        if self.local_socket:
-            self.local_socket.close()
-            print("Socket closed successfully!")
-            # self.save_remaining_data()
-        else:
-            print("something wrong has happened somewhere")
-    """
-    def construct_format_string(self):
-        # '<QI20dB'
-        # '<'  Little-endian
-        # 'Q' 8 byte integer (UNIX-timestamp)
-        # REMOVED 'I'  Unsigned int (sequence number) 4 bytes
-        # 'd'  doubles (data) 8 bytes
-        # 'B'  Unsigned char (checksum) 1 byte
-        return endian_specifier + unix_format + data_format * self.recvd_num_inputs + checksum_format
-
-    def read_data_file(self):
         # Format string differs from recv_bytes with added timestamp
-        format_str = self.construct_format_string()
+        print(f"File format is: {str(format_str)}")
+
         data_size = struct.calcsize(format_str)
 
         if not os.path.exists(file_path):
@@ -116,20 +74,44 @@ class MasiSocketManager:
 
                 # Unpack the data
                 data = struct.unpack(format_str, packed_data)
+                print(f"Raw data: {data}")
 
-                # Extract Unix time, checksum, and values
-                unix_time = data[0]
-                checksum = data[-1]  # Checksum is the last byte
-                values = data[1:-1]  # Values are between Unix time and checksum
+    def setup_socket(self, socket_type):
+        # add error checking
+        self.socket_type = socket_type
+        if not self.local_socket:
+            self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if self.socket_type == 'server':
+                self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.local_socket.bind((local_addr, port))
+                self.local_socket.listen(1)
+                print("Socket configured as a server!")
+                print(f"\nSocket listening on {local_addr}:{port}")
+                self.connected_socket, self.connected_addr = self.local_socket.accept()
+                return True
 
-                # Print the extracted data
-                print(
-                    f"Unix time: {unix_time}, "
-                    f"Checksum: {checksum}, Values: {values}")
-    """
-    def pack_data(self, data):
-        # using fixed data_format as Mevea only accepts doubles!
-        return struct.pack(endian_specifier + data_format * len(data), *data)
+            elif self.socket_type == 'client':
+                # TCP_NODELAY is apparently faster
+                self.local_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                print("Socket configured as a client!")
+                self.local_socket.connect((connect_addr, port))
+                self.connected_socket = self.local_socket
+                return True
+
+            print("Check client type!")
+            return False
+        else:
+            # socket already made, do something?
+            print("socket already made!")
+            return False
+
+    def close_socket(self):
+        if self.local_socket:
+            self.local_socket.close()
+            print("Socket closed successfully!")
+            # self.save_remaining_data()
+        else:
+            print("something wrong has happened somewhere")
 
     def add_checks(self, packed_data):
         # Compute checksum
@@ -159,20 +141,6 @@ class MasiSocketManager:
         if len(self.data_buffer) >= BUFFER_SIZE:
             self.save_buffer()
         return final_data
-
-    """
-    def set_start_flag(self, boolean):
-        # tell the excavator to start running
-        # should check if this is bool....
-        print(f"set start flag to {boolean}!")
-        self.start_flag = boolean
-
-    def set_record_flag(self, boolean):
-        # start recording the motionplaft outputs
-        # should check if this is bool....
-        print(f"set record flag to {boolean}!")
-        self.record_flag = boolean
-    """
 
     def receive_data(self):
         if self.recvd_num_outputs == 0:
@@ -219,7 +187,6 @@ class MasiSocketManager:
         # check if the buffer is full
         if len(self.data_buffer) >= BUFFER_SIZE:
             self.save_buffer()
-
 
     def save_buffer(self):
         # save data from buffer to file

@@ -11,7 +11,7 @@ inputs = 20
 outputs = 0
 
 file_path = "log/example_data.bin"
-BUFFER_SIZE = 10
+BUFFER_SIZE = 100
 
 # '<QI20DB'
 # '<'  Little-endian
@@ -27,11 +27,10 @@ data_format = 'd'
 # 'B'  Unsigned char (checksum) 1 byte
 checksum_format = 'B'
 
-file_path = "log/example_data.bin"
-BUFFER_SIZE = 10
-
 # ISM330 IMU's use these multiplexer channels
 multiplexer_channels = [1, 2, 3]
+tca_address=0x71
+bno08x_address=0x4a
 
 # Hal sensor GPIO pins
 gpio_rpm = 4
