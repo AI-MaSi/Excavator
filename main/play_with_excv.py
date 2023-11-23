@@ -1,6 +1,10 @@
 import universal_socket_manager
 import masi_driver
-import imu_sensor_manager
+#import imu_sensor_manager
+
+# GPIO CLEANUP!!!!!!!!!!!!!!
+import sensor_manager
+
 from time import time, sleep
 
 simulation_mode = False
@@ -13,14 +17,25 @@ manager = universal_socket_manager.MasiSocketManager()
 
 # init servo controller
 controller = masi_driver.ExcavatorController(simulation_mode=simulation_mode)
+# exceptions soon...
 
 # init IMU's
-if log_data:
-    try:
-        imu_manager = imu_sensor_manager.IMUSensorManager(simulation_mode=simulation_mode)
-    except (imu_sensor_manager.BNO08xInitializationError, imu_sensor_manager.ISM330InitializationError) as e:
-        imu_manager = None
-        raise e
+try:
+    imu_manager = sensor_manager.IMUSensorManager(simulation_mode=simulation_mode)
+    # imu_manager = sensor_manager.IMUSensorManager(simulation_mode=simulation_mode)
+# except (imu_sensor_manager.BNO08xInitializationError, imu_sensor_manager.ISM330InitializationError) as e:
+except (sensor_manager.BNO08xInitializationError, sensor_manager.ISM330InitializationError) as e:
+    imu_manager = None
+    raise e
+
+# init pressure checking
+pressure_manager = sensor_manager.PressureSensor()
+# exceptions soon...
+
+# init RPM check
+rpm_manager = sensor_manager.RPMSensor()
+# exceptions soon...
+
 
 def setup():
     if log_data:
@@ -56,6 +71,17 @@ def run():
             if log_data:
                 # get values from the sensors
                 data_i_want_to_save = imu_manager.read_all()  # BNO has problems!
+
+                # get pressure values
+                pressure_data= pressure_manager.read_pressure()
+                if pressure_data is not None:
+                    data_i_want_to_save += pressure_data
+
+                # get the pump rpm
+                rpm_data = rpm_manager.get_rpm()
+                if rpm_data is not None:
+                    # data_i_want_to_save += rpm_data
+                    data_i_want_to_save.append(rpm_data)
 
                 packed_data = manager.pack_data(data_i_want_to_save)
 
@@ -93,3 +119,4 @@ if __name__ == "__main__":
     else:
         manager.close_socket()
         controller.reset()
+        # GPIO CLEANUP!!!!!!!!!!!!!!

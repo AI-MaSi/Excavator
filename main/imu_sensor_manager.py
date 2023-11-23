@@ -1,33 +1,35 @@
 import random
-# import struct
-
-from config import multiplexer_channels, tca_address # bno08x_address
+import time
+import threading
+from config import multiplexer_channels, tca_address, bno08x_address
 
 try:
     import board
     import adafruit_tca9548a
+    from adafruit_lsm6ds import Rate
     from adafruit_lsm6ds.ism330dhcx import ISM330DHCX
 
-    """
-    BNO HAS PROBLEMS!!!!!!!!
-    from adafruit_bno08x.i2c import BNO08X_I2C  # Make sure you have this module
+    import RPi.GPIO as GPIO
+    from ADCPi import ADCPi
+
+    from adafruit_bno08x.i2c import BNO08X_I2C
     from adafruit_bno08x import (
         BNO_REPORT_ACCELEROMETER,
         BNO_REPORT_GYROSCOPE,
         BNO_REPORT_MAGNETOMETER,
         BNO_REPORT_ROTATION_VECTOR,
     )
-    """
+
     IMU_MODULES_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"Failed to import modules: {e}")
     IMU_MODULES_AVAILABLE = False
 
-
 bno_features = [
-                "BNO_REPORT_ACCELEROMETER",
-                "BNO_REPORT_GYROSCOPE",
-                "BNO_REPORT_MAGNETOMETER",
-                "BNO_REPORT_ROTATION_VECTOR"
+    BNO_REPORT_ACCELEROMETER,
+    BNO_REPORT_GYROSCOPE,
+    BNO_REPORT_MAGNETOMETER,
+    BNO_REPORT_ROTATION_VECTOR,
             ]
 
 class IMUSensorManager:
@@ -42,6 +44,8 @@ class IMUSensorManager:
                 self.tca = adafruit_tca9548a.TCA9548A(self.i2c, address=tca_address)
                 self.sensors = {}
                 self.initialize_ism330(multiplexer_channels)
+
+                # refresh rate too slow!
                 # self.initialize_bno08(bno08x_address)
             else:
                 raise IMUmodulesNotAvailableError("IMU-modules are not available but required for non-simulation mode.")
@@ -52,29 +56,30 @@ class IMUSensorManager:
         for channel in channels:
             try:
                 self.sensors[channel] = ISM330DHCX(self.tca[channel])
+
+                # Set the data rates for accelerometer and gyro
+                self.sensors[channel].accelerometer_data_rate = Rate.RATE_26_HZ
+                self.sensors[channel].gyro_data_rate = Rate.RATE_26_HZ
+
                 print(f"ISM330DHCX on channel {channel} initialized.")
             except Exception as e:
                 raise ISM330InitializationError(f"Error initializing ISM330DHCX on channel {channel}: {e}")
 
-    """
     def initialize_bno08(self, address):
+        rate = 26 # Hz
         try:
             self.bno08x = BNO08X_I2C(self.i2c, address=address)
 
-            # not tested
             for feature in bno_features:
                 self.bno08x.enable_feature(feature)
+                self.bno08x.set_feature_report_rate(feature, rate)
+
+
             print(f"BNO08x sensor initialized.")
             # find right exception
         except Exception as e:
             raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
 
-    @staticmethod
-    def pack_data(data):
-        # little endian, doubles. Because Mevea.
-        format_str = '<' + 'd' * len(data)
-        return struct.pack(format_str, *data)
-    """
     def read_all(self):
         # Combined data from all sensors
         # BNO has problems, skipping it
@@ -155,31 +160,6 @@ class IMUSensorManager:
         # return list(data)
         return data
 
-
-'''
-print("Acceleration:")
-    accel_x, accel_y, accel_z = self.bno08x.acceleration  # pylint:disable=no-member
-    print("X: %0.6f  Y: %0.6f Z: %0.6f  m/s^2" % (accel_x, accel_y, accel_z))
-    print("")
-
-    print("Gyro:")
-    gyro_x, gyro_y, gyro_z = self.bno08x.gyro  # pylint:disable=no-member
-    print("X: %0.6f  Y: %0.6f Z: %0.6f rads/s" % (gyro_x, gyro_y, gyro_z))
-    print("")
-
-    print("Magnetometer:")
-    mag_x, mag_y, mag_z = self.bno08x.magnetic  # pylint:disable=no-member
-    print("X: %0.6f  Y: %0.6f Z: %0.6f uT" % (mag_x, mag_y, mag_z))
-    print("")
-
-    print("Rotation Vector Quaternion:")
-    quat_i, quat_j, quat_k, quat_real = self.bno08x.quaternion  # pylint:disable=no-member
-    print(
-        "I: %0.6f  J: %0.6f K: %0.6f  Real: %0.6f" % (quat_i, quat_j, quat_k, quat_real)
-     )
-    print("")
-     '''
-
 class IMUmodulesNotAvailableError(Exception):
     pass
 
@@ -194,3 +174,81 @@ class BNO08xInitializationError(Exception):
 
 class BNO08xReadError(Exception):
     pass
+
+class RPMSensor:
+    def __init__(self, rpm_sensor_pin, magnets=14):
+        self.hall_sensor_pin = rpm_sensor_pin
+        self.magnets = magnets
+        self.pulse_count = 0
+        self.rpm = 0
+        self.setup_gpio()
+        self.start_measurement()
+
+    def setup_gpio(self):
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.hall_sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(self.hall_sensor_pin, GPIO.FALLING, callback=self.sensor_callback)
+
+    def sensor_callback(self, channel):
+        self.pulse_count += 1
+
+    def calculate_rpm(self):
+        last_checked_time = time.time()
+        while True:
+            current_time = time.time()
+            elapsed_time = current_time - last_checked_time
+
+            if elapsed_time >= 1:  # Update every second
+                self.rpm = (self.pulse_count / self.magnets) * 60 / elapsed_time
+                self.pulse_count = 0
+                last_checked_time = current_time
+
+            time.sleep(0.1)
+
+    def start_measurement(self):
+        self.thread = threading.Thread(target=self.calculate_rpm)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def get_rpm(self):
+        return self.rpm
+
+    def cleanup(self):
+        GPIO.cleanup()
+
+class PressureSensor:
+    def __init__(self, i2c_addr=(0x6E, 0x6F), channels=6, decimals=1):
+        self.channel_numbers = channels
+        self.decimals = decimals
+        self.data = [0] * self.channel_numbers
+        self.initialized = False
+
+        try:
+            self.adc = ADCPi(i2c_addr, 12)
+            self.adc.set_conversion_mode(1)
+            self.initialized = True
+        except OSError as e:
+            print(f"Failed to set I2C-address! Error: {e}")
+
+    def read_pressure(self):
+        if self.initialized:
+            for i in range(1, self.channel_numbers + 1):
+                voltage = self.adc.read_voltage(i)
+                if voltage > 0.40:
+                    # round values and convert the voltages to psi (rough)
+                    self.data[i - 1] = round(((1000 * (voltage - 0.5) / (4.5 - 0.5))), self.decimals)
+                else:
+                    self.data[i - 1] = 0
+            return self.data
+        else:
+            print("ADCPi not initialized!")
+            return None
+
+class CenterPositionSensor:
+    def __init__(self, sensor_pin):
+        # set the right GPIO pin
+        pass
+
+    def check_center_position(self):
+        # check position
+        pass
