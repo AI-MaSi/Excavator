@@ -4,7 +4,6 @@ import datetime
 import threading
 import os
 
-
 # using these directly now. Add to __init__ if more flexibility needed
 from config import (file_path, local_addr, port, connect_addr, identification_number,
                     inputs, outputs, endian_specifier, data_format, checksum_format,
@@ -37,10 +36,9 @@ class MasiSocketManager:
 
     @staticmethod
     def clear_file():
-        # try:
         with open(file_path, 'wb'):
             pass
-        # except (no file error find this):
+        print("Cleared file!")
 
     @staticmethod
     def pack_data(data):
@@ -53,10 +51,11 @@ class MasiSocketManager:
         total_size = struct.calcsize(format_str)
 
         # Add checksum byte if not divisible by 2
+        # not tested yet!
         if total_size % 2 != 0:
             format_str += checksum_format
 
-        # Format string differs from recv_bytes with added timestamp
+
         print(f"File format is: {str(format_str)}")
 
         data_size = struct.calcsize(format_str)
@@ -109,7 +108,6 @@ class MasiSocketManager:
         if self.local_socket:
             self.local_socket.close()
             print("Socket closed successfully!")
-            # self.save_remaining_data()
         else:
             print("something wrong has happened somewhere")
 

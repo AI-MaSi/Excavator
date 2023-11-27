@@ -2,13 +2,12 @@ import universal_socket_manager
 import masi_driver
 #import imu_sensor_manager
 
-# GPIO CLEANUP!!!!!!!!!!!!!!
+
 import sensor_manager
 
 from time import time, sleep
 
 simulation_mode = False
-log_data = True
 threshold = 5  # atleast this many messages required every second
 
 # init socket
@@ -38,9 +37,7 @@ rpm_manager = sensor_manager.RPMSensor()
 
 
 def setup():
-    if log_data:
-        manager.clear_file()
-
+    manager.clear_file()
     setup_result = manager.setup_socket(socket_type='client')
     if not setup_result:
         print("could not set up socket!")
@@ -51,12 +48,39 @@ def setup():
         print("could not make handshake!")
     return handshake_result
 
+def collect_data():
+    # get values from the sensors
+    data_i_want_to_save = imu_manager.read_all()  # BNO has problems!
+
+    # get pressure values
+    pressure_data = pressure_manager.read_pressure()
+    if pressure_data is not None:
+        data_i_want_to_save += pressure_data
+
+    # get the pump rpm
+    rpm_data = rpm_manager.get_rpm()
+    if rpm_data is not None:
+        # data_i_want_to_save += rpm_data
+        data_i_want_to_save.append(rpm_data)
+
+    packed_data = manager.pack_data(data_i_want_to_save)
+
+    # Add an empty checksum byte to the packed_data
+    # Now data will be in the same format as the packed MotionPlatform joystick data
+    packed_data += b'\x00'
+
+    manager.add_data_to_buffer(packed_data)
+
+
 def run():
     check_interval = 1.0
     data_received_count = 0
     start_time = time()
 
+    log_data = False
+
     while True:
+
         try:
             # I only want to send handshake
             # outputs are set to 0, handshake is sent automatically
@@ -65,31 +89,20 @@ def run():
             # receive joystick values
             data_i_want_to_receive = manager.receive_data()
 
-            # use joystick values to control the excavator
-            controller.update_values(data_i_want_to_receive)
+            if data_i_want_to_receive[11] and not log_data:
+                log_data=True
+                print("Started logging data!")
+
+            if data_i_want_to_receive[13] and log_data:
+                log_data=False
+                print("Stopped logging data!")
+
 
             if log_data:
-                # get values from the sensors
-                data_i_want_to_save = imu_manager.read_all()  # BNO has problems!
+                collect_data()
 
-                # get pressure values
-                pressure_data= pressure_manager.read_pressure()
-                if pressure_data is not None:
-                    data_i_want_to_save += pressure_data
-
-                # get the pump rpm
-                rpm_data = rpm_manager.get_rpm()
-                if rpm_data is not None:
-                    # data_i_want_to_save += rpm_data
-                    data_i_want_to_save.append(rpm_data)
-
-                packed_data = manager.pack_data(data_i_want_to_save)
-
-                # Add an empty checksum byte to the packed_data
-                # Now data will be in the same format as the packed MotionPlatform joystick data
-                packed_data += b'\x00'
-
-                manager.add_data_to_buffer(packed_data)
+            # use joystick values to control the excavator
+            controller.update_values(data_i_want_to_receive)
 
             # check if the loop rate exceeds the threshold
             # safety feature
@@ -111,6 +124,7 @@ def run():
             # this is important!
             controller.reset()
             manager.close_socket()
+            rpm_manager.cleanup()
             return
 
 if __name__ == "__main__":
@@ -119,4 +133,4 @@ if __name__ == "__main__":
     else:
         manager.close_socket()
         controller.reset()
-        # GPIO CLEANUP!!!!!!!!!!!!!!
+        rpm_manager.cleanup()

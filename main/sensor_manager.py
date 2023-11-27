@@ -14,11 +14,9 @@ try:
 
     from adafruit_bno08x.i2c import BNO08X_I2C
     from adafruit_bno08x import (
-        BNO_REPORT_ACCELEROMETER,
-        BNO_REPORT_GYROSCOPE,
         BNO_REPORT_MAGNETOMETER,
         BNO_REPORT_ROTATION_VECTOR,
-    )
+            )
 
     IMU_MODULES_AVAILABLE = True
 except ImportError as e:
@@ -26,8 +24,6 @@ except ImportError as e:
     IMU_MODULES_AVAILABLE = False
 
 bno_features = [
-    BNO_REPORT_ACCELEROMETER,
-    BNO_REPORT_GYROSCOPE,
     BNO_REPORT_MAGNETOMETER,
     BNO_REPORT_ROTATION_VECTOR,
             ]
@@ -46,7 +42,8 @@ class IMUSensorManager:
                 self.initialize_ism330(multiplexer_channels)
 
                 # refresh rate too slow!
-                # self.initialize_bno08(bno08x_address)
+                self.initialize_bno08(bno08x_address)
+                time.sleep(1)
             else:
                 raise IMUmodulesNotAvailableError("IMU-modules are not available but required for non-simulation mode.")
         elif self.simulation_mode:
@@ -57,7 +54,7 @@ class IMUSensorManager:
             try:
                 self.sensors[channel] = ISM330DHCX(self.tca[channel])
 
-                # Set the data rates for accelerometer and gyro
+                # Set the data rates for accelerometer and gyro. 26Hz
                 self.sensors[channel].accelerometer_data_rate = Rate.RATE_26_HZ
                 self.sensors[channel].gyro_data_rate = Rate.RATE_26_HZ
 
@@ -66,23 +63,20 @@ class IMUSensorManager:
                 raise ISM330InitializationError(f"Error initializing ISM330DHCX on channel {channel}: {e}")
 
     def initialize_bno08(self, address):
-        rate = 26 # Hz
         try:
             self.bno08x = BNO08X_I2C(self.i2c, address=address)
 
             for feature in bno_features:
                 self.bno08x.enable_feature(feature)
-                self.bno08x.set_feature_report_rate(feature, rate)
-
 
             print(f"BNO08x sensor initialized.")
+            print("(but not used at the moment)")
             # find right exception
         except Exception as e:
             raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
 
     def read_all(self):
         # Combined data from all sensors
-        # BNO has problems, skipping it
         combined_data = []
 
         # Read data from each ISM330 sensor
@@ -93,17 +87,8 @@ class IMUSensorManager:
             except ISM330ReadError as e:
                 print(f"Failed to read from ISM330 sensor at channel {channel}: {e}")
 
-
-        """
-        # Read data from the BNO08 sensor
-        try:
             bno08_data = self.read_bno08()
             combined_data.extend(bno08_data)
-        except BNO08xReadError as e:
-            print(f"Failed to read from BNO08 sensor: {e}")
-            # Optionally handle the error or re-raise it
-        """
-
         return combined_data
 
     def read_ism330(self, channel):
@@ -135,29 +120,25 @@ class IMUSensorManager:
         if not self.simulation_mode:
             if IMU_MODULES_AVAILABLE:
                 try:
-                    accel_x, accel_y, accel_z = self.bno08x.acceleration  # pylint:disable=no-member
-                    gyro_x, gyro_y, gyro_z = self.bno08x.gyro  # pylint:disable=no-member
                     mag_x, mag_y, mag_z = self.bno08x.magnetic  # pylint:disable=no-member
                     quat_i, quat_j, quat_k, quat_real = self.bno08x.quaternion  # pylint:disable=no-member
 
-                    data = (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
-                            mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
-                #find specific exception
+                    data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
+                    print(data)
                 except Exception as e:
-                    raise BNO08xReadError(f"Error reading from BNO08x sensor: {e}")
+                    # find the right exceptions!
+                    print(e)
+
+
             else:
                 raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
         else:
-            accel_x, accel_y, accel_z = [random.uniform(0, 10) for _ in range(3)]
-            gyro_x, gyro_y, gyro_z = [random.uniform(0, 10) for _ in range(3)]
+
             mag_x, mag_y, mag_z = [random.uniform(0, 10) for _ in range(3)]
             quat_i, quat_j, quat_k, quat_real = [random.uniform(0, 10) for _ in range(4)]
 
-            data = (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
-                    mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
+            data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
 
-        # return self.pack_data(data) if pack else data
-        # return list(data)
         return data
 
 class IMUmodulesNotAvailableError(Exception):
