@@ -17,7 +17,7 @@ class IMUSensorManager:
         self.i2c = board.I2C()
         self.tca = adafruit_tca9548a.TCA9548A(self.i2c, address=tca_address)
         self.sensors = {}
-        self.initialize_ism330(channels)
+        #self.initialize_ism330(channels)
         self.initialize_bno08(bno08x_address)
 
     def initialize_ism330(self, channels):

@@ -1,14 +1,24 @@
+"""
+This is a messy test script to drive around with the excavator.
+The script will save ISM330, pressure sensor and pump rpm data. Saves to .bin file
+Also the script tests bno08x-IMU, and saves the test results to .txt -file
+"""
+
 import universal_socket_manager
 import masi_driver
-#import imu_sensor_manager
-
-
 import sensor_manager
+# bno08x is messed up
+import bno_tester
 
+
+import threading
 from time import time, sleep
 
+# num_passes = int(input("Enter the (thousand) number of measurements to perform: "))
+# etc. etc. etc...
+
 simulation_mode = False
-threshold = 5  # atleast this many messages required every second
+threshold = 2  # at least this many messages required every second
 
 # init socket
 manager = universal_socket_manager.MasiSocketManager()
@@ -36,6 +46,12 @@ rpm_manager = sensor_manager.RPMSensor()
 # exceptions soon...
 
 
+def bno08x_test_thread(num_passes, frequency):
+    test_results = []
+    test_results.append((f'Test with {frequency} Hz', bno_tester.test_bno08x(num_passes, frequency)))
+    bno_tester.save_test_results_to_file(test_results, num_passes, "bno08x_test_results.txt")
+    print("BNO08x test results saved to 'bno08x_test_results.txt'")
+
 def setup():
     manager.clear_file()
     setup_result = manager.setup_socket(socket_type='client')
@@ -56,12 +72,16 @@ def collect_data():
     pressure_data = pressure_manager.read_pressure()
     if pressure_data is not None:
         data_i_want_to_save += pressure_data
+    else:
+        print("pressure data is None!!!!!!!!!")
 
     # get the pump rpm
     rpm_data = rpm_manager.get_rpm()
     if rpm_data is not None:
-        # data_i_want_to_save += rpm_data
+        #data_i_want_to_save += rpm_data
         data_i_want_to_save.append(rpm_data)
+    else:
+        print("RPM data is None!!!!!!!!!")
 
     packed_data = manager.pack_data(data_i_want_to_save)
 
@@ -77,7 +97,7 @@ def run():
     data_received_count = 0
     start_time = time()
 
-    log_data = False
+    log_data = True
 
     while True:
 
@@ -99,8 +119,11 @@ def run():
 
 
             if log_data:
-                collect_data()
-
+                try:
+                    collect_data()
+                except Exception as e:
+                    print(e)
+                    continue
             # use joystick values to control the excavator
             controller.update_values(data_i_want_to_receive)
 
@@ -119,7 +142,7 @@ def run():
             # relax for a while
             # sleep(0.01)
 
-        except Exception as e:
+        except (Exception, KeyboardInterrupt) as e:
             print(e)
             # this is important!
             controller.reset()
@@ -129,8 +152,19 @@ def run():
 
 if __name__ == "__main__":
     if setup():
-        run()
-    else:
-        manager.close_socket()
-        controller.reset()
-        rpm_manager.cleanup()
+        # Start the BNO08x test thread
+        num_passes = 5  # *1000 passes
+        frequency = 30  # Hz
+        bno08x_thread = threading.Thread(target=bno08x_test_thread, args=(num_passes, frequency))
+        #bno08x_thread.start()
+
+        # Run the main function
+        try:
+            run()
+        finally:
+            # Wait for the BNO08x test to complete before exiting
+            #bno08x_thread.join()
+            manager.save_remaining_data()
+            manager.close_socket()
+            controller.reset()
+            rpm_manager.cleanup()

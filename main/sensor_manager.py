@@ -70,13 +70,11 @@ class IMUSensorManager:
                 self.bno08x.enable_feature(feature)
 
             print(f"BNO08x sensor initialized.")
-            print("(but not used at the moment)")
             # find right exception
         except Exception as e:
             raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
 
     def read_all(self):
-        # Combined data from all sensors
         combined_data = []
 
         # Read data from each ISM330 sensor
@@ -87,8 +85,9 @@ class IMUSensorManager:
             except ISM330ReadError as e:
                 print(f"Failed to read from ISM330 sensor at channel {channel}: {e}")
 
-            bno08_data = self.read_bno08()
-            combined_data.extend(bno08_data)
+        # if self.bno08x is not None:
+        bno08_data = self.read_bno08()
+        combined_data.extend(bno08_data)
         return combined_data
 
     def read_ism330(self, channel):
@@ -122,13 +121,12 @@ class IMUSensorManager:
                 try:
                     mag_x, mag_y, mag_z = self.bno08x.magnetic  # pylint:disable=no-member
                     quat_i, quat_j, quat_k, quat_real = self.bno08x.quaternion  # pylint:disable=no-member
-
-                    data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
-                    print(data)
                 except Exception as e:
-                    # find the right exceptions!
                     print(e)
+                    # find the right exceptions!
+                    mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real = [0.0 for _ in range(7)]
 
+                data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
 
             else:
                 raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
