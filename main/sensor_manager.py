@@ -29,9 +29,10 @@ bno_features = [
             ]
 
 class IMUSensorManager:
-    def __init__(self, simulation_mode=False):
+    def __init__(self, simulation_mode=False, decimals=2):
         self.simulation_mode = simulation_mode
         self.multiplexer_channels = multiplexer_channels
+        self.decimals = decimals
         self.bno08x = None
 
         if not self.simulation_mode:
@@ -95,8 +96,8 @@ class IMUSensorManager:
             if IMU_MODULES_AVAILABLE:
                 try:
                     sensor = self.sensors[channel]
-                    accel_x, accel_y, accel_z = sensor.acceleration
-                    gyro_x, gyro_y, gyro_z = sensor.gyro
+                    accel_x, accel_y, accel_z = [round(val, self.decimals) for val in sensor.acceleration]
+                    gyro_x, gyro_y, gyro_z = [round(val, self.decimals) for val in sensor.gyro]
                     data = accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
 
                 # adafruit sensor exception
@@ -119,8 +120,9 @@ class IMUSensorManager:
         if not self.simulation_mode:
             if IMU_MODULES_AVAILABLE:
                 try:
-                    mag_x, mag_y, mag_z = self.bno08x.magnetic  # pylint:disable=no-member
-                    quat_i, quat_j, quat_k, quat_real = self.bno08x.quaternion  # pylint:disable=no-member
+                    mag_x, mag_y, mag_z = [round(val, self.decimals) for val in self.bno08x.magnetic]
+                    quat_i, quat_j, quat_k, quat_real = [round(val, self.decimals) for val in self.bno08x.quaternion]
+
                 except Exception as e:
                     print(e)
                     # find the right exceptions!
@@ -155,11 +157,12 @@ class BNO08xReadError(Exception):
     pass
 
 class RPMSensor:
-    def __init__(self, rpm_sensor_pin=4, magnets=14):
+    def __init__(self, rpm_sensor_pin=4, magnets=14, decimals=2):
         self.hall_sensor_pin = rpm_sensor_pin
         self.magnets = magnets
         self.pulse_count = 0
         self.rpm = 0
+        self.decimals = decimals
         self.setup_gpio()
         self.start_measurement()
 
@@ -190,13 +193,13 @@ class RPMSensor:
         self.thread.start()
 
     def get_rpm(self):
-        return self.rpm
+        return round(self.rpm, self.decimals)
 
     def cleanup(self):
         GPIO.cleanup()
 
 class PressureSensor:
-    def __init__(self, i2c_addr=(0x6E, 0x6F), channels=6, decimals=1):
+    def __init__(self, i2c_addr=(0x6E, 0x6F), channels=6, decimals=2):
         self.channel_numbers = channels
         self.decimals = decimals
         self.data = [0] * self.channel_numbers
