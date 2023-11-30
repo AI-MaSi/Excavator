@@ -76,10 +76,9 @@ Input center deadzone. 0...100(%)
 
 
 hydraulic_multiplier_channels = [2, 3, 4, 6, 7] #output channels
-
 center_val_servo = 90
-
 deadzone = 15
+input_rate_threshold = 5  # at least this many messages per second or reset
 
 CHANNEL_CONFIGS = {
     'trackR': {'output_channel': 0, 'type': 'angle', 'offset': -1, 'direction': -1, 'multiplier': 30, 'input_channel': 6},

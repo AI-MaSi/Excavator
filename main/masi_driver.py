@@ -17,6 +17,7 @@ class ExcavatorController:
     def __init__(self, simulation_mode=False, num_inputs=20):
         self.simulation_mode = simulation_mode
         self.num_inputs = num_inputs
+        self.input_counter = 0
         self.values = [0.0 for _ in range(num_inputs)]
 
         if not self.simulation_mode:
@@ -30,6 +31,17 @@ class ExcavatorController:
             print("Simulation mode activated! Simulated drive prints will be used.")
 
         self.reset()
+
+    def monitor_input_rate(self):
+        check_interval = 0.2  # 200 milliseconds
+        expected_inputs_per_check = (input_rate_threshold * check_interval)
+        while True:
+            current_count = self.input_counter
+            time.sleep(check_interval)
+            if (self.input_counter - current_count) < expected_inputs_per_check:
+                self.reset()
+
+            self.input_counter = 0
 
     def update_values(self, raw_values):
         if len(raw_values) != self.num_inputs:
@@ -57,6 +69,8 @@ class ExcavatorController:
 
                 # Assign the value from the input channel to the correct output channel
                 self.values[output_channel] = raw_values[input_channel]
+
+                self.input_counter += 1
 
         # Use these values
         self.use_values(self.values)
@@ -111,7 +125,7 @@ class ExcavatorController:
 
         # Set the pump to -1 throttle
         if 'pump' in CHANNEL_CONFIGS and CHANNEL_CONFIGS['pump']['type'] == 'throttle':
-            self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -0.9
+            self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -1.0
 
         # Reset all servos that have a type of 'angle' to their center value
         for channel_name, config in CHANNEL_CONFIGS.items():
