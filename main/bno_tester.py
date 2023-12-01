@@ -1,4 +1,5 @@
 from time import sleep, time
+from collections import deque
 import board
 from adafruit_bno08x.i2c import BNO08X_I2C
 from adafruit_bno08x import (
@@ -19,6 +20,8 @@ def test_bno08x(num_passes, frequency_hz):
 
     loop_count = 0
     failed_measurements = []
+    previous_measurements = deque(maxlen=20)
+    bno_crashed = False
 
     print(f"Starting {frequency_hz}Hz test loop...")
     for _ in range(multiplied_num_passes):
@@ -26,18 +29,32 @@ def test_bno08x(num_passes, frequency_hz):
         try:
             mag_x, mag_y, mag_z = bno08x.magnetic  # pylint:disable=no-member
             quat_i, quat_j, quat_k, quat_real = bno08x.quaternion  # pylint:disable=no-member
+            current_measurement = (mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real)
+
+            # Check for repeated measurements
+            if all(current_measurement == previous_measurement for previous_measurement in previous_measurements):
+                failed_measurements.append((loop_count, "Sensor data frozen"))
+                bno_crashed = True
+                break
+
+            previous_measurements.append(current_measurement)
         except Exception as e:
             failed_measurements.append((loop_count, str(e)))
+
         loop_count += 1
 
         if loop_count % 1000 == 0 and loop_count != 0:
             fail_rate = (len(failed_measurements) / loop_count) * 100
-            print(f"{int(loop_count / 1000)}k loop, failed passes: {len(failed_measurements)} ({fail_rate:.2f}%) ")
+            print(f"{int(loop_count / 1000)}k loop, failed passes: {len(failed_measurements)} ({fail_rate:.2f}%)")
 
         time_elapsed = time() - loop_start_time
         sleep_time = max(0, loop_period - time_elapsed)
         sleep(sleep_time)
-    print(f"{frequency_hz}Hz tests done!")
+
+    if bno_crashed:
+        print("Sensor data appears to be frozen. Test loop stopped.")
+    else:
+        print(f"{frequency_hz}Hz tests done!")
     sleep(1)
     return failed_measurements
 

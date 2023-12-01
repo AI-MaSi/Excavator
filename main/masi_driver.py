@@ -33,13 +33,14 @@ class ExcavatorController:
         self.reset()
 
     def monitor_input_rate(self):
-        check_interval = 0.2  # 200 milliseconds
+        # this method check how much data we are getting
+        check_interval = 0.2
         expected_inputs_per_check = (input_rate_threshold * check_interval)
         while True:
             current_count = self.input_counter
-            time.sleep(check_interval)
+            sleep(check_interval)
             if (self.input_counter - current_count) < expected_inputs_per_check:
-                self.reset()
+                self.reset(reset_pump=False)
 
             self.input_counter = 0
 
@@ -103,47 +104,43 @@ class ExcavatorController:
             else:
                 self.kit.continuous_servo[pump_channel].throttle = -0.9
 
-        # Adjust the servo angles
-        for channel_name, config in CHANNEL_CONFIGS.items():
-            if config['type'] == 'angle':
-                value = config['offset'] + center_val_servo + (config['direction'] * values[config['output_channel']]
-                                                            * config['multiplier'])
+        try:
+            # Adjust the servo angles
+            for channel_name, config in CHANNEL_CONFIGS.items():
+                if config['type'] == 'angle':
+                    value = config['offset'] + center_val_servo + (config['direction'] * values[config['output_channel']]
+                                                        * config['multiplier'])
 
-                # give the value to the servo
-                self.kit.servo[config['output_channel']].angle = value
+                    # set angle values
+                    self.kit.servo[config['output_channel']].angle = value
 
+                # set throttle value
+                # differentiate from pump!
+                # elif config['type'] == 'throttle':
+                    # self.kit.continuous_servo[config['output_channel']].throttle = value
 
-                # TEST THIS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                #elif config['type'] == 'throttle':
-                    #self.kit.continuous_servo[config['output_channel']].throttle = value
+        except (ValueError, IndexError, KeyError) as e:
+            raise ServoKitWriteError(f"Failed to set values! Error: {e}")
 
     def reset(self, reset_pump=True):
         if self.simulation_mode:
             print("Simulated reset")
-            sleep(2)
             return
 
-<<<<<<< Updated upstream
-        # Set the pump to -1 throttle
-        if 'pump' in CHANNEL_CONFIGS and CHANNEL_CONFIGS['pump']['type'] == 'throttle':
-            self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -1.0
-=======
         if reset_pump:
             # Set the pump to -1 throttle
             if 'pump' in CHANNEL_CONFIGS and CHANNEL_CONFIGS['pump']['type'] == 'throttle':
-                self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -0.9
->>>>>>> Stashed changes
+                self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -1.0
 
         # Reset all servos that have a type of 'angle' to their center value
         for channel_name, config in CHANNEL_CONFIGS.items():
             if config['type'] == 'angle':
                 self.kit.servo[config['output_channel']].angle = center_val_servo + config.get('offset', 0)
 
-        print("Reseted servos!")
-        sleep(2)
 
 class ServoKitNotAvailableError(Exception):
     pass
+
 
 class ServoKitWriteError(Exception):
     pass
