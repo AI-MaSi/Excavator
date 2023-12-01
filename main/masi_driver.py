@@ -117,15 +117,22 @@ class ExcavatorController:
                 #elif config['type'] == 'throttle':
                     #self.kit.continuous_servo[config['output_channel']].throttle = value
 
-    def reset(self):
+    def reset(self, reset_pump=True):
         if self.simulation_mode:
             print("Simulated reset")
             sleep(2)
             return
 
+<<<<<<< Updated upstream
         # Set the pump to -1 throttle
         if 'pump' in CHANNEL_CONFIGS and CHANNEL_CONFIGS['pump']['type'] == 'throttle':
             self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -1.0
+=======
+        if reset_pump:
+            # Set the pump to -1 throttle
+            if 'pump' in CHANNEL_CONFIGS and CHANNEL_CONFIGS['pump']['type'] == 'throttle':
+                self.kit.continuous_servo[CHANNEL_CONFIGS['pump']['output_channel']].throttle = -0.9
+>>>>>>> Stashed changes
 
         # Reset all servos that have a type of 'angle' to their center value
         for channel_name, config in CHANNEL_CONFIGS.items():

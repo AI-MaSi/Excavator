@@ -28,7 +28,7 @@ data_format = 'd'
 checksum_format = 'B'
 
 # ISM330 IMU's use these multiplexer channels
-multiplexer_channels = [0, 1, 2]
+multiplexer_channels = [0, 1, 2, 3]
 tca_address=0x71
 bno08x_address=0x4a
 

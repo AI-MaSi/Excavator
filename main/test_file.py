@@ -1,7 +1,6 @@
 """
 This is a messy test script to drive around with the excavator.
-The script will save ISM330, pressure sensor and pump rpm data. Saves to .bin file
-Also the script tests bno08x-IMU, and saves the test results to .txt -file
+The script will save sensor data to .bin -file
 """
 
 import universal_socket_manager
@@ -18,7 +17,8 @@ stop_thread = False
 
 
 simulation_mode = False
-threshold = 8  # at least this many messages required every interval time
+threshold = 3  # at least this many messages required every interval time
+interval = 0.5 # seconds
 
 # init socket
 manager = universal_socket_manager.MasiSocketManager()
@@ -49,14 +49,15 @@ def setup():
     return handshake_result
 
 
-def message_monitor(threshold, interval=1.0):
+def message_monitor(threshold, interval):
     global message_count, stop_thread
     while not stop_thread:
         sleep(interval)
         with message_count_lock:
             if message_count < threshold:
                 print("Message count below threshold.")
-                controller.reset()
+                # reset servos but keep the pump running
+                controller.reset(reset_pump=False)
             # Reset message count for the next interval
             message_count = 0
 
@@ -71,9 +72,6 @@ def collect_data():
     # get the pump rpm
     rpm_data = rpm_manager.get_rpm()
     data_i_want_to_save.append(rpm_data)
-
-    print(f"datalen: {len(data_i_want_to_save)}")
-
     packed_data = manager.pack_data(data_i_want_to_save)
 
     # Add an empty checksum byte to the packed_data
@@ -109,7 +107,7 @@ def run():
 if __name__ == "__main__":
     if setup():
         # Start the message monitoring thread
-        monitor_thread = threading.Thread(target=message_monitor, args=(threshold,))
+        monitor_thread = threading.Thread(target=message_monitor, args=(threshold,interval))
         monitor_thread.start()
         try:
             run()
@@ -118,10 +116,10 @@ if __name__ == "__main__":
             stop_thread = True
             monitor_thread.join()
             # Cleanup
-            manager.save_remaining_data(num_doubles=32)
+            manager.save_remaining_data(num_doubles=31)
             manager.close_socket()
             controller.reset()
             rpm_manager.cleanup()
             # Misc
             sleep(2)
-            manager.print_bin_file(num_doubles=32)
+            manager.print_bin_file(num_doubles=31)
