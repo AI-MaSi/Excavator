@@ -90,7 +90,7 @@ CHANNEL_CONFIGS = {
     'tool1': {'output_channel': 6, 'type': 'angle', 'offset': 0, 'direction': 1, 'multiplier': 10, 'input_channel': 5},
     'tool2': {'output_channel': 7, 'type': 'angle', 'offset': 0, 'direction': 1, 'multiplier': 10, 'input_channel': 2},
     'not used1': {'output_channel': 8, 'type': 'none'},
-    'pump': {'output_channel': 9, 'type': 'throttle', 'offset': 0, 'direction': 1, 'idle': -0.1, 'multiplier': 2, 'variable': 1, 'input_channel': 'none'},
+    'pump': {'output_channel': 9, 'type': 'throttle', 'offset': 0, 'direction': 1, 'idle': -0.1, 'multiplier': 2.0, 'input_channel': 'none'},
     'not used2': {'output_channel': 10, 'type': 'none'},
     'not used3': {'output_channel': 11, 'type': 'none'},
     'not used4': {'output_channel': 12, 'type': 'none'},

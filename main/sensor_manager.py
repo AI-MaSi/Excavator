@@ -1,7 +1,7 @@
 import random
 import time
 import threading
-from config import multiplexer_channels, tca_address, bno08x_address
+from config import multiplexer_channels, tca_address #bno08x_address
 
 try:
     import board
@@ -118,6 +118,7 @@ class IMUSensorManager:
         # return list(data)
         return data
 
+    """
     def read_bno08(self):
 
         if not self.simulation_mode:
@@ -147,6 +148,7 @@ class IMUSensorManager:
             data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
 
         return data
+        """
 
 class IMUmodulesNotAvailableError(Exception):
     pass

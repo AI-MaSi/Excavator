@@ -6,35 +6,24 @@ The script will save sensor data to .bin -file
 import universal_socket_manager
 import masi_driver
 import sensor_manager
-
-import threading
 from time import sleep
-
-# Shared variables and lock for thread communication
-message_count = 0
-message_count_lock = threading.Lock()
-stop_thread = False
-
-
-simulation_mode = False
-threshold = 3  # at least this many messages required every interval time
-interval = 0.5 # seconds
 
 # init socket
 manager = universal_socket_manager.MasiSocketManager()
 # exceptions soon...
 
 # init servo controller
-controller = masi_driver.ExcavatorController(simulation_mode=simulation_mode)
+controller = masi_driver.ExcavatorController(simulation_mode=False, tracks_disabled=True, pump_variable=False)
 
 # init IMU's
-imu_manager = sensor_manager.IMUSensorManager(simulation_mode=simulation_mode)
+imu_manager = sensor_manager.IMUSensorManager(simulation_mode=False)
 
 # init pressure checking
 pressure_manager = sensor_manager.PressureSensor()
 
 # init RPM check
 rpm_manager = sensor_manager.RPMSensor()
+
 
 def setup():
     manager.clear_file()
@@ -48,18 +37,6 @@ def setup():
         print("could not make handshake!")
     return handshake_result
 
-
-def message_monitor(threshold, interval):
-    global message_count, stop_thread
-    while not stop_thread:
-        sleep(interval)
-        with message_count_lock:
-            if message_count < threshold:
-                print("Message count below threshold.")
-                # reset servos but keep the pump running
-                controller.reset(reset_pump=False)
-            # Reset message count for the next interval
-            message_count = 0
 
 def collect_data():
     # get values from the sensors
@@ -77,15 +54,11 @@ def collect_data():
     # Add an empty checksum byte to the packed_data
     # Now data will be in the same format as the packed MotionPlatform joystick data
     packed_data += b'\x00'
-
     manager.add_data_to_buffer(packed_data)
 
 
 def run():
-    global message_count
-
     while True:
-
         # I only want to send handshake
         # outputs are set to 0, handshake is sent automatically
         manager.send_data(data=None)
@@ -100,26 +73,21 @@ def run():
         # use joystick values to control the excavator
         controller.update_values(data_i_want_to_receive)
 
-        with message_count_lock:
-            message_count += 1
-
 
 if __name__ == "__main__":
     if setup():
-        # Start the message monitoring thread
-        monitor_thread = threading.Thread(target=message_monitor, args=(threshold,interval))
-        monitor_thread.start()
         try:
             run()
         finally:
-            # Signal the monitoring thread to stop and wait for it to finish
-            stop_thread = True
-            monitor_thread.join()
             # Cleanup
+            # save data left over
             manager.save_remaining_data(num_doubles=31)
+            # close socket connections
             manager.close_socket()
+            # reset servos and stop the pump
             controller.reset()
+            # clean up rpm-GPIO pins
             rpm_manager.cleanup()
-            # Misc
             sleep(2)
+            # Misc. Print the saved values.
             manager.print_bin_file(num_doubles=31)

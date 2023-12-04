@@ -1,3 +1,7 @@
+"""
+Use this script to test the bno08x sensor for errors
+"""
+
 from time import sleep, time
 from collections import deque
 import board
@@ -73,13 +77,16 @@ def save_test_results_to_file(test_results, num_passes, filename):
                 file.write(f"{test_name} - No failures detected.\n")
         file.write("-----------------------------------------------------------\n")
 
-"""
+
 num_passes = int(input("Enter the (thousand) number of measurements to perform: "))
 
+test_results.append(('Test with 30 Hz', test_bno08x(num_passes, 30)))
+
+"""
 test_results.append(('Test with 20 Hz', test_bno08x(num_passes, 20)))
 test_results.append(('Test with 50 Hz', test_bno08x(num_passes, 50)))
 test_results.append(('Test with 100 Hz', test_bno08x(num_passes, 100)))
-
+"""
 save_test_results_to_file(test_results, num_passes, "log/bno08x_test_results.txt")
 print("Test results saved to 'bno08x_test_results.txt'")
-"""
+
