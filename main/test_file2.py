@@ -10,7 +10,6 @@ from time import sleep
 
 # init socket
 manager = universal_socket_manager.MasiSocketManager()
-# exceptions soon...
 
 # init servo controller
 controller = masi_driver.ExcavatorController(simulation_mode=False, tracks_disabled=True, pump_variable=False)
@@ -58,6 +57,7 @@ def collect_data():
 
 
 def run():
+    record_flag = False
     while True:
         # I only want to send handshake
         # outputs are set to 0, handshake is sent automatically
@@ -66,9 +66,23 @@ def run():
         # receive joystick values
         data_i_want_to_receive = manager.receive_data()
 
+        rec_start_button = data_i_want_to_receive[12]  # right stick top button
+        rec_stop_button = data_i_want_to_receive[11]  # right stick bot button
+
+        if rec_start_button and not record_flag:
+            print("Started recording!")
+            record_flag = True
+        if rec_stop_button and record_flag:
+            print("Stopped recording!")
+            record_flag = False
+
+
+
+
         # get all the sensor data. should be 25 doubles
-        collect_data()
-        # this sends them to buffer straight away
+        if record_flag:
+            collect_data()
+            # this sends them to buffer straight away
 
         # use joystick values to control the excavator
         controller.update_values(data_i_want_to_receive)
