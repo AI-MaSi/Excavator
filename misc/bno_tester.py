@@ -69,7 +69,7 @@ def save_test_results_to_file(test_results, num_passes, filename):
         for test_name, failures in test_results:
             if failures:
                 failure_rate = (len(failures) / (num_passes * 1000)) * 100
-                file.write(f"{test_name} - {len(failures)} Failed measurements ({failure_rate:.2f}%):\n")
+                file.write(f"{test_name} with {num_passes} passes - {len(failures)} Failed measurements ({failure_rate:.2f}%):\n")
                 for failure in failures:
                     file.write(f"Loop {failure[0]}: Error - {failure[1]}\n")
                 file.write("\n")
