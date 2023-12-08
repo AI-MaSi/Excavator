@@ -180,7 +180,7 @@ class RPMSensor:
         GPIO.setup(self.hall_sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.add_event_detect(self.hall_sensor_pin, GPIO.FALLING, callback=self.sensor_callback)
 
-    def sensor_callback(self, channel):
+    def sensor_callback(self): #channel removed
         self.pulse_count += 1
 
     def calculate_rpm(self):

@@ -12,8 +12,6 @@ except ImportError:
     SERVOKIT_AVAILABLE = False
 
 
-
-
 class ExcavatorController:
     def __init__(self, simulation_mode=False, toggle_pump=True, pump_variable=True, tracks_disabled=False, num_inputs=20):
         # simulated values instead of real control inputs
@@ -73,9 +71,13 @@ class ExcavatorController:
 
             self.input_counter = 0
 
-    def update_values(self, raw_values):
+    def update_values(self, raw_values, min_cap=-1, max_cap=1):
+        # check values and make them go in the right place here
         if len(raw_values) != self.num_inputs:
             raise ValueError(f"Expected {self.num_inputs} inputs, but received {len(raw_values)}.")
+
+        # Calculate threshold value from deadzone % and min/max value
+        deadzone_threshold = deadzone / 100.0 * (max_cap - min_cap)
 
         # Iterate through channel configurations
         for channel_name, config in CHANNEL_CONFIGS.items():
@@ -87,8 +89,15 @@ class ExcavatorController:
                 if input_channel == 'none' or input_channel >= len(raw_values):
                     continue
 
-                # Assign the value from the input channel to the correct output channel
-                self.values[output_channel] = raw_values[input_channel]
+                # Apply limits to raw value
+                capped_value = max(min_cap, min(raw_values[input_channel], max_cap))
+
+                # Apply deadzone. Same for all channels now...
+                if abs(capped_value) < deadzone_threshold:
+                    capped_value = 0
+
+                # Assign the processed value to the correct output channel
+                self.values[output_channel] = capped_value
 
                 self.input_counter += 1
 
@@ -96,20 +105,16 @@ class ExcavatorController:
         self.use_values(self.values)
 
     def use_values(self, values):
-        # Increase pump speed when set channels go over a certain threshold
         if self.pump_variable:
-            active_channels_count = sum([1 for i in hydraulic_multiplier_channels if abs(values[i]) > (deadzone / 100)])
+            # Deadzone already handled, increase multiplier if value is not 0
+            active_channels_count = sum(1 for channel, config in CHANNEL_CONFIGS.items() if config['affects_pump']
+                                        and abs(values[config['output_channel']]) > 0)
         else:
-            # spin pump a bit faster with fixed speed
+            # spin pump a bit faster (than idle) with fixed speed
             active_channels_count = 3
 
         if self.simulation_mode:
             print(f"values: {values}")
-            for i in hydraulic_multiplier_channels:
-                print(f"Hydraulic channel {i}, Value: {values[i]}, Abs Value: {abs(values[i])}, Deadzone: {deadzone}%")
-                if abs(values[i]) > deadzone / 100:
-                    print(f"Channel {i} is active!")
-            return
 
         if 'pump' in CHANNEL_CONFIGS and CHANNEL_CONFIGS['pump']['type'] == 'throttle':
             pump_channel = CHANNEL_CONFIGS['pump']['output_channel']
@@ -131,7 +136,7 @@ class ExcavatorController:
                         continue
 
                     value = config['offset'] + center_val_servo + (config['direction'] * values[config['output_channel']]
-                                                        * config['multiplier'])
+                                                                   * config['multiplier'])
 
                     # set angle values
                     self.kit.servo[config['output_channel']].angle = value
