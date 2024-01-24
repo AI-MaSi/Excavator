@@ -142,9 +142,21 @@ class ExcavatorController:
                     self.kit.servo[config['output_channel']].angle = value
 
                 # set throttle value
-                # differentiate from pump!
-                # elif config['type'] == 'throttle':
-                    # self.kit.continuous_servo[config['output_channel']].throttle = value
+                # add not pump!!
+                #elif config['type'] == 'throttle':
+                    #self.kit.continuous_servo[config['output_channel']].throttle = value
+
+
+                # finish this. check absolute etc.!!
+                elif config['type'] == 'switch':
+                    value = values[config['output_channel']]
+                    if value > config['threshold']:
+                        # set true
+                        pass
+
+                    else:
+                        # set false
+                        pass
 
         except (ValueError, IndexError, KeyError) as e:
             self.reset()

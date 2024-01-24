@@ -1,15 +1,13 @@
 import socket
 import struct
-import datetime
+from datetime import datetime
 import threading
 import os
 
 from time import sleep
 
 # using these directly now. Add to __init__ if more flexibility needed
-from config import (file_path, local_addr, port, connect_addr, identification_number,
-                    inputs, outputs, endian_specifier, data_format, checksum_format,
-                    unix_format, handshake_format, BUFFER_SIZE)
+from config import *
 
 
 # make proper exceptions you lazy man
@@ -18,6 +16,10 @@ class MasiSocketManager:
         # lock needed if using threading in the future...
         self.data_save_lock = threading.Lock()
         self.checksum_bytes = struct.calcsize((endian_specifier + checksum_format))
+
+        file_extension = ".bin" # not meant to be user changeable for now
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        self.filepath = os.path.join(dir_path, f"{base_filename}_{current_date}{file_extension}")
 
         self.local_socket = None
         self.connected_socket = None
@@ -37,30 +39,28 @@ class MasiSocketManager:
         return checksum
 
     @staticmethod
-    def clear_file():
-        with open(file_path, 'wb'):
-            pass
-        print("Cleared file!")
-
-    @staticmethod
     def pack_data(data):
         # using fixed data_format as Mevea only accepts doubles!
         return struct.pack(endian_specifier + data_format * len(data), *data)
 
-    @staticmethod
-    def print_bin_file(num_doubles):
+    def clear_file(self):
+        with open(self.filepath, 'wb'):
+            pass
+        print("Cleared file!")
+
+    def print_bin_file(self, num_doubles):
         format_str = endian_specifier + unix_format + data_format * num_doubles + checksum_format
 
         print(f"File format is: {str(format_str)}")
         sleep(2)
         data_size = struct.calcsize(format_str)
 
-        if not os.path.exists(file_path):
-            print(f"Error: File '{file_path}' does not exist.")
+        if not os.path.exists(self.filepath):
+            print(f"Error: File '{self.filepath}' does not exist.")
             # raise or create file
             return
 
-        with open(file_path, 'rb') as f:
+        with open(self.filepath, 'rb') as f:
             while True:
                 packed_data = f.read(data_size)
                 if not packed_data:
@@ -159,7 +159,7 @@ class MasiSocketManager:
 
         if received_checksum != computed_checksum:
             print("Checksum mismatch!")
-            #raise???
+            # raise???
             return False
 
         decoded_values = [round(struct.unpack((endian_specifier + data_format), chunk)[0], 2)
@@ -171,7 +171,7 @@ class MasiSocketManager:
     def add_data_to_buffer(self, packed_data):
         # add UNIX-timestamp and add to buffer
         with self.data_save_lock:
-            current_timestamp = datetime.datetime.now().timestamp()
+            current_timestamp = datetime.now().timestamp()
             microsecond_timestamp = int(current_timestamp * 1e6)
 
             timestamped_data = struct.pack((endian_specifier + unix_format), microsecond_timestamp) + packed_data
@@ -183,7 +183,7 @@ class MasiSocketManager:
 
     def save_buffer(self):
         # save data from buffer to file
-        with open(file_path, 'ab') as f:
+        with open(self.filepath, 'ab') as f:
             for value in self.data_buffer:
                 f.write(value)
         print("saved data to file...")
@@ -193,7 +193,7 @@ class MasiSocketManager:
     def save_remaining_data(self, num_doubles):
         # If there's remaining data in the buffer, save it to file
         if self.data_buffer:
-            with open(file_path, 'ab') as f:
+            with open(self.filepath, 'ab') as f:
                 for value in self.data_buffer:
                     missing_values = num_doubles - (len(value) // 8 - 1)  # subtract 1 for the timestamp
                     value += struct.pack((endian_specifier + '{}' + data_format).format(missing_values), *([0.0] * missing_values))  # 0.0 doubles

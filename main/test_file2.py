@@ -3,7 +3,7 @@ This is a messy test script to drive around with the excavator.
 The script will save sensor data to .bin -file
 """
 
-import universal_socket_manager
+import universal_connection_manager
 import masi_driver
 import sensor_manager
 from time import sleep
