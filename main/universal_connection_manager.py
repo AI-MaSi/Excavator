@@ -7,7 +7,7 @@ import os
 from time import sleep
 
 # using these directly now. Add to __init__ if more flexibility needed
-from config import *
+from config import * #prööt, when more time create eg. json-config
 
 
 # make proper exceptions you lazy man
@@ -203,7 +203,35 @@ class MasiSocketManager:
         else:
             print("no data in buffer to save!")
 
-    def handshake(self):
+    def prepare_extra_args(self, kwargs, num_args=3):
+        # Prepare extra arguments for sending, ensuring exactly num_args are present
+        extra_args_to_send = list(kwargs.values())[:num_args]
+        extra_args_to_send.extend([0] * (num_args - len(extra_args_to_send)))  # Fill with 0s if needed
+        return extra_args_to_send
+
+    def receive_extra_args(self, num_args=3):
+        # Receive extra arguments from the connection
+        recvd_extra_args = []
+        for _ in range(num_args):
+            packed_arg = self.connected_socket.recv(struct.calcsize(handshake_format))
+            arg, = struct.unpack(endian_specifier + handshake_format, packed_arg)
+            recvd_extra_args.append(arg)
+        return recvd_extra_args
+
+    def identify(self,device_name, recvd_extra_args):
+        # let the user know who is who
+        if device_name == "Undefined":
+            print(
+                f"Undefined handshake received from {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+        elif device_name == "Mevea":
+            print(
+                f"Handshake confirmed with Mevea device at {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+        else:
+            print(
+                f"Handshake received from {device_name} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+        print(f"Received extra arguments: {recvd_extra_args}")
+
+    def handshake(self, **kwargs):
         """
         Handshake is done so that it will work with Mevea.
         When the connection is accepted, Mevea will send 3x32bit integers
@@ -212,49 +240,50 @@ class MasiSocketManager:
         User needs to respond to this with [identification number], [number of inputs], [number of outputs]
         These values need to match!
         Please note that the response does not directly match the received data! (in / out flipped)
-        """
+         """
+
+        # Additional arguments for non-Mevea connections
+        for key, value in kwargs.items():
+            print(f"Additional argument added: {key} with value: {value}")
+
+        device_name = None
+        recvd_extra_args = None
+        extra_arguments = 3  # for setting additional stuff
 
         # handle handshake as server
         if self.socket_type == 'server':
-            # receive, then send
             packed_handshake = self.connected_socket.recv(12)  # 3x4 bytes
+            self.recvd_id_number, self.recvd_num_outputs, self.recvd_num_inputs = struct.unpack(
+                endian_specifier + handshake_format * 3, packed_handshake)
+            device_name = id_numbers.get(self.recvd_id_number, "Unknown")
 
-            self.recvd_id_number, self.recvd_num_outputs, self.recvd_num_inputs = struct.unpack((endian_specifier + 3*handshake_format), packed_handshake)
-            # send back the response handshake (in / out flipped)
-            response = struct.pack((endian_specifier + 3 * handshake_format), identification_number, inputs, outputs)
-            self.connected_socket.send(response)    # connected or local???
+            if device_name != "Mevea":
+                recvd_extra_args = self.receive_extra_args(extra_arguments)
+
+            extra_args_to_send = self.prepare_extra_args(kwargs, extra_arguments)
+            response_format = endian_specifier + handshake_format * (3 + extra_arguments)
+            response_values = [identification_number, inputs, outputs] + extra_args_to_send
+            response = struct.pack(response_format, *response_values)
+            self.connected_socket.send(response)
 
         # handle handshake as client
         elif self.socket_type == 'client':
-            # send, then receive
-            response = struct.pack((endian_specifier + 3 * handshake_format), identification_number, outputs, inputs)
+            extra_args_to_send = self.prepare_extra_args(kwargs, extra_arguments)
+            response = struct.pack(
+                endian_specifier + handshake_format * (3 + extra_arguments),
+                identification_number, outputs, inputs, *extra_args_to_send)
             self.local_socket.send(response)
 
-            # receive handshake
-            packed_handshake = self.local_socket.recv(12)  # 3x4 bytes
-            self.recvd_id_number, self.recvd_num_inputs, self.recvd_num_outputs = struct.unpack((endian_specifier + 3 * handshake_format), packed_handshake)
+            packed_handshake = self.local_socket.recv(12)
+            self.recvd_id_number, self.recvd_num_inputs, self.recvd_num_outputs = struct.unpack(
+                endian_specifier + handshake_format * 3, packed_handshake)
+            device_name = id_numbers.get(self.recvd_id_number, "Undefined")
 
-            # check the handshake
-            # identification number cannot be the same
-            if self.recvd_id_number == identification_number:
-                print("cannot connect two of the same!")
-                # raise
-            # in / out needs to match
-            if self.recvd_num_inputs != outputs or self.recvd_num_outputs != inputs:
-                print("input / output mismatch")
-                # raise
+            if device_name != "Mevea":
+                recvd_extra_args = self.receive_extra_args(extra_arguments)
 
-        # let the user know the handshake results
-        if self.recvd_id_number == 0:
-            print(f"Handshake received from Excavator with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-        elif self.recvd_id_number == 1:
-            print(f"Handshake received from Mevea with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-        elif self.recvd_id_number == 2:
-            print(f"Handshake received from Motion Platform with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-        else:
-            print(f"Unknown handshake received from {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-            return False
+        self.identify(device_name, recvd_extra_args)
+        return recvd_extra_args
 
-        # calculate how many bytes we are going to receive
-        self.recv_bytes = struct.calcsize((endian_specifier + data_format)) * self.recvd_num_outputs + self.checksum_bytes
-        return True
+
+
