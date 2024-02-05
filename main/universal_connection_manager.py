@@ -7,7 +7,7 @@ import os
 from time import sleep
 
 # using these directly now. Add to __init__ if more flexibility needed
-from config import * #prööt, when more time create eg. json-config
+from config import *  # prööt, when more time create eg. json-config
 
 
 # make proper exceptions you lazy man
@@ -17,7 +17,7 @@ class MasiSocketManager:
         self.data_save_lock = threading.Lock()
         self.checksum_bytes = struct.calcsize((endian_specifier + checksum_format))
 
-        file_extension = ".bin" # not meant to be user changeable for now
+        file_extension = ".bin"  # not meant to be user changeable for now
         current_date = datetime.now().strftime("%Y-%m-%d")
         self.filepath = os.path.join(dir_path, f"{base_filename}_{current_date}{file_extension}")
 
@@ -196,7 +196,8 @@ class MasiSocketManager:
             with open(self.filepath, 'ab') as f:
                 for value in self.data_buffer:
                     missing_values = num_doubles - (len(value) // 8 - 1)  # subtract 1 for the timestamp
-                    value += struct.pack((endian_specifier + '{}' + data_format).format(missing_values), *([0.0] * missing_values))  # 0.0 doubles
+                    value += struct.pack((endian_specifier + '{}' + data_format).format(missing_values),
+                                         *([0.0] * missing_values))  # 0.0 doubles
                     f.write(value)
             self.data_buffer.clear()
             print("\nSaved remaining data.")
@@ -218,7 +219,7 @@ class MasiSocketManager:
             recvd_extra_args.append(arg)
         return recvd_extra_args
 
-    def identify(self,device_name, recvd_extra_args):
+    def identify(self, device_name, recvd_extra_args):
         # let the user know who is who
         if device_name == "Undefined":
             print(
@@ -281,6 +282,14 @@ class MasiSocketManager:
 
             if device_name != "Mevea":
                 recvd_extra_args = self.receive_extra_args(extra_arguments)
+
+        else:  # not correct socket-type
+            print("wrong socket type!")
+            return False
+
+        # calculate how many bytes we are going to receive (in drive loop)
+        self.recv_bytes = struct.calcsize(
+            (endian_specifier + data_format)) * self.recvd_num_outputs + self.checksum_bytes
 
         self.identify(device_name, recvd_extra_args)
         return recvd_extra_args
