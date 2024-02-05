@@ -3,8 +3,10 @@
 
 # add more servo types (on/off, GPIO???) for student projects!!
 
-local_addr = '10.214.3.104'
-connect_addr = '10.214.5.160'
+#local_addr = '10.214.3.104'
+#connect_addr = '10.214.5.160'
+local_addr = '127.0.0.1'
+connect_addr = '127.0.0.1'
 port = 5111
 identification_number = 0 # 0 excavator, 1 Mevea, 2 Motion Platform
 inputs = 20
@@ -15,13 +17,13 @@ base_filename = "excavator_recording"
 
 BUFFER_SIZE = 100
 
-# '<QI20DB'
+
+# please don't change these yet
+
 # '<'  Little-endian
 endian_specifier = '<'
 # 'Q' 8 byte integer (UNIX-timestamp)
 unix_format = 'Q'
-# REMOVED 'I'  Unsigned int (sequence number) 4 bytes
-# sequence_format = 'I'
 # 'i' Signed int (handshake) 4 bytes
 handshake_format = 'i'
 # 'd'  doubles (data) 8 bytes
@@ -32,11 +34,11 @@ checksum_format = 'B'
 # ISM330 IMU's use these multiplexer channels
 multiplexer_channels = [0, 1, 2, 3]
 tca_address=0x71
-bno08x_address=0x4a
 
 # Hal sensor GPIO pins
 gpio_rpm = 4
 gpio_center = 17
+
 
 """
 CHANNEL CONFIGS
@@ -72,13 +74,17 @@ VARIABLES
 "center_val_servo"
 Rough universal center value for all "angle" type servos
 
-"deadzone"
-Input center deadzone. 0...100(%)
 """
 
+
+# Rough universal center value for all "angle" type servos
 center_val_servo = 90
+
+# Input center deadzone. 0...100(%)
 deadzone = 15
-input_rate_threshold = 5  # at least this many messages per second or reset
+
+# at least this many messages per second or reset
+input_rate_threshold = 5
 
 
 # throttle
@@ -88,7 +94,7 @@ input_rate_threshold = 5  # at least this many messages per second or reset
 # 'name': {'output_channel': 0, 'type': 'angle', 'affects_pump': False, 'offset': -1, 'direction': -1, 'multiplier': 30, 'input_channel': 6}
 
 # switch
-#
+# WIP!
 
 
 CHANNEL_CONFIGS = {
@@ -103,9 +109,17 @@ CHANNEL_CONFIGS = {
     'not used1': {'output_channel': 8, 'type': 'none'},
     'pump': {'output_channel': 9, 'type': 'throttle', 'offset': 0, 'direction': 1, 'idle': -0.1, 'multiplier': 2.0, 'input_channel': 'none'},
     'not used2': {'output_channel': 10, 'type': 'none'},
-    'not used3': {'output_channel': 11, 'type': 'switch', 'threshold': 0.5, 'absolute': False, 'input_channel': 15}, # example, not ready yet
+    'not used3': {'output_channel': 11, 'type': 'switch', 'threshold': 0.5, 'absolute': False, 'input_channel': 15}, # example, not ready yet!
     'not used4': {'output_channel': 12, 'type': 'none'},
     'not used5': {'output_channel': 13, 'type': 'none'},
     'not used6': {'output_channel': 14, 'type': 'none'},
     'not used7': {'output_channel': 15, 'type': 'none'},
+}
+
+# identification numbers, you can add your own to the list
+id_numbers = {
+    0: "Excavator",
+    1: "Mevea",
+    2: "Motion Platform",
+    3: "Digicenter"
 }
