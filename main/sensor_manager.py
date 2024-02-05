@@ -1,7 +1,9 @@
+# bno08x removed 5.2.2024
+
 import random
 import time
 import threading
-from config import multiplexer_channels, tca_address #bno08x_address
+from config import multiplexer_channels, tca_address
 
 try:
     import board
@@ -11,24 +13,13 @@ try:
 
     import RPi.GPIO as GPIO
     from ADCPi import ADCPi
-    """
-    from adafruit_bno08x.i2c import BNO08X_I2C
-    from adafruit_bno08x import (
-        BNO_REPORT_MAGNETOMETER,
-        BNO_REPORT_ROTATION_VECTOR,
-            )
-    """
+
     IMU_MODULES_AVAILABLE = True
 except ImportError as e:
     print(f"Failed to import modules: {e}")
     IMU_MODULES_AVAILABLE = False
 
-"""
-bno_features = [
-    BNO_REPORT_MAGNETOMETER,
-    BNO_REPORT_ROTATION_VECTOR,
-            ]
-"""
+
 class IMUSensorManager:
     def __init__(self, simulation_mode=False, decimals=2):
         self.simulation_mode = simulation_mode
@@ -64,20 +55,6 @@ class IMUSensorManager:
             except Exception as e:
                 raise ISM330InitializationError(f"Error initializing ISM330DHCX on channel {channel}: {e}")
 
-    """
-    def initialize_bno08(self, address):
-        try:
-            self.bno08x = BNO08X_I2C(self.i2c, address=address)
-            self.bno08x.initialize()
-
-            for feature in bno_features:
-                self.bno08x.enable_feature(feature)
-
-            print(f"BNO08x sensor initialized.")
-            # find right exception
-        except Exception as e:
-            raise BNO08xInitializationError(f"Error initializing BNO08x sensor: {e}")
-    """
     def read_all(self):
         combined_data = []
 
@@ -118,37 +95,6 @@ class IMUSensorManager:
         # return list(data)
         return data
 
-    """
-    def read_bno08(self):
-
-        if not self.simulation_mode:
-            if IMU_MODULES_AVAILABLE:
-                try:
-                    mag_x, mag_y, mag_z = [round(val, self.decimals) for val in self.bno08x.magnetic]
-                    quat_i, quat_j, quat_k, quat_real = [round(val, self.decimals) for val in self.bno08x.quaternion]
-                    data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
-                except Exception as e:
-                    print(e)
-                    # find the right exceptions!
-                    mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real = [0.0 for _ in range(7)]
-                    data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
-
-                    self.bno08x.soft_reset()
-                    print("soft reset")
-                    self.bno08x.initialize()
-                    print("re init")
-
-            else:
-                raise BNO08xReadError("BNO08x drivers are not available or simulation mode is not enabled.")
-        else:
-
-            mag_x, mag_y, mag_z = [random.uniform(0, 10) for _ in range(3)]
-            quat_i, quat_j, quat_k, quat_real = [random.uniform(0, 10) for _ in range(4)]
-
-            data = mag_x, mag_y, mag_z, quat_i, quat_j, quat_k, quat_real
-
-        return data
-        """
 
 class IMUmodulesNotAvailableError(Exception):
     pass
@@ -159,11 +105,6 @@ class ISM330InitializationError(Exception):
 class ISM330ReadError(Exception):
     pass
 
-class BNO08xInitializationError(Exception):
-    pass
-
-class BNO08xReadError(Exception):
-    pass
 
 class RPMSensor:
     def __init__(self, rpm_sensor_pin=4, magnets=14, decimals=2):
@@ -242,4 +183,5 @@ class CenterPositionSensor:
 
     def check_center_position(self):
         # check position
+        # forgot this even exists, do someday!
         pass
