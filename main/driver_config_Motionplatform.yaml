@@ -1,0 +1,119 @@
+
+
+CHANNEL_CONFIGS:
+  trackR:
+    input_channel: 6    # The index of the input data array
+    output_channel: 0   # The PWM hat channel, same as printed on the PCB
+    type: angle         # type of the controlled thing. angle(eg. servo), throttle(eg. motor), switch(eg. LED)
+    affects_pump: false # use of the channel will increase pump speed
+    offset: -1          # center position fine-tuning
+    direction: -1       # change direction
+    multiplier: 30      # change sensitivity
+
+  trackL:
+    input_channel: 7
+    output_channel: 1
+    type: angle
+    affects_pump: false
+    offset: -1
+    direction: 1
+    multiplier: 30
+
+  scoop:
+    input_channel: 0
+    output_channel: 2
+    type: angle
+    affects_pump: true
+    offset: 8.5
+    direction: 1
+    multiplier: 30
+
+  lift_boom:
+    input_channel: 1
+    output_channel: 3
+    type: angle
+    affects_pump: true
+    offset: 8
+    direction: 1
+    multiplier: 30
+
+  tilt_boom:
+    input_channel: 4
+    output_channel: 4
+    type: angle
+    affects_pump: true
+    offset: 4
+    direction: 1
+    multiplier: 30
+
+  rotate:
+    input_channel: 3
+    output_channel: 5
+    type: angle
+    affects_pump: false
+    offset: 5
+    direction: -1
+    multiplier: 12
+
+  tool1:
+    input_channel: 5
+    output_channel: 6
+    type: angle
+    affects_pump: true
+    offset: 0
+    direction: 1
+    multiplier: 10
+
+  tool2:
+    input_channel: 2
+    output_channel: 7
+    type: angle
+    affects_pump: true
+    offset: 0
+    direction: 1
+    multiplier: 10
+
+  pump:
+    input_channel: none
+    output_channel: 9
+    type: pump
+    offset: 0
+    direction: 1
+    idle: -0.1
+    multiplier: 2.0
+
+  test:
+    input_channel: 12
+    output_channel: 10
+    type: none
+    offset: 0
+    direction: 1
+    idle: -0.1
+    multiplier: 999.0
+
+
+
+
+
+# You can add up to 16 channels. Unused channels can be configured as needed.
+
+# EXAMPLES:
+
+# WIP!!!!!!
+
+# drill:
+ # input_channel: x
+ # output_channel: y
+ # type: switch
+ # treshold: 0.5
+ # absolute: False
+
+# variableDrill:
+ # input_channel: x
+ # output_channel: y
+ # type: throttle # this is giving raw value for now!!
+ # offset: 0
+ # direction: 1
+ # multiplier: 10
+
+

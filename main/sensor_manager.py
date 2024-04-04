@@ -3,7 +3,7 @@
 import random
 import time
 import threading
-from config import multiplexer_channels, tca_address
+#from config import multiplexer_channels, tca_address
 
 try:
     import board
