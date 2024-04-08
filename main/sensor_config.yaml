@@ -1,0 +1,85 @@
+# only pressure sensors for now
+
+ADC_CONFIG:
+  i2c_addresses:
+    b1: [0x6E,0x6F]  # I2C address for board 1
+    b2: [0,0]  # I2C address PLACEHOLDER for board 2
+
+  pga_gain: 1
+  # Set the gain of the PGA on the chip
+  # Parameters: gain - 1, 2, 4, 8
+
+  bit_rate: 14
+  # Parameters: rate - 12, 14, 16, 18. Samples Per Second (SPS)
+  # 12 = 12 bit (240SPS max)
+  # 14 = 14 bit (60SPS max)
+  # 16 = 16 bit (15SPS max)
+  # 18 = 18 bit (3.75SPS max)
+
+  conversion_mode: 1
+  # Set the conversion mode for the ADC
+  # Parameters: mode - 0 = One-shot conversion, 1 = Continuous conversion
+
+  # (One-shot conversion) Perform a single conversion upon trigger, conserving power and resources for infrequent measurements
+  # (Continuous conversion) Continuously convert analog signals to digital, suitable for real-time monitoring
+
+
+
+PRESSURE_SENSORS:
+  sensor1:
+    name: "LiftBoom retraction"         # Name
+    input: [b1,1]               # [Board number, Port number]
+    calibration_value: 1.000   # Multiplier for calibrating measurements
+
+  sensor2:
+    name: "LiftBoom extension"
+    input: [b1,2]
+    calibration_value: 1.000
+
+  sensor3:
+    name: "TiltBoom retraction"
+    input: [b1,3]
+    calibration_value: 1.000
+
+  sensor4:
+    name: "TiltBoom extension"
+    input: [b1,4]
+    calibration_value: 1.000
+
+  sensor5:
+    name: "Scoop extension"
+    input: [b1,5]
+    calibration_value: 1.000
+
+  sensor6:
+    name: "Scoop retraction"
+    input: [b1,6]
+    calibration_value: 1.000
+
+  sensor7:
+    name: "Pump"
+    input: [b1,7]
+    calibration_value: 1.000
+
+  sensor8:
+    name: "Tool1 B"
+    input: [2,1]
+    calibration_value: 1.000
+
+  sensor9:
+    name: "Tool1 B"
+    input: [2,2]
+    calibration_value: 1.000
+
+  sensor10:
+    name: "Tool2 A"
+    input: [2,3]
+    calibration_value: 1.000
+
+  sensor11:
+    name: "Tool2 B"
+    input: [2,4]
+    calibration_value: 1.000
+
+
+    # add more if connected

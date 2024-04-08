@@ -4,10 +4,10 @@
 import universal_connection_manager
 import masi_driver
 from sensor_manager import PressureSensor
-from time import sleep
+from time import time, sleep
 
 
-addr = '127.0.0.1'
+addr = '192.168.0.136'
 port = 5111
 
 # Who am I. Check config for names
@@ -21,7 +21,7 @@ outputs = 0
 
 # init pwm driver
 controller = masi_driver.ExcavatorController(inputs=inputs,
-                                             simulation_mode= True,
+                                             simulation_mode=False,
                                              config_file='driver_config_Motionplatform.yaml',
                                              pump_variable=True,)
 
@@ -57,20 +57,33 @@ def run():
     # start receiving
     masi_manager.start_data_recv_thread()
 
+    last_print_time = time()  # Initialize the last print time
 
     while True:
         # get latest received joystick values
         value_list = masi_manager.get_latest_received()
 
-        # update PWM driver values
+        # Update the controller with new values if any
         controller.update_values(value_list)
-        if value_list is not None:
-            print(f"Received: {value_list}")
+        #if value_list is not None:
+            #print(f"Received: {value_list}")
+
+        # Print sensor values (placeholder function call, replace with actual usage)
+        pressures = sensors.read_pressure(return_names=True)
+
+        print(pressures)
+
+        # Check if 3 seconds have elapsed since the last print
+        # WIP, shows wrong hz!!
+        current_time = time()
+        if current_time - last_print_time >= 3:
+            # Retrieve and print the current receiving frequency
+            current_hz = controller.get_current_hz()
+            print(f"Current Receiving Hz: {current_hz if current_hz is not None else 'N/A'}")
+            last_print_time = current_time  # Reset the last print time
 
 
-        pressures = sensors.read_pressure()
-
-        sleep(0.001)
+        #sleep(0.001)
 
 if __name__ == "__main__":
     run()

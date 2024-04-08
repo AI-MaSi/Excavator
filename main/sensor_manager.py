@@ -1,9 +1,10 @@
-# bno08x removed 5.2.2024
-
 import random
-import time
+from time import time, sleep
 import threading
-#from config import multiplexer_channels, tca_address
+import yaml
+
+
+
 
 try:
     import board
@@ -15,15 +16,17 @@ try:
     from ADCPi import ADCPi
 
     IMU_MODULES_AVAILABLE = True
+    GPIO.cleanup()
 except ImportError as e:
     print(f"Failed to import modules: {e}")
     IMU_MODULES_AVAILABLE = False
 
 
 class IMUSensorManager:
-    def __init__(self, simulation_mode=False, decimals=2):
+    # bno08x removed 5.2.2024
+    def __init__(self, simulation_mode=False, decimals=2, tca_address=0x71):
         self.simulation_mode = simulation_mode
-        self.multiplexer_channels = multiplexer_channels
+        self.multiplexer_channels = [0, 1, 2, 3]
         self.decimals = decimals
         self.bno08x = None
 
@@ -32,7 +35,7 @@ class IMUSensorManager:
                 self.i2c = board.I2C()
                 self.tca = adafruit_tca9548a.TCA9548A(self.i2c, address=tca_address)
                 self.sensors = {}
-                self.initialize_ism330(multiplexer_channels)
+                self.initialize_ism330(self.multiplexer_channels)
 
                 # refresh rate too slow!
                 # self.initialize_bno08(bno08x_address)
@@ -59,7 +62,7 @@ class IMUSensorManager:
         combined_data = []
 
         # Read data from each ISM330 sensor
-        for channel in multiplexer_channels:
+        for channel in self.multiplexer_channels:
             try:
                 ism330_data = self.read_ism330(channel)
                 combined_data.extend(ism330_data)
@@ -99,16 +102,18 @@ class IMUSensorManager:
 class IMUmodulesNotAvailableError(Exception):
     pass
 
+
 class ISM330InitializationError(Exception):
     pass
+
 
 class ISM330ReadError(Exception):
     pass
 
 
 class RPMSensor:
-    def __init__(self, rpm_sensor_pin=4, magnets=14, decimals=2):
-        self.hall_sensor_pin = rpm_sensor_pin
+    def __init__(self, sensor_pin=4, magnets=14, decimals=2):
+        self.sensor_pin = sensor_pin
         self.magnets = magnets
         self.pulse_count = 0
         self.rpm = 0
@@ -118,16 +123,16 @@ class RPMSensor:
 
     def setup_gpio(self):
         GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.hall_sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.add_event_detect(self.hall_sensor_pin, GPIO.FALLING, callback=self.sensor_callback)
+        GPIO.setup(self.sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(self.sensor_pin, GPIO.FALLING, callback=self.sensor_callback)
 
     def sensor_callback(self): #channel removed
         self.pulse_count += 1
 
     def calculate_rpm(self):
-        last_checked_time = time.time()
+        last_checked_time = time()
         while True:
-            current_time = time.time()
+            current_time = time()
             elapsed_time = current_time - last_checked_time
 
             if elapsed_time >= 1:  # Update every second
@@ -135,7 +140,7 @@ class RPMSensor:
                 self.pulse_count = 0
                 last_checked_time = current_time
 
-            time.sleep(0.1)
+            sleep(0.1)
 
     def start_measurement(self):
         self.thread = threading.Thread(target=self.calculate_rpm)
@@ -145,43 +150,114 @@ class RPMSensor:
     def get_rpm(self):
         return round(self.rpm, self.decimals)
 
+
     def cleanup(self):
-        GPIO.cleanup()
+        GPIO.cleanup(self.sensor_pin)
+
 
 class PressureSensor:
-    def __init__(self, i2c_addr=(0x6E, 0x6F), channels=6, decimals=2):
-        self.channel_numbers = channels
+    def __init__(self, decimals=3):
+
+        config_file = 'sensor_config.yaml'
+
+        # Load configs from .yaml file
+        with open(config_file, 'r') as file:
+            configs = yaml.safe_load(file)
+            self.sensor_configs = configs['PRESSURE_SENSORS']
+
+        # ADCPi settings
+        i2c_addresses = configs['ADC_CONFIG']['i2c_addresses']
+        pga_gain = configs['ADC_CONFIG']['pga_gain']
+        bit_rate = configs['ADC_CONFIG']['bit_rate']
+        conversion_mode = configs['ADC_CONFIG']['conversion_mode']
+
+        board_needs_initialization = {board_name: False for board_name in i2c_addresses.keys()}
+
+        for sensor_config in self.sensor_configs.values():
+            board_name = sensor_config['input'][0]
+            if board_name in board_needs_initialization:
+
+                board_needs_initialization[board_name] = True
+
+        print(f"Boards needed to init: {board_needs_initialization}")
+
+        # Initialize a dictionary to hold ADC objects
+        self.adcs = {}
+
         self.decimals = decimals
-        self.data = [0] * self.channel_numbers
         self.initialized = False
 
-        try:
-            self.adc = ADCPi(i2c_addr[0], i2c_addr[1], 12)
-            self.adc.set_conversion_mode(1)
-            self.initialized = True
-        except OSError as e:
-            print(f"Failed to set I2C-address! Error: {e}")
+        for board_name, need_init in board_needs_initialization.items():
+            if need_init:
+                addr1, addr2 = i2c_addresses[board_name]
 
-    def read_pressure(self):
+                try:
+                    # Create an instance of ADCPi with the addresses
+                    adc_instance = ADCPi(addr1, addr2, bit_rate)
+                    adc_instance.set_conversion_mode(conversion_mode)
+                    adc_instance.set_pga(pga_gain)
+
+                    # Store the initialized instance in the dictionary
+                    self.adcs[board_name] = adc_instance
+
+                    print(f"Initialized {board_name} with addresses {hex(addr1)}, {hex(addr2)}")
+                    print(f"PGA Gain: {pga_gain}, Bit Rate: {bit_rate} bits, Conversion Mode: {conversion_mode}")
+                except OSError as e:
+                    print(f"Failed to initialize ADCPi for {board_name}! Error: {e}")
+                    return
+
+        self.initialized = True
+
+    def read_pressure(self, return_names=False):
         if self.initialized:
-            for i in range(1, self.channel_numbers + 1):
-                voltage = self.adc.read_voltage(i)
-                if voltage > 0.40:
-                    # round values and convert the voltages to psi (rough)
-                    self.data[i - 1] = round(((1000 * (voltage - 0.5) / (4.5 - 0.5))), self.decimals)
+            sensor_data = []
+            # Iterate through each sensor configured
+            for sensor_name, sensor_config in self.sensor_configs.items():
+                board_name = sensor_config['input'][0]  # Get the board name from sensor input config
+                channel = sensor_config['input'][1]  # Get the channel from sensor input config
+                adc_instance = self.adcs[board_name]  # Retrieve the appropriate ADCPi instance by board name
+
+                # Read voltage from the specified channel on the appropriate ADCPi instance
+                voltage = adc_instance.read_voltage(channel)
+
+                # Process the voltage reading
+                if voltage > 0.40:  # filter out under 0.4V
+                    # Round values and convert the voltages to psi (rough)
+                    # Apply calibration value
+                    calibrated_value = round(
+                        (1000 * (voltage - 0.5) / (4.5 - 0.5)) * sensor_config['calibration_value'], self.decimals)
+                    value = calibrated_value
                 else:
-                    self.data[i - 1] = 0
-            return self.data
+                    value = 0
+
+                if return_names:
+                    # Include sensor name and value for debugging
+                    sensor_data.append((sensor_name, sensor_config['name'], value))
+                else:
+                    # Include only the value if not in debug mode
+                    sensor_data.append(value)
+
+            # Directly return the sensor data list
+            return sensor_data
         else:
             print("ADCPi not initialized!")
             return None
 
+
 class CenterPositionSensor:
     def __init__(self, sensor_pin=17):
-        # set the right GPIO pin
-        pass
+        self.sensor_pin = sensor_pin
+        self.setup_gpio()
+
+    def setup_gpio(self):
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     def check_center_position(self):
-        # check position
-        # forgot this even exists, do someday!
-        pass
+        if GPIO.input(self.sensor_pin):
+            return True  # Sensor is in center position
+        else:
+            return False
+
+    def cleanup(self):
+        GPIO.cleanup(self.sensor_pin)
