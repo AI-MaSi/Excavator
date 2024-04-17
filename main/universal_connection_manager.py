@@ -1,450 +1,231 @@
-"""
-WOW huge update
--keep alive -system removed
--ability to use UDP or TCP, TCP side not tested yet tho
--own thread to monitor incoming control signals
-
--Back and forth -communication has been fucked because I don't understand UDP well enough haha
-
-"""
-
-import threading
-import os
-from time import sleep
-from config import *  # prööt, when more time create e.g. json-config
-
-
-# Socket stuff
 import socket
 import struct
 from datetime import datetime
+import threading
+import os
+from collections import deque
+#from time import sleep
 
-# Gamepad
-from inputs import get_gamepad
-import math
+# identification numbers, you can add your own to the list
+id_numbers = {
+    0: "Excavator",
+    1: "Mevea",
+    2: "Motion Platform",
+    3: "Digicenter"
+}
 
-
-buffer_size = 100
-extra_args = 3
+# different datatypes available for send
+datatype_encoding = {
+    'int': 0,
+    'double': 1
+}
 
 
 class MasiSocketManager:
-    def __init__(self, identification_number, inputs, outputs):
+    def __init__(self,
+                 endian_specifier='<',              # Little-endian
+                 unix_format='d',                   # old 'Q' 8-byte integer
+                 handshake_format='i',              # 8-byte signed int
+                 checksum_format='B',               # 1-byte unsigned int
+                 int_format='b',                    # 1-byte signed int
+                 double_format='d',                 # 8-byte double (float)
+                 dir_path="log/",                   # Path for log file
+                 base_filename="data_recording",    # Name of the file. Date will be added at the end
+                 file_extension='.bin',             # log file type
+                 ):
 
-        # lock needed if using threading in the future...
-        self.data_save_lock = threading.Lock()
-        self.latest_data_lock = threading.Lock()
+        self.endian_specifier = endian_specifier
+        self.unix_format = unix_format
+        self.handshake_format = handshake_format
+        self.checksum_format = checksum_format
+        self.int_format = int_format
+        self.double_format = double_format
+        self.checksum_format_size = struct.calcsize(endian_specifier + checksum_format)
 
-        self.checksum_bytes = struct.calcsize((endian_specifier + checksum_format))
+        self.socket_type = None  # Client or Server. User selectable
+        self.network_protocol = None  # TCP or UDP. User selectable
+        self.filepath = None
 
-        file_extension = ".bin"  # not meant to be user changeable for now
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        self.filepath = os.path.join(dir_path, f"{base_filename}_{current_date}{file_extension}")
-
-        self.local_id_number = identification_number
-        self.local_num_inputs = inputs
-        self.local_num_outputs = outputs
-        self.data_format = data_format
-        self.data_buffer = []
-
+        self.local_id_number = None
+        self.local_num_inputs = None
+        self.local_num_outputs = None
         self.local_socket = None
-        self.connected_socket = None
         self.local_addr = None
-        self.connected_addr = None
+        self.local_output_datatype = None
+        self.local_datatype_size = None
+
         self.recvd_id_number = None
         self.recvd_num_inputs = None
         self.recvd_num_outputs = None
+        self.connected_socket = None
+        self.connected_addr = None
+        self.connected_output_datatype = None
+        self.connected_datatype_size = None
+
+        self.buffer_size = 100
+        #self.data_buffer = []
+        self.data_buffer = deque()  # Use deque for more efficient pops
+        self.pack_datatype = self.double_format  # for now force floating point numbers
+        self.len_buffer_data = None
+        self.saving_thread = None
+        self.saving_running = None
+
+        self.send_bytes = None
         self.recv_bytes = None
-        self.socket_type = None
-        self.network_protocol = None
-        self.running = None
+        self.data_recv_running = None
         self.data_reception_thread = None
         self.latest_recvd = None
 
-    @staticmethod
-    def compute_checksum(packed_data):
-        checksum = 0
-        for byte in packed_data:
-            checksum ^= byte
-        return checksum
 
-    @staticmethod
-    def prepare_extra_args(kwargs):
-        # Prepare extra arguments for sending, ensuring exactly num_args are present
-        extra_args_to_send = list(kwargs.values())[:extra_args]
-        extra_args_to_send.extend([0] * (extra_args - len(extra_args_to_send)))  # Fill no data with 0
-        return extra_args_to_send
+        self.latest_data_lock = threading.Lock()
 
-    def pack_data(self, data):
-        # ghetto packing using 1 byte integers
+        self.data_buffer_lock = threading.Lock()
+        self.buffer_not_empty = threading.Condition(self.data_buffer_lock)
 
-        int_data = []  # List to store converted integer values
-        for value in data:
-            clamped_value = max(-1.0, min(1.0, value))
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        self.filepath = os.path.join(dir_path, f"{base_filename}_{current_date}{file_extension}")
 
-            int_value = int(clamped_value * 100)  # haha ghetto convert
-            int_data.append(int_value)
+        # init done
 
-        packed_data = struct.pack(endian_specifier + self.data_format * len(int_data), *int_data)
+    def setup_socket(self, addr, port, identification_number, inputs, outputs, socket_type):
+        """Set up the socket as a client or server"""
+        self.local_id_number = identification_number
+        self.local_num_inputs = inputs
+        self.local_num_outputs = outputs
 
-        return packed_data
-
-    def clear_file(self):
-        with open(self.filepath, 'wb'):
-            pass
-        print("Cleared file!")
-
-    def print_bin_file(self, num_doubles):
-        format_str = endian_specifier + unix_format + self.data_format * num_doubles + checksum_format
-
-        print(f"File format is: {str(format_str)}")
-        sleep(2)
-        data_size = struct.calcsize(format_str)
-
-        if not os.path.exists(self.filepath):
-            print(f"Error: File '{self.filepath}' does not exist.")
-            # raise or create file
-            return
-
-        with open(self.filepath, 'rb') as f:
-            while True:
-                packed_data = f.read(data_size)
-                if not packed_data:
-                    break
-
-                # Unpack the data
-                data = struct.unpack(format_str, packed_data)
-                print(f"Raw data: {data}")
-
-    def setup_socket(self, addr, port, socket_type):
         if socket_type == 'client':
-            self.setup_socket_client(addr, port)
+            self.__setup_socket_client(addr, port)
 
         elif socket_type == 'server':
-            self.setup_socket_server(addr, port)
+            self.__setup_socket_server(addr, port)
         else:
-            print("Check socket type!")
+            print(f"Check socket type! {socket_type} given!")
             return False
         return True
 
-    def setup_socket_client(self, addr, port):
-        if not self.local_socket:
-            self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Set up as client. TCP
-            self.local_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print("Socket configured as a TCP-client!")
-            self.local_socket.connect((addr, port))
+    def handshake(self, local_datatype='double', num_extra_args=3, **kwargs):
+        local_datatype_code = datatype_encoding.get(local_datatype, 1)  # Default to 'double'
 
-            # Remember for later use
-            self.socket_type = 'client'
-            self.connected_addr = (addr, port)
-            self.connected_socket = self.local_socket
-            self.network_protocol = 'tcp'
-
-        else:
-            # socket already made, do something?
-            print("socket already made!")
-
-    def setup_socket_server(self, addr, port):
-        if not self.local_socket:
-            self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-            # Set up as server. TCP
-            self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.local_socket.bind((addr, port))
-            print(f"Socket configured as a TCP-server! Listening on {addr}:{port}")
-            self.local_socket.listen(1)
-            self.connected_socket, self.connected_addr = self.local_socket.accept()
-
-            self.socket_type = 'server'
-            self.local_addr = (addr, port)
-            self.network_protocol = 'tcp'
-
-        else:
-            # socket already made, do something?
-            print("socket already made!")
-
-    def close_socket(self):
-        if self.local_socket:
-            self.local_socket.close()
-            print("Socket closed successfully!")
-        else:
-            print("something wrong has happened somewhere")
-
-    def add_checks(self, packed_data):
-        # Compute checksum
-        checksum = self.compute_checksum(packed_data)
-        # Concatenate packed data with its checksum
-        packed_values = packed_data + struct.pack((endian_specifier + checksum_format), checksum)
-        # Sequence number removed
-        return packed_values
-
-    def send_data(self, data):
-
-        # pack data
-        packed_data = self.pack_data(data)
-        # add checks to packed data
-        final_data = self.add_checks(packed_data)
-
-        # send the data
-        # self.connected_socket.send(final_data) TCP
-        self.local_socket.sendto(final_data, self.connected_addr)
-
-        # save buffer data to file
-        if len(self.data_buffer) >= buffer_size:
-            self.save_buffer()
-        return final_data
-
-    def start_data_recv_thread(self):
-        if self.data_reception_thread is None or not self.data_reception_thread.is_alive():
-            self.running = True
-            self.data_reception_thread = threading.Thread(target=self.continuous_data_receiver, daemon=True)
-            self.data_reception_thread.start()
-            print("Started data receiving thread!")
-        else:
-            print("Data reception is already running.")
-
-    def stop_data_recv_thread(self):
-        self.running = False
-        if self.data_reception_thread is not None:
-            self.data_reception_thread.join()
-            self.data_reception_thread = None
-
-    def continuous_data_receiver(self, ultimate_relaxing_time=0.002):
-        while self.running:
-            try:
-                data = self.receive_data()
-                if data:
-                    with self.latest_data_lock:
-                        self.latest_recvd = data
-                # sleep(ultimate_relaxing_time)  # Consistent delay for both data and no-data scenarios
-            except Exception as e:
-                print(f"Error receiving data: {e}")
-                # sleep(ultimate_relaxing_time)  # Relax time in case of exceptions as well
-
-    def receive_data(self):
-        try:
-            if self.network_protocol == 'tcp':
-                full_data = self.connected_socket.recv(self.recv_bytes)
-            else:
-                full_data, addr = self.local_socket.recvfrom(self.recv_bytes)
-
-            if not full_data or len(full_data) != self.recv_bytes:
-                # Handles both keep-alive (len=1) and incomplete/missing data
-                print("No new data or incomplete data received.")
-                return None  # Unified return for no or incorrect data
-
-            return full_data  # Returns the full, received data for further processing
-        except Exception as e:
-            print(f"Error receiving data: {e}")
-            return None
-
-    def get_latest_received(self):
-        with self.latest_data_lock:
-            if self.latest_recvd is None:
-                return None  # Silently handle the no-data-yet case
-
-            try:
-                full_data = self.latest_recvd
-                received_checksum, = struct.unpack((endian_specifier + checksum_format),
-                                                   full_data[-self.checksum_bytes:])
-                computed_checksum = self.compute_checksum(full_data[:-self.checksum_bytes])
-                if received_checksum != computed_checksum:
-                    print("Checksum mismatch!")
-                    return None
-
-                decoded_values = [(struct.unpack(endian_specifier + self.data_format, chunk)[0] / 100.0)
-                                  for chunk in (full_data[i:i + struct.calcsize(endian_specifier + self.data_format)]
-                                                for i in range(0, len(full_data) - self.checksum_bytes,
-                                                               struct.calcsize(endian_specifier + self.data_format)))]
-                self.latest_recvd = None  # Reset after processing
-                return decoded_values
-            except Exception as e:
-                print(f"Error processing the latest received data: {e}")
-                return None
-
-    """
-    def receive_data(self):
-        if self.recvd_num_outputs == 0:
-
-            # sender has no outputs, just receive the keep alive
-            if self.network_protocol == 'tcp':
-                keep_alive = self.connected_socket.recv(1)
-            else:
-                keep_alive, addr = self.local_socket.recvfrom(1)
-
-            if len(keep_alive) == 1:
-                return True
-            else:
-                print("Lost keep-alive signal.")
-                return False
-
-        # recv_bytes calculated in the handshake -method
-        if self.network_protocol == 'tcp':
-            full_data = self.connected_socket.recv(self.recv_bytes)
-        else:
-            full_data, addr = self.local_socket.recvfrom(self.recv_bytes)
-
-        if len(full_data) != self.recv_bytes:
-            print(f"Data received is shorter than expected: {len(full_data)} instead of {self.recv_bytes}.")
-            # raise???
-            return False
-
-        # Extract and validate checksum
-        received_checksum, = struct.unpack((endian_specifier + checksum_format), full_data[-self.checksum_bytes:])
-        computed_checksum = self.compute_checksum(full_data[:-self.checksum_bytes])
-
-        if received_checksum != computed_checksum:
-            print("Checksum mismatch!")
-            # raise???
-            return False
-
-        decoded_values = [(struct.unpack(endian_specifier + self.data_format, chunk)[0] / 100.0)
-                          for chunk in (full_data[i:i + struct.calcsize(endian_specifier + self.data_format)]
-                                        for i in range(0, len(full_data) - self.checksum_bytes,
-                                                       struct.calcsize(endian_specifier + self.data_format)))]
-        return decoded_values
-
-    """
-
-    def add_data_to_buffer(self, packed_data):
-        # add UNIX-timestamp and add to buffer
-        with self.data_save_lock:
-            current_timestamp = datetime.now().timestamp()
-            microsecond_timestamp = int(current_timestamp * 1e6)
-
-            timestamped_data = struct.pack((endian_specifier + unix_format), microsecond_timestamp) + packed_data
-            self.data_buffer.append(timestamped_data)
-
-        # check if the buffer is full
-        if len(self.data_buffer) >= buffer_size:
-            self.save_buffer()
-
-    def save_buffer(self):
-        # save data from buffer to file
-        with open(self.filepath, 'ab') as f:
-            for value in self.data_buffer:
-                f.write(value)
-        print("saved data to file...")
-        self.data_buffer.clear()
-        return True
-
-    def save_remaining_data(self, num_values):
-        # If there's remaining data in the buffer, save it to file
-        if self.data_buffer:
-            with open(self.filepath, 'ab') as f:
-                for value in self.data_buffer:
-                    missing_values = num_values - (len(value) // 8 - 1)  # subtract 1 for the timestamp
-                    value += struct.pack((endian_specifier + '{}' + self.data_format).format(missing_values),
-                                         *([0.0] * missing_values))  # 0.0 doubles
-                    f.write(value)
-            self.data_buffer.clear()
-            print("\nSaved remaining data.")
-        else:
-            print("no data in buffer to save!")
-
-    def receive_extra_args(self, num_args):
-        # Receive extra arguments from the TCP connection
-        recvd_extra_args = []
-        for _ in range(num_args):
-            packed_arg = self.connected_socket.recv(struct.calcsize(handshake_format))
-            arg, = struct.unpack(endian_specifier + handshake_format, packed_arg)
-            recvd_extra_args.append(arg)
-        return recvd_extra_args
-
-    def identify(self, device_name, recvd_extra_args):
-        # let the user know who is who
-        # here you could also set some settings for different connections
-        if device_name == "Undefined":
-            print(
-                f"Undefined handshake received from {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-        elif device_name == "Mevea":
-            print(
-                f"Handshake confirmed with Mevea device at {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-
-            self.data_format = 'd'  # 8 byte doubles for Mevea
-        else:
-            print(
-                f"Handshake received from {device_name} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
-
-        print(f"Received extra arguments: {recvd_extra_args}")
-
-    def handshake(self, **kwargs):
         """
-        Handshake is done so that it will work with Mevea.
-        When the connection is accepted, Mevea will send 3x32bit integers
-        containing [identification number], [number of outputs], [number of inputs].
+                Handshake is done so that it will work with Mevea.
+                When the connection is accepted, Mevea will send 3x32bit (8-byte) integers
+                containing [identification number], [number of outputs], [number of inputs].
 
-        User needs to respond to this with [identification number], [number of inputs], [number of outputs]
-        These values need to match!
-        Please note that the response does not directly match the received data! (in / out flipped)
+                User needs to respond to this with [identification number], [number of inputs], [number of outputs]
+                These values need to match!
+                Please note that the response does not directly match the received data! (in / out flipped)
 
+                If not communicating with Mevea, handshake will always send one extra argument that is used to inform the datatype.
+                You are also able to send [num_extra_args] amount of extra arguments during handshake.
+                These can be used to e.g. inform various things.
+                As of 17.4.2024 the example extra arguments are:
+                - Loop frequency in Hz
+                - value for scaling float values to integers
 
-        If not communicating with Mevea, you are able to send three extra arguments during handshake.
-        These can be used to e.g. inform the receiving end about the sending rate or pump multiplier
-         """
+                'local_output_datatype' and 'connected_output_datatype' are used to set the format for sending/receiving.
+                As of 17.4.2024, Parameter can be 'int' (Signed 1-byte integer) or 'double' (8-byte floating point number).
+
+                !Python’s float is a double-precision 64-bit (4*16byte) binary format IEEE 754 value (double in C/C++ terms)!
+        """
+
+        if local_datatype_code == 0:
+            self.local_output_datatype = self.int_format
+        else:
+            self.local_output_datatype = self.double_format # force doubles if dt code mismatch
 
         recvd_extra_args = None
 
-        # Additional arguments for non-Mevea connections
-        for key, value in kwargs.items():
-            print(f"Additional argument added: {key} with value: {value}")
-
         # handle handshake as server
         if self.socket_type == 'server':
-            packed_handshake = self.connected_socket.recv(12)  # 3x4 bytes
+            # receive, then send
+            packed_handshake = self.connected_socket.recv(12)
             self.recvd_id_number, self.recvd_num_outputs, self.recvd_num_inputs = struct.unpack(
-                endian_specifier + handshake_format * 3, packed_handshake)
-            device_name = id_numbers.get(self.recvd_id_number, "Undefined")
+                self.endian_specifier + self.handshake_format * 3, packed_handshake)
+            connected_device_name = id_numbers.get(self.recvd_id_number, "Undefined")
 
+            # check if in/out match
             inputs_match = self.recvd_num_inputs == self.local_num_outputs
             outputs_match = self.recvd_num_outputs == self.local_num_inputs
 
             if not (inputs_match and outputs_match):
-                # raise?
-                print(f"Error: Mismatch in expected inputs/outputs with {device_name}.")
+                print(f"Error: Mismatch in expected inputs/outputs with {connected_device_name}.")
                 return False
 
-            if device_name != "Mevea":
-                recvd_extra_args = self.receive_extra_args(extra_args)
+            # skip extra args if connected to Mevea
+            if connected_device_name == "Mevea":
+                self.local_output_datatype = self.double_format
+                self.connected_output_datatype = self.double_format
+                response_format = self.endian_specifier + self.handshake_format * 3
+                response_values = [self.local_id_number, self.local_num_inputs, self.local_num_outputs]
+            else:
+                packed_datatype = self.connected_socket.recv(struct.calcsize(self.handshake_format))
+                connected_datatype_code, = struct.unpack(self.handshake_format, packed_datatype)
 
-            extra_args_to_send = self.prepare_extra_args(kwargs)
-            response_format = endian_specifier + handshake_format * (3 + extra_args)
-            response_values = [self.local_id_number, self.local_num_inputs, self.local_num_outputs] + extra_args_to_send
+                if connected_datatype_code == 0:
+                    self.connected_output_datatype = self.int_format
+                else:
+                    self.connected_output_datatype = self.double_format
+
+                recvd_extra_args = self.__receive_extra_args(num_extra_args)
+                extra_args_to_send = self._prepare_extra_args(kwargs, num_extra_args)
+
+                response_format = self.endian_specifier + self.handshake_format * (
+                            3 + num_extra_args) + self.handshake_format
+                response_values = [self.local_id_number, self.local_num_inputs, self.local_num_outputs,
+                                   local_datatype_code] + extra_args_to_send
+
             response = struct.pack(response_format, *response_values)
             self.connected_socket.send(response)
 
-        # handle handshake as client
+        # handle connection as client
         elif self.socket_type == 'client':
-            extra_args_to_send = self.prepare_extra_args(kwargs)
-            response = struct.pack(
-                endian_specifier + handshake_format * (3 + extra_args),
-                self.local_id_number, self.local_num_outputs, self.local_num_inputs, *extra_args_to_send)
+            # send, then receive
+            extra_args_to_send = self._prepare_extra_args(kwargs, num_extra_args)
+            response_format = self.endian_specifier + self.handshake_format * (
+                        3 + num_extra_args) + self.handshake_format
+            response = struct.pack(response_format, self.local_id_number, self.local_num_outputs, self.local_num_inputs,
+                                   local_datatype_code, *extra_args_to_send)
+
             self.local_socket.send(response)
+            packed_handshake = self.connected_socket.recv(12)
 
-            packed_handshake = self.local_socket.recv(12)
             self.recvd_id_number, self.recvd_num_inputs, self.recvd_num_outputs = struct.unpack(
-                endian_specifier + handshake_format * 3, packed_handshake)
-            device_name = id_numbers.get(self.recvd_id_number, "Undefined")
+                self.endian_specifier + self.handshake_format * 3, packed_handshake)
+            connected_device_name = id_numbers.get(self.recvd_id_number, "Undefined")
 
-            if device_name != "Mevea":
-                recvd_extra_args = self.receive_extra_args(extra_args)
+            # skip extra args if connected to Mevea
+            if connected_device_name == "Mevea":
+                self.local_output_datatype = self.double_format
+                self.connected_output_datatype = self.double_format
+            else:
+                packed_datatype = self.connected_socket.recv(struct.calcsize(self.handshake_format))
+                connected_datatype_code, = struct.unpack(self.handshake_format, packed_datatype)
 
-        else:  # not correct socket-type
-            print("wrong socket type!")
-            return False
+                if connected_datatype_code == 0:
+                    self.connected_output_datatype = self.int_format
+                else:
+                    self.connected_output_datatype = self.double_format
 
-        # calculate how many bytes we are going to receive (in drive loop)
-        self.recv_bytes = struct.calcsize(
-            (endian_specifier + self.data_format)) * self.recvd_num_outputs + self.checksum_bytes
+                recvd_extra_args = self.__receive_extra_args(num_extra_args)
 
-        print(f"Received data should be: {self.recv_bytes} bytes")
-        sleep(1)
+        else:
+            print(f"Wrong socket type! What the hell is {self.socket_type}")
+            return None
 
-        self.identify(device_name, recvd_extra_args)
-        print(f"Handshake done!")
-        print("\n------------------------------------------")
-        return True, recvd_extra_args
+        # calculate dt sizer for further use
+        self.local_datatype_size = struct.calcsize(self.endian_specifier + self.local_output_datatype)
+        self.connected_datatype_size = struct.calcsize(self.endian_specifier + self.connected_output_datatype)
+
+        # calculate wanted byte sizes when sending and receiving
+        self.send_bytes = struct.calcsize(
+            (self.endian_specifier + self.local_output_datatype)) * self.local_num_outputs + self.checksum_format_size
+        self.recv_bytes = struct.calcsize((
+                                                      self.endian_specifier + self.connected_output_datatype)) * self.recvd_num_outputs + self.checksum_format_size
+
+        # debug feature, inform the user about the made connection
+        self.__identify(connected_device_name, recvd_extra_args)
+        print("Handshake completed successfully.\n------------------------------------------")
+        return self.connected_output_datatype, recvd_extra_args
 
     def tcp_to_udp(self, socket_buffer_size=64):
         print("Reconfiguring to UDP...")
@@ -479,90 +260,335 @@ class MasiSocketManager:
             self.network_protocol = 'udp'
             return True
 
+    def start_data_recv_thread(self):
+        if self.data_reception_thread is None or not self.data_reception_thread.is_alive():
+            self.data_recv_running = True
+            self.data_reception_thread = threading.Thread(target=self.__continuous_data_receiver, daemon=True)
+            self.data_reception_thread.start()
+            print("Started data receiving thread!")
+        else:
+            print("Data reception is already running.")
 
-# https://github.com/bzier/TensorKart
-class MasiJoyController(object):
-    MAX_TRIG_VAL = math.pow(2, 8)
-    MAX_JOY_VAL = math.pow(2, 15)
+    def stop_data_recv_thread(self):
+        self.data_recv_running = False
+        if self.data_reception_thread is not None:
+            self.data_reception_thread.join()
+            self.data_reception_thread = None
+            return True
 
-    def __init__(self):
+    def start_saving_thread(self):
+        if self.saving_thread is None or not self.saving_thread.is_alive():
+            self.saving_running = True
+            self.saving_thread = threading.Thread(target=self._run_saving_thread, daemon=True)
+            self.saving_thread.start()
+            print("Started data saving thread!")
+        else:
+            print("Data saving is already running.")
 
-        self.LeftJoystickY = 0
-        self.LeftJoystickX = 0
-        self.RightJoystickY = 0
-        self.RightJoystickX = 0
-        self.LeftTrigger = 0
-        self.RightTrigger = 0
-        self.LeftBumper = 0
-        self.RightBumper = 0
-        self.A = 0
-        self.X = 0
-        self.Y = 0
-        self.B = 0
-        self.LeftThumb = 0
-        self.RightThumb = 0
-        self.Back = 0
-        self.Start = 0
-        self.LeftDPad = 0
-        self.RightDPad = 0
-        self.UpDPad = 0
-        self.DownDPad = 0
+    def stop_saving_thread(self):
+        self.saving_running = False
+        with self.buffer_not_empty:
+            self.buffer_not_empty.notify()  # Wake up the thread if it's waiting
+        if self.saving_thread is not None:
+            self.saving_thread.join()
+            self.saving_thread = None
+            return True
 
-        self._monitor_thread = threading.Thread(target=self._monitor_controller, args=())
-        self._monitor_thread.daemon = True
-        self._monitor_thread.start()
+    def stop_all(self):
+        self.close_socket()
+        if self.stop_data_recv_thread() and self.stop_saving_thread():
+            print("Threads stopped succesfully!")
+
+    def send_data(self, data):
+
+        # pack data (without checksum). Use local_output_datatype
+        packed_data = struct.pack(self.endian_specifier + self.local_output_datatype * len(data), *data)  # local datatype here??
+
+        if packed_data is not None:
+            # add checksum as the last value of the list
+            final_data = self._add_checksum(packed_data)
+
+            # send the data
+            if self.network_protocol == 'tcp':
+                self.connected_socket.send(final_data)
+            else:  # should be UDP haha
+                self.local_socket.sendto(final_data, self.connected_addr)
+
+            return final_data
+        return None
+
+    def get_latest_received(self):
+        with self.latest_data_lock:
+            if self.latest_recvd is None:
+                return None  # Silently handle the no-data-yet case
+
+            try:
+                full_data = self.latest_recvd
+                #print(f"(get_latest_recived) raw data: {full_data}")
+                received_checksum, = struct.unpack((self.endian_specifier + self.checksum_format),
+                                                   full_data[-self.checksum_format_size:])
+                computed_checksum = self._compute_checksum(full_data[:-self.checksum_format_size])
+
+                if received_checksum != computed_checksum:
+                    print("Checksum mismatch!")
+                    return None
+
+                # Ensure data length aligns with expected chunks
+                expected_length = len(full_data) - self.checksum_format_size
+                if expected_length % self.connected_datatype_size != 0:
+                    print(f"Data length {expected_length} is not a multiple of {self.connected_datatype_size}")
+                    return None
+
+                decoded_values = [struct.unpack(self.endian_specifier + self.connected_output_datatype,
+                                                full_data[i:i + self.connected_datatype_size])[0]
+                                  for i in range(0, expected_length, self.connected_datatype_size)]
 
 
-    def read(self): # return the buttons/triggers that you care about in this methode
-        x = self.LeftJoystickX
-        y = self.LeftJoystickY
-        a = self.A
-        b = self.X # b=1, x=2
-        rb = self.RightBumper
-        return [x, y, a, b, rb]
+                self.latest_recvd = None  # Reset after processing
+                return decoded_values
+            except Exception as e:
+                print(f"Error processing the latest received data: {e}")
+                return None
 
+    def add_data_to_buffer(self, unpacked_data):
+        """Appends raw data along with a timestamp to the buffer."""
+        current_timestamp = datetime.now().timestamp()
+        microsecond_timestamp = int(current_timestamp * 1e6)
+        timestamped_data = (microsecond_timestamp, unpacked_data)
 
-    def _monitor_controller(self):
-        while True:
-            events = get_gamepad()
-            for event in events:
-                if event.code == 'ABS_Y':
-                    self.LeftJoystickY = event.state / MasiJoyController.MAX_JOY_VAL # normalize between -1 and 1
-                elif event.code == 'ABS_X':
-                    self.LeftJoystickX = event.state / MasiJoyController.MAX_JOY_VAL # normalize between -1 and 1
-                elif event.code == 'ABS_RY':
-                    self.RightJoystickY = event.state / MasiJoyController.MAX_JOY_VAL # normalize between -1 and 1
-                elif event.code == 'ABS_RX':
-                    self.RightJoystickX = event.state / MasiJoyController.MAX_JOY_VAL # normalize between -1 and 1
-                elif event.code == 'ABS_Z':
-                    self.LeftTrigger = event.state / MasiJoyController.MAX_TRIG_VAL # normalize between 0 and 1
-                elif event.code == 'ABS_RZ':
-                    self.RightTrigger = event.state / MasiJoyController.MAX_TRIG_VAL # normalize between 0 and 1
-                elif event.code == 'BTN_TL':
-                    self.LeftBumper = event.state
-                elif event.code == 'BTN_TR':
-                    self.RightBumper = event.state
-                elif event.code == 'BTN_SOUTH':
-                    self.A = event.state
-                elif event.code == 'BTN_NORTH':
-                    self.Y = event.state #previously switched with X
-                elif event.code == 'BTN_WEST':
-                    self.X = event.state #previously switched with Y
-                elif event.code == 'BTN_EAST':
-                    self.B = event.state
-                elif event.code == 'BTN_THUMBL':
-                    self.LeftThumb = event.state
-                elif event.code == 'BTN_THUMBR':
-                    self.RightThumb = event.state
-                elif event.code == 'BTN_SELECT':
-                    self.Back = event.state
-                elif event.code == 'BTN_START':
-                    self.Start = event.state
-                elif event.code == 'BTN_TRIGGER_HAPPY1':
-                    self.LeftDPad = event.state
-                elif event.code == 'BTN_TRIGGER_HAPPY2':
-                    self.RightDPad = event.state
-                elif event.code == 'BTN_TRIGGER_HAPPY3':
-                    self.UpDPad = event.state
-                elif event.code == 'BTN_TRIGGER_HAPPY4':
-                    self.DownDPad = event.state
+        with self.data_buffer_lock:
+            self.data_buffer.append(timestamped_data)
+            ready_to_save = len(self.data_buffer) >= self.buffer_size
+
+        if ready_to_save:
+            with self.buffer_not_empty:
+                self.buffer_not_empty.notify()  # Notify outside of data_buffer_lock
+
+    def clear_file(self):
+        # check if the 'wb' matters
+        with open(self.filepath, 'wb'):
+            pass
+        print("Cleared file!")
+
+    def print_bin_file(self, num_values):
+        """Prints the binary file in a human-readable format."""
+
+        # TODO: convert the whole dataset to human readable format!
+
+        # Prepare the format string for unpacking
+        format_str = self.endian_specifier + (self.pack_datatype * (num_values + 1)) # +1 for timestamp
+        data_size = struct.calcsize(format_str)
+
+        if not os.path.exists(self.filepath):
+            print(f"Error: File '{self.filepath}' does not exist.")
+            return
+
+        with open(self.filepath, 'rb') as f:
+            while True:
+                packed_data = f.read(data_size)
+                if not packed_data:
+                    break
+
+                # Unpack the data
+                data = struct.unpack(format_str, packed_data)
+                print(data)
+
+    def close_socket(self):
+        if self.local_socket:
+            self.local_socket.close()
+            print("Socket closed successfully!")
+        else:
+            print("something wrong has happened somewhere")
+
+    @staticmethod
+    def _compute_checksum(packed_data):
+        checksum = 0
+        for byte in packed_data:
+            checksum ^= byte
+        return checksum
+
+    @staticmethod
+    def _prepare_extra_args(kwargs, num_extra_args):
+
+        # Additional arguments for non-Mevea connections
+        #for key, value in kwargs.items():
+         #   print(f"Additional argument added: {key} with value: {value}")
+
+        # Prepare extra arguments for sending
+        extra_args_to_send = list(kwargs.values())[:num_extra_args]
+        extra_args_to_send.extend([0] * (num_extra_args - len(extra_args_to_send)))  # Fill no data with 0
+        return extra_args_to_send
+
+    def _run_saving_thread(self):
+        while self.saving_running:
+            with self.buffer_not_empty:
+                while len(self.data_buffer) < self.buffer_size and self.saving_running:
+                    self.buffer_not_empty.wait()
+                if not self.saving_running:
+                    break
+
+            # Moved outside the with block to avoid holding buffer_not_empty during save
+            self.__save_buffer()  # Assumes this function manages data_buffer_lock internally
+
+    def _add_checksum(self, packed_data):
+        # Compute checksum
+        checksum = self._compute_checksum(packed_data)
+        # add the checksum as the last value in the list
+        packed_values = packed_data + struct.pack((self.endian_specifier + self.checksum_format), checksum)
+        return packed_values
+
+    """
+    def _save_buffer(self):
+        # Saves all buffered data to file if buffer size exceeds the limit.
+        with self.data_save_lock:
+            packed_data_list = []
+            for timestamp, data in self.data_buffer:
+                print("Timestamp:", type(timestamp), timestamp)
+                print("Data types before casting:", [type(d) for d in data])
+
+                # Assuming timestamp needs to be packed as an unsigned int ('I')
+                # and each data point as a float ('f'), correct these as necessary:
+                try:
+                    timestamp = int(timestamp)  # Ensure timestamp is an integer, adjust as needed
+                    data = [float(d) for d in data]  # Convert data points to float
+                except ValueError as e:
+                    print("Type conversion error:", e)
+                    continue  # Skip this entry if conversion fails
+
+                print("Data types after casting:", [type(d) for d in data])
+
+                # Prepare the format string
+                format_string = self.endian_specifier + self.unix_format + (self.pack_datatype * len(data))
+                print("Format string:", format_string)
+
+                try:
+                    # Pack the timestamp and data together for each item
+                    packed_data = struct.pack(format_string, timestamp, *data)
+                    packed_data_list.append(packed_data)
+                except struct.error as e:
+                    print("Struct packing error:", e)
+                    print("Failed data entry:", data)
+                    continue  # Skip this entry if packing fails
+
+            # Write all packed data to the file at once
+            with open(self.filepath, 'ab') as f:
+                f.writelines(packed_data_list)
+
+            print("Saved data to file...")
+            self.data_buffer.clear()
+            """
+
+    def __save_buffer(self):
+        packed_data_list = []
+        while self.data_buffer:
+            data = self.data_buffer.popleft()
+            try:
+                timestamp = int(data[0])
+                # Ensure all elements in the list are floats
+                sensor_values = [float(d) for d in data[1]]  # data[1] because all sensor values are in a list at index 1
+            except ValueError as e:
+                print("Type conversion error:", e)
+                continue
+
+            format_string = self.endian_specifier + self.unix_format + (self.pack_datatype * len(sensor_values))
+            try:
+                packed_data = struct.pack(format_string, timestamp, *sensor_values)
+                packed_data_list.append(packed_data)
+            except struct.error as e:
+                print("Struct packing error:", e)
+                continue
+
+        with open(self.filepath, 'ab') as f:  # 'ab' denotes appending in binary mode
+            f.writelines(packed_data_list)
+
+        print("Saved data to file...")
+
+    def __setup_socket_client(self, addr, port):
+        if not self.local_socket:
+            self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Set up as client. TCP
+            self.local_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print("Socket configured as a TCP-client!")
+            self.local_socket.connect((addr, port))
+
+            # Remember for later use
+            self.socket_type = 'client'
+            self.connected_addr = (addr, port)
+            self.connected_socket = self.local_socket
+            self.network_protocol = 'tcp'
+
+        else:
+            # socket already made, do something?
+            print("socket already made!")
+
+    def __setup_socket_server(self, addr, port):
+        if not self.local_socket:
+            self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            # Set up as server. TCP
+            self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.local_socket.bind((addr, port))
+            print(f"Socket configured as a TCP-server! Listening on {addr}:{port}")
+            self.local_socket.listen(1)
+            self.connected_socket, self.connected_addr = self.local_socket.accept()
+
+            self.socket_type = 'server'
+            self.local_addr = (addr, port)
+            self.network_protocol = 'tcp'
+
+        else:
+            # socket already made, do something?
+            print("socket already made!")
+
+    def __continuous_data_receiver(self):
+        # now polling, would events be better?
+        while self.data_recv_running:
+            try:
+                data = self.__receive_data()
+                if data:
+                    with self.latest_data_lock:
+                        self.latest_recvd = data
+            except Exception as e:
+                print(f"Error receiving data (continuous_data_receiver): {e}")
+
+    def __receive_data(self):
+        try:
+            if self.network_protocol == 'tcp':
+                full_data = self.connected_socket.recv(self.recv_bytes)
+            else:
+                full_data, addr = self.local_socket.recvfrom(self.recv_bytes)
+
+            if not full_data or len(full_data) != self.recv_bytes:
+                print("No new data or incomplete data received.")
+                return None  # Unified return for no or incorrect data
+
+            return full_data  # full received data for further processing
+        except Exception as e:
+            print(f"Error receiving data (receive_data): {e}")
+            return None
+
+    def __receive_extra_args(self, num_args):
+        # Receive extra arguments from the TCP connection
+        recvd_extra_args = []
+        for _ in range(num_args):
+            packed_arg = self.connected_socket.recv(struct.calcsize(self.handshake_format))
+            arg, = struct.unpack(self.endian_specifier + self.handshake_format, packed_arg)
+            recvd_extra_args.append(arg)
+        return recvd_extra_args
+
+    def __identify(self, device_name, recvd_extra_args):
+        # Let the user know who is who and what is what and whatnot
+        if device_name == "Undefined":
+            print(
+                f"Undefined handshake received from {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+        elif device_name == "Mevea":
+            print(
+                f"Handshake confirmed with Mevea device at {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+        else:
+            print(
+                f"Handshake received from {device_name} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+
+        print(f"Received extra arguments: {recvd_extra_args}")
+
+        print(f"Sent data will be: {self.send_bytes} bytes with ({self.local_output_datatype}) datatype!")
+        print(f"Received data should be: {self.recv_bytes} bytes with ({self.connected_output_datatype}) datatype!")

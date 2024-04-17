@@ -2,76 +2,100 @@
 
 CHANNEL_CONFIGS:
   trackR:
-    input_channel: 6    # The index of the input data array
-    output_channel: 0   # The PWM hat channel, same as printed on the PCB
-    type: angle         # type of the controlled thing. angle(eg. servo), throttle(eg. motor), switch(eg. LED)
-    affects_pump: false # use of the channel will increase pump speed
-    offset: -1          # center position fine-tuning
-    direction: -1       # change direction
-    multiplier: 30      # change sensitivity
+    input_channel: 6              # The index of the input data array
+    output_channel: 0             # The PWM hat channel, same as printed on the PCB
+    type: angle                   # type of the controlled thing. angle(eg. servo), throttle(eg. motor), switch(eg. LED)
+    affects_pump: false           # use of the channel will increase pump speed. True or False
+    direction: -1                 # change direction. 1 or -1
+    offset: -1                    # center position fine-tuning. setting -30...30
+    multiplier_positive: 10       # Multiplier when input is from 0 to 1. setting 1-50
+    multiplier_negative: 10       # Multiplier when input is from -1 to 0.
+    gamma_positive: 1.0           # Gamma when input is from 0 to 1. setting 0.1..3
+    gamma_negative: 1.0           # Gamma when input is from -1 to 0
 
   trackL:
     input_channel: 7
     output_channel: 1
     type: angle
     affects_pump: false
-    offset: -1
     direction: 1
-    multiplier: 30
+    offset: -1
+    multiplier_positive: 10
+    multiplier_negative: 10
+    gamma_positive: 1.0
+    gamma_negative: 1.0
 
   scoop:
     input_channel: 0
     output_channel: 2
     type: angle
     affects_pump: true
-    offset: 8.5
-    direction: 1
-    multiplier: 30
+    direction: -1
+    offset: 8
+    multiplier_positive: 30
+    multiplier_negative: 30
+    gamma_positive: 0.7
+    gamma_negative: 0.7
 
   lift_boom:
     input_channel: 1
     output_channel: 3
     type: angle
     affects_pump: true
-    offset: 8
-    direction: 1
-    multiplier: 30
+    direction: -1
+    offset: 0
+    multiplier_positive: 30
+    multiplier_negative: 30
+    gamma_positive: 2.8
+    gamma_negative: 0.7
 
   tilt_boom:
     input_channel: 4
     output_channel: 4
     type: angle
     affects_pump: true
-    offset: 4
     direction: 1
-    multiplier: 30
+    offset: 5
+    multiplier_positive: 33
+    multiplier_negative: 33
+    gamma_positive: 1.0
+    gamma_negative: 1.0
 
   rotate:
     input_channel: 3
     output_channel: 5
     type: angle
     affects_pump: false
-    offset: 5
     direction: -1
-    multiplier: 12
+    offset: 5
+    multiplier_positive: 11
+    multiplier_negative: 11
+    gamma_positive: 0.6
+    gamma_negative: 1.5
 
   tool1:
     input_channel: 5
     output_channel: 6
     type: angle
     affects_pump: true
-    offset: 0
     direction: 1
-    multiplier: 10
+    offset: 0
+    multiplier_positive: 5
+    multiplier_negative: 5
+    gamma_positive: 1.0
+    gamma_negative: 1.0
 
   tool2:
     input_channel: 2
     output_channel: 7
     type: angle
     affects_pump: true
-    offset: 0
     direction: 1
-    multiplier: 10
+    offset: 0
+    multiplier_positive: 5
+    multiplier_negative: 5
+    gamma_positive: 1.0
+    gamma_negative: 1.0
 
   pump:
     input_channel: none
@@ -81,15 +105,6 @@ CHANNEL_CONFIGS:
     direction: 1
     idle: -0.1
     multiplier: 2.0
-
-  test:
-    input_channel: 12
-    output_channel: 10
-    type: none
-    offset: 0
-    direction: 1
-    idle: -0.1
-    multiplier: 999.0
 
 
 

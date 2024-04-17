@@ -24,6 +24,7 @@ except ImportError as e:
 
 class IMUSensorManager:
     # bno08x removed 5.2.2024
+    # add calibration!!!!!!!!!!!!!
     def __init__(self, simulation_mode=False, decimals=2, tca_address=0x71):
         self.simulation_mode = simulation_mode
         self.multiplexer_channels = [0, 1, 2, 3]
@@ -118,18 +119,18 @@ class RPMSensor:
         self.pulse_count = 0
         self.rpm = 0
         self.decimals = decimals
-        self.setup_gpio()
-        self.start_measurement()
+        self.__setup_gpio()
+        self.__start_measurement()
 
-    def setup_gpio(self):
+    def __setup_gpio(self):
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.add_event_detect(self.sensor_pin, GPIO.FALLING, callback=self.sensor_callback)
+        GPIO.add_event_detect(self.sensor_pin, GPIO.FALLING, callback=self.__sensor_callback)
 
-    def sensor_callback(self): #channel removed
+    def __sensor_callback(self, channel):
         self.pulse_count += 1
 
-    def calculate_rpm(self):
+    def __calculate_rpm(self):
         last_checked_time = time()
         while True:
             current_time = time()
@@ -142,12 +143,15 @@ class RPMSensor:
 
             sleep(0.1)
 
-    def start_measurement(self):
-        self.thread = threading.Thread(target=self.calculate_rpm)
+    def __start_measurement(self):
+        self.thread = threading.Thread(target=self.__calculate_rpm)
         self.thread.daemon = True
         self.thread.start()
 
-    def get_rpm(self):
+    # def stop measurements!!!!!!!!!!!
+
+    def read_rpm(self):
+        # return as a list so .extend() works
         return round(self.rpm, self.decimals)
 
 
@@ -247,9 +251,9 @@ class PressureSensor:
 class CenterPositionSensor:
     def __init__(self, sensor_pin=17):
         self.sensor_pin = sensor_pin
-        self.setup_gpio()
+        self.__setup_gpio()
 
-    def setup_gpio(self):
+    def __setup_gpio(self):
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 

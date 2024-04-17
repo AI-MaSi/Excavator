@@ -1,14 +1,9 @@
-# UPD / TCP hybrid connection demo
-# handshake with TCP, data transmission with UDP
-
 import universal_connection_manager
 import masi_driver
-import sensor_manager
 from time import sleep
 
 
 addr = '192.168.0.136'
-#addr = '127.0.0.1'
 port = 5111
 
 # Who am I. Check config for names
@@ -52,36 +47,8 @@ masi_manager.tcp_to_udp()
 # -------------------------------------------------------------------
 
 
-# init pressure sensors
-pressures = sensor_manager.PressureSensor()
-
-# init IMUs
-imus = sensor_manager.IMUSensorManager(simulation_mode=False)
-
-# init RPM check
-rpm = sensor_manager.RPMSensor()
 
 
-def collect_data(received_float_values):        # control signal. 20 values
-    imu_data = imus.read_all()                  # get values from the sensors. 4x6 values
-    #print(f"imu data: {imu_data}")
-    received_float_values.extend(imu_data)
-    pressure_data = pressures.read_pressure()   # get pressure values. 7 values
-    #print(f"pressure data: {pressure_data}")
-    received_float_values.extend(pressure_data)
-    rpm_data = rpm.read_rpm()                  # get the pump rpm. 1 value converted to a list.
-    #print(f"rpm data: {rpm_data}")
-    received_float_values.append(rpm_data)
-    #print(f"full data: {received_float_values}")
-    #sleep(10)
-
-    #print(f"len data to buffer: {len(received_float_values)}")
-    masi_manager.add_data_to_buffer(received_float_values)  # 52 values added
-
-def get_datalen():
-    #WIP
-    # get the length of the full data list
-    return 52
 
 def int_to_float(int_data, decimals=2, scale=int_scale):
     """
@@ -101,11 +68,9 @@ def int_to_float(int_data, decimals=2, scale=int_scale):
 
 
 def run():
-    # clear the file
-    masi_manager.clear_file()
     # start threads for receiving and saving data
     masi_manager.start_data_recv_thread()
-    masi_manager.start_saving_thread()
+
 
     while True:
         # Get latest received joystick values
@@ -116,8 +81,6 @@ def run():
 
             controller.update_values(float_values)
 
-            # save all data to buffer. Add received control data
-            collect_data(float_values)
 
         #sleep(1/loop_frequency)  # relax time, could be made way better especially for higher Hz usage
 
@@ -126,17 +89,7 @@ if __name__ == "__main__":
         run()
     finally:
         # Cleanup
+        controller.reset()              # reset servos and stop the pump
+        masi_manager.stop_all()         # close socket connections and kill all used (masi_manager) threads
+        controller.stop_monitoring()    # stop servo safety monitoring thread. You don't have to stop this, and it's probably better to leave running haha
 
-        # reset servos and stop the pump
-        controller.reset()
-
-        # close socket connections and kill all used (masi_manager) threads
-        masi_manager.stop_all()
-        # clean up used GPIO pins
-        rpm.cleanup()
-
-        # stop servo safety monitoring thread. You don't have to stop this, and it's probably better to leave running haha
-        controller.stop_monitoring()
-
-        # Misc. Print the saved values.
-        masi_manager.print_bin_file(num_values=get_datalen()) # num_values is the length of the data added to the buffer!

@@ -61,25 +61,6 @@ PRESSURE_SENSORS:
     input: [b1,7]
     calibration_value: 1.000
 
-  sensor8:
-    name: "Tool1 B"
-    input: [2,1]
-    calibration_value: 1.000
-
-  sensor9:
-    name: "Tool1 B"
-    input: [2,2]
-    calibration_value: 1.000
-
-  sensor10:
-    name: "Tool2 A"
-    input: [2,3]
-    calibration_value: 1.000
-
-  sensor11:
-    name: "Tool2 B"
-    input: [2,4]
-    calibration_value: 1.000
 
 
     # add more if connected
