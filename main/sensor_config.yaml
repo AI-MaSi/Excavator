@@ -2,8 +2,8 @@
 
 ADC_CONFIG:
   i2c_addresses:
-    b1: [0x6E,0x6F]  # I2C address for board 1
-    b2: [0,0]  # I2C address PLACEHOLDER for board 2
+    b1: [0x6E,0x6F]   # I2C address for board 1
+    b2: [0,0]         # I2C address PLACEHOLDER for board 2
 
   pga_gain: 1
   # Set the gain of the PGA on the chip
@@ -23,13 +23,16 @@ ADC_CONFIG:
   # (One-shot conversion) Perform a single conversion upon trigger, conserving power and resources for infrequent measurements
   # (Continuous conversion) Continuously convert analog signals to digital, suitable for real-time monitoring
 
-
+RPM_SENSORS:
+  RPM_pump:
+    GPIO pin: 21
+    magnets: 14
 
 PRESSURE_SENSORS:
   sensor1:
-    name: "LiftBoom retraction"         # Name
-    input: [b1,1]               # [Board number, Port number]
-    calibration_value: 1.000   # Multiplier for calibrating measurements
+    name: "LiftBoom retraction"   # Name
+    input: [b1,1]                 # [Board number, Port number]
+    calibration_value: 1.000      # Multiplier for calibrating measurements
 
   sensor2:
     name: "LiftBoom extension"
@@ -62,5 +65,8 @@ PRESSURE_SENSORS:
     calibration_value: 1.000
 
 
-
-    # add more if connected
+IMU_CONFIG:
+  multiplexer_address: 0x71
+  multiplexer_channels: [0,1,2,3]   # ISM330DHCX IMU are connected to multiplexer channels 0, 1, 2, 3
+  accelerometer_data_rate: 'Rate.RATE_26_HZ'
+  gyro_data_rate: 'Rate.RATE_26_HZ'

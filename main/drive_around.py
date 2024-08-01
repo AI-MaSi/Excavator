@@ -6,12 +6,13 @@ from time import sleep
 addr = '192.168.0.136'
 port = 5111
 
-# Who am I. Check config for names
+
 identification_number = 0  # 0 excavator, 1 Mevea, 2 Motion Platform, more can be added...
 # My (num) inputs received from the other end
 inputs = 20
 # My (num) outputs im going to send
 outputs = 0
+
 
 
 # init pwm driver
@@ -42,7 +43,7 @@ controller.set_threshold(loop_frequency*0.50)
 if not handshake_result:
     raise Exception("could not make handshake!")
 
-# switcheroo
+# switcheroo (to save bandwidth)
 masi_manager.tcp_to_udp()
 # -------------------------------------------------------------------
 
@@ -57,7 +58,7 @@ def int_to_float(int_data, decimals=2, scale=int_scale):
     Values are converted back to floats here.
 
     The precision of these values is limited by the 256 discrete levels available (due to the 8-bit conversion).
-    We are using hobby-grade servos so the lost value resolution doesn't affect anything.
+    We are using hobby-grade servos so the lost value resolution doesn't affect basically anything.
     """
 
     float_data = []  # List to store converted float values
@@ -67,6 +68,7 @@ def int_to_float(int_data, decimals=2, scale=int_scale):
     return float_data
 
 
+# and finally the main loop
 def run():
     # start threads for receiving and saving data
     masi_manager.start_data_recv_thread()
@@ -77,12 +79,12 @@ def run():
         value_list = masi_manager.get_latest_received()
 
         if value_list is not None:
+            # Convert received integer values to float
             float_values = int_to_float(value_list)
 
+            # Update the PWM controller with the received values
             controller.update_values(float_values)
 
-
-        #sleep(1/loop_frequency)  # relax time, could be made way better especially for higher Hz usage
 
 if __name__ == "__main__":
     try:

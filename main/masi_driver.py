@@ -4,6 +4,7 @@ import yaml
 
 try:
     from adafruit_servokit import ServoKit
+
     SERVOKIT_AVAILABLE = True
 except ImportError:
     SERVOKIT_AVAILABLE = False
@@ -11,9 +12,9 @@ except ImportError:
 
 class ExcavatorController:
     def __init__(self, inputs, config_file, simulation_mode=False, pump_variable=True,
-                 tracks_disabled=False, input_rate_threshold=5, deadzone=6):
+                 tracks_disabled=False, input_rate_threshold=5, deadzone=5):
 
-        #full_name = f"{config_file}.yaml"
+        # full_name = f"{config_file}.yaml"
 
         pwm_channels = 16
         print(f"PWM channels in use: {pwm_channels}")
@@ -26,7 +27,7 @@ class ExcavatorController:
             # exception if not available
 
         self.simulation_mode = simulation_mode
-        #self.toggle_pump = toggle_pump
+        # self.toggle_pump = toggle_pump
         self.pump_variable = pump_variable
         self.tracks_disabled = tracks_disabled
 
@@ -34,8 +35,12 @@ class ExcavatorController:
         self.num_inputs = inputs
         self.num_outputs = pwm_channels
 
-        input_channels = [config['input_channel'] for config in self.channel_configs.values() if config['type'] != 'none' and config['input_channel'] != 'none']
+        input_channels = [config['input_channel'] for config in self.channel_configs.values() if
+                          config['type'] != 'none' and config['input_channel'] != 'none']
+
         unique_input_channels = set(input_channels)
+
+        print(f"Input channels in the config: {unique_input_channels}")
 
         if SERVOKIT_AVAILABLE and not self.simulation_mode:
             self.kit = ServoKit(channels=pwm_channels)
@@ -45,12 +50,13 @@ class ExcavatorController:
             print("Simulation mode activated! Simulated drive prints will be used.")
 
         if self.num_inputs < len(unique_input_channels):
-            print(f"Warning: The number of inputs specified ({self.num_inputs}) is less than the number of unique input channels used in channel_configs ({len(unique_input_channels)}). This may result in some inputs not being correctly mapped.")
+            print(
+                f"Warning: The number of inputs specified ({self.num_inputs}) is less than the number of unique input channels used in channel_configs ({len(unique_input_channels)}). This may result in some inputs not being correctly mapped.")
             sleep(3)
         elif self.num_inputs > len(unique_input_channels):
-            print(f"Warning: The number of inputs specified ({self.num_inputs}) is more than the number of unique input channels used in channel_configs ({len(unique_input_channels)}). This will result in some inputs being  left out.")
+            print(
+                f"Warning: The number of inputs specified ({self.num_inputs}) is more than the number of unique input channels used in channel_configs ({len(unique_input_channels)}). This will result in some inputs being  left out.")
             sleep(3)
-
 
         self.input_counter = 0
         self.running = None
@@ -60,6 +66,10 @@ class ExcavatorController:
 
         self.center_val_servo = 90
         self.deadzone = deadzone
+
+        self.return_servo_angles = False
+        # Create a list to store the angles
+        self.servo_angles = []
 
         self.reset()
         self.validate_configuration()
@@ -142,17 +152,24 @@ class ExcavatorController:
                 self.reset(reset_pump=False)
             self.input_counter = 0
 
-    def get_current_rate(self):
-        #WIP
-        # monitor_input_rate could calculate incoming Hz rate and user could ask it
-        # Return the most recently calculated Hz, or None if not yet calculated
-        #return getattr(self, 'current_hz', None)
-        pass
+    # WIP
+    # def get_current_rate(self):
+    # WIP
+    # monitor_input_rate could calculate incoming Hz rate and user could ask it
+    # Return the most recently calculated Hz, or None if not yet calculated
+    # return getattr(self, 'current_hz', None)
+    # pass
 
-    def update_values(self, raw_values, min_cap=-1, max_cap=1):
+    def update_values(self, raw_values, min_cap=-1, max_cap=1, return_servo_angles=False):
+        self.return_servo_angles = return_servo_angles
+
         if raw_values is None:
             self.reset()
             raise ValueError("Input values are None")
+
+        # Turn single input value to a list
+        if isinstance(raw_values, float) or isinstance(raw_values, int):
+            raw_values = [raw_values]
 
         if len(raw_values) != self.num_inputs:
             self.reset()
@@ -165,52 +182,57 @@ class ExcavatorController:
             if input_channel == 'none' or input_channel >= len(raw_values):
                 continue
 
+            # Check if the value is within the limits
             capped_value = max(min_cap, min(raw_values[input_channel], max_cap))
+
+            # Check deadzone
             if abs(capped_value) < deadzone_threshold:
                 capped_value = 0.0
 
-            # Apply gamma correction if gamma is specified and value is not zero
-            if capped_value != 0:
-                if capped_value > 0:
-                    gamma = config.get('gamma_positive', 1)  # Default to 1 if not specified
-                else:
-                    gamma = config.get('gamma_negative', 1)  # Default to 1 if not specified
-
-                normalized_input = (capped_value - min_cap) / (max_cap - min_cap)  # Normalize to 0-1 range
-                adjusted_input = normalized_input ** gamma  # Apply gamma power
-                gamma_corrected_value = adjusted_input * (max_cap - min_cap) + min_cap  # Scale back to original range
-                self.values[config['output_channel']] = gamma_corrected_value
-            else:
-                self.values[config['output_channel']] = capped_value
+            self.values[config['output_channel']] = capped_value
 
             self.input_counter += 1
 
         self.__use_values(self.values)
+
+        #TODO: make better asshole
+        if self.return_servo_angles:
+            angles_to_return = self.servo_angles.copy()  # Make a copy to return
+            self.servo_angles.clear()  # Clear the original list
+            return angles_to_return
 
     def handle_pump(self, values):
         pump_config = self.channel_configs['pump']
         pump_channel = pump_config['output_channel']
         pump_multiplier = pump_config['multiplier']
         pump_idle = pump_config['idle']
+        input_channel = pump_config.get('input_channel', None)
 
-        if self.pump_variable:
-            # Calculate the number of active channels that affect the pump
-            active_channels_count = sum(1 for channel, config in self.channel_configs.items()
-                                        if
-                                        config.get('affects_pump', False) and abs(values[config['output_channel']]) > 0)
+        if input_channel is None:
+            if self.pump_variable:
+                # Calculate the number of active channels that affect the pump
+                active_channels_count = sum(1 for channel, config in self.channel_configs.items()
+                                            if config.get('affects_pump', False) and abs(
+                    values[config['output_channel']]) > 0)
+            else:
+                active_channels_count = 2  # Static value if not variable
+
+            # Calculate the pump's throttle setting
+            throttle_value = pump_idle + ((pump_multiplier / 100) * active_channels_count)
         else:
-            active_channels_count = 2  # Static value if not variable
+            # Use the value from the input channel to control the pump speed
+            throttle_value = values[input_channel]
 
-        # Calculate the pump's throttle setting
-        throttle_value = pump_idle + ((pump_multiplier / 100) * active_channels_count)
         throttle_value = max(-1.0, min(1.0, throttle_value))  # Ensure throttle is within valid range
 
         if self.simulation_mode:
-            print(f"Pump level: {active_channels_count} with throttle setting {throttle_value}")
+            print(
+                f"Pump control: {'input_channel' if input_channel else 'active_channels_count'} with throttle setting {throttle_value}")
         else:
             self.kit.continuous_servo[pump_channel].throttle = throttle_value
 
     def handle_angles(self, values):
+
         for channel_name, config in self.channel_configs.items():
             if config['type'] == 'angle':
                 if self.tracks_disabled and channel_name in ['trackL', 'trackR']:
@@ -237,7 +259,7 @@ class ExcavatorController:
 
                 # Apply gamma correction safely
                 adjusted_input = normalized_input ** gamma
-                gamma_corrected_value = adjusted_input if input_value >= 0 else -adjusted_input  # Reapply sign if negative
+                gamma_corrected_value = adjusted_input if input_value >= 0 else -adjusted_input
 
                 # Calculate final angle using the directionally adjusted multiplier
                 angle = center + (gamma_corrected_value * multiplier * config['direction'])
@@ -251,6 +273,10 @@ class ExcavatorController:
                     except Exception as e:
                         print(f"Failed to set angle for {channel_name}: {e}")
 
+                # Collect the angle in the list
+                if self.return_servo_angles:
+                    self.servo_angles.append(angle)
+
     def __use_values(self, values):
 
         self.handle_pump(values)
@@ -261,9 +287,9 @@ class ExcavatorController:
 
         # more different
 
-    def reset(self, reset_pump=True):
+    def reset(self, reset_pump=True, pump_reset_point=-1.0):
         if self.simulation_mode:
-            #print("Simulated reset")
+            # print("Simulated reset")
             return
 
         for config in self.channel_configs.values():
@@ -271,13 +297,12 @@ class ExcavatorController:
                 self.kit.servo[config['output_channel']].angle = self.center_val_servo + config.get('offset', 0)
 
         if reset_pump and 'pump' in self.channel_configs:
-            self.kit.continuous_servo[self.channel_configs['pump']['output_channel']].throttle = -1.0
-
+            self.kit.continuous_servo[self.channel_configs['pump']['output_channel']].throttle = pump_reset_point
 
     # Update values during driving
     def set_threshold(self, number_value):
         if not isinstance(number_value, (int, float)):
-            #raise TypeError("Threshold value must be an integer or float.")
+            # raise TypeError("Threshold value must be an integer or float.")
             print("Threshold value must be an integer.")
             return
         self.input_rate_threshold = number_value
@@ -285,7 +310,7 @@ class ExcavatorController:
 
     def set_deadzone(self, int_value):
         if not isinstance(int_value, (int)):
-            #raise TypeError("Deadzone value must be an integer.")
+            # raise TypeError("Deadzone value must be an integer.")
             print("Deadzone value must be an integer.")
             return
         self.deadzone = int_value
@@ -293,7 +318,7 @@ class ExcavatorController:
 
     def set_tracks(self, bool_value):
         if not isinstance(bool_value, bool):
-            #raise TypeError("Tracks value must be a boolean (True or False).")
+            # raise TypeError("Tracks value must be a boolean (True or False).")
             print("Tracks value value must be boolean.")
             return
         self.tracks_disabled = bool_value
@@ -301,15 +326,61 @@ class ExcavatorController:
 
     def set_pump(self, bool_value):
         if not isinstance(bool_value, bool):
-            #raise TypeError("Pump value must be a boolean (True or False).")
+            # raise TypeError("Pump value must be a boolean (True or False).")
             print("Pump value value must be boolean.")
             return
         self.toggle_pump = bool_value
         print(f"Pump boolean set to: {self.toggle_pump}!")
 
+    # update config file while the code is running
+    def update_config(self, config_file):
+        # Reset the controller
+        self.reset()
+
+        # Re-read the config file
+        with open(config_file, 'r') as file:
+            configs = yaml.safe_load(file)
+            self.channel_configs = configs['CHANNEL_CONFIGS']
+
+        # Validate the new configuration
+        self.validate_configuration()
+
+        # Reinitialize necessary components
+        if SERVOKIT_AVAILABLE and not self.simulation_mode:
+            self.kit = ServoKit(channels=self.num_outputs)
+
+        # Reset input counter and other necessary variables
+        self.input_counter = 0
+
+        # Restart monitoring if it was running
+        if self.running:
+            self.stop_monitoring()
+            self.start_monitoring()
+
+        print(f"Configuration updated successfully from {config_file}")
+
+    # Print the input mappings
+    def print_input_mappings(self):
+        print("Input mappings:")
+        input_to_name = {}
+        for channel_name, config in self.channel_configs.items():
+            input_channel = config['input_channel']
+            if input_channel != 'none' and isinstance(input_channel, int):
+                if input_channel not in input_to_name:
+                    input_to_name[input_channel] = []
+                input_to_name[input_channel].append(channel_name)
+
+        for input_num in range(self.num_inputs):
+            if input_num in input_to_name:
+                names = ', '.join(input_to_name[input_num])
+                print(f"Input {input_num}: {names}")
+            else:
+                print(f"Input {input_num}: Not assigned")
+
 
 class ServoKitNotAvailableError(Exception):
     pass
+
 
 class ServoKitWriteError(Exception):
     pass

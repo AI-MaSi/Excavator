@@ -2,8 +2,8 @@
 
 CHANNEL_CONFIGS:
   trackR:
-    input_channel: 6              # The index of the input data array
-    output_channel: 0             # The PWM hat channel, same as printed on the PCB
+    input_channel: 6              # The index of the input data array. In Python, indexing is zero-based, meaning the first value is at index 0
+    output_channel: 0             # The PWM hat channel, same as printed on the PCB. Zero-based!
     type: angle                   # type of the controlled thing. angle(eg. servo), throttle(eg. motor), switch(eg. LED)
     affects_pump: false           # use of the channel will increase pump speed. True or False
     direction: -1                 # change direction. 1 or -1
@@ -34,8 +34,8 @@ CHANNEL_CONFIGS:
     offset: 8
     multiplier_positive: 30
     multiplier_negative: 30
-    gamma_positive: 0.7
-    gamma_negative: 0.7
+    gamma_positive: 0.3
+    gamma_negative: 0.3
 
   lift_boom:
     input_channel: 1
@@ -46,8 +46,8 @@ CHANNEL_CONFIGS:
     offset: 0
     multiplier_positive: 30
     multiplier_negative: 30
-    gamma_positive: 2.8
-    gamma_negative: 0.7
+    gamma_positive: 0.3
+    gamma_negative: 0.3
 
   tilt_boom:
     input_channel: 4
@@ -58,8 +58,8 @@ CHANNEL_CONFIGS:
     offset: 5
     multiplier_positive: 33
     multiplier_negative: 33
-    gamma_positive: 1.0
-    gamma_negative: 1.0
+    gamma_positive: 0.3
+    gamma_negative: 0.3
 
   rotate:
     input_channel: 3
@@ -70,8 +70,8 @@ CHANNEL_CONFIGS:
     offset: 5
     multiplier_positive: 11
     multiplier_negative: 11
-    gamma_positive: 0.6
-    gamma_negative: 1.5
+    gamma_positive: 1.0
+    gamma_negative: 1.0
 
   tool1:
     input_channel: 5
