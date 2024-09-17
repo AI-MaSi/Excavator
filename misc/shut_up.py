@@ -11,7 +11,7 @@ excavator_main_dir = '/home/pi/GitHub/Excavator/main'
 sys.path.append(excavator_main_dir)
 
 # Define the configuration file
-config_file_name = 'driver_config_Motionplatform.yaml'
+config_file_name = 'configuration_files/driver_config_Motionplatform.yaml'
 
 # Construct the full path
 config_file_path = os.path.join(excavator_main_dir, config_file_name)
