@@ -4,6 +4,7 @@ import json
 import time
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+import struct
 
 
 class DataExchangeServer:
@@ -12,7 +13,7 @@ class DataExchangeServer:
         self.client_data = {
             client: {
                 "received_values": None,
-                "local_values": [0.0] * config['clients'][client]['num_outputs'],
+                "local_values": [],
                 "last_timestamp": 0,
                 "last_checksum": None
             }
@@ -23,10 +24,6 @@ class DataExchangeServer:
     def update_latest(self, client_id, values, timestamp, checksum):
         if client_id not in self.client_data:
             return False, "Invalid client ID"
-
-        expected_values = self.config['clients'][client_id]['num_outputs']
-        if len(values) != expected_values:
-            return False, f"Expected {expected_values} values, got {len(values)}"
 
         if timestamp <= self.client_data[client_id]["last_timestamp"]:
             return False, "Message is old"
@@ -77,18 +74,24 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         timestamp = time.time()
         checksum = server.calculate_checksum(values, timestamp)
-        response = json.dumps({
+        response_data = {
             'values': values,
             'timestamp': timestamp,
             'checksum': checksum,
             'message': message
-        })
+        }
+        response_json = json.dumps(response_data)
+
+        # Calculate the message size and prepare the header
+        message_size = len(response_json)
+        size_header = struct.pack('>I', message_size)  # 4-byte unsigned integer, big-endian
 
         self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(response)))
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(4 + message_size))  # 4 bytes for size + actual message size
         self.end_headers()
-        self.wfile.write(response.encode())
+        self.wfile.write(size_header)
+        self.wfile.write(response_json.encode())
 
     def do_POST(self):
         if not self.path.startswith('/send'):
@@ -97,7 +100,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
-        data = json.loads(post_data.decode())
+
+        # Extract the message size from the first 4 bytes
+        size_header = post_data[:4]
+        message_size = struct.unpack('>I', size_header)[0]
+
+        # Extract and parse the JSON data
+        json_data = post_data[4:4 + message_size].decode()
+        data = json.loads(json_data)
 
         client_id = self.path.split('/')[-1]
         success, message = server.update_latest(
@@ -107,12 +117,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             data['checksum']
         )
 
-        response = json.dumps({'status': message})
+        response_data = {'status': message}
+        response_json = json.dumps(response_data)
+        message_size = len(response_json)
+        size_header = struct.pack('>I', message_size)
+
         self.send_response(200 if success else 400)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(response)))
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(4 + message_size))
         self.end_headers()
-        self.wfile.write(response.encode())
+        self.wfile.write(size_header)
+        self.wfile.write(response_json.encode())
 
 
 def load_config(config_file):
@@ -125,8 +140,8 @@ def run_server(config):
     httpd = ThreadingHTTPServer(server_address, RequestHandler)
     print(f"Server running on {server_address}")
     print("Clients:")
-    for client, details in config['clients'].items():
-        print(f"  - {client}: {details['num_outputs']} output values")
+    for client in config['clients']:
+        print(f"  - {client}")
     httpd.serve_forever()
 
 
