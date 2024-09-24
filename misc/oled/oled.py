@@ -1,3 +1,4 @@
+# remember to change font_path!
 import subprocess
 import os
 import board
@@ -81,7 +82,7 @@ def update_display(interface, network_name, IP, rssi=None, show_cpu_temp=False):
     image = Image.new("1", (width, height))
     draw = ImageDraw.Draw(image)
 
-    font_path = '/home/pi/Desktop/Test-bench/misc/oled/Montserrat-VariableFont_wght.ttf'
+    font_path = '/home/pi/Documents/masi/misc/oled/Montserrat-VariableFont_wght.ttf'
     font_size = 12
     font_size_ip = 19
     font_savonia = ImageFont.truetype(font_path, font_size)
