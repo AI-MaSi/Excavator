@@ -245,27 +245,36 @@ class PWM_hat:
         pump_idle = pump_config['idle']
         input_channel = pump_config.get('input_channel')
 
+        print(f"Debug: input_channel = {input_channel}, type = {type(input_channel)}")
+        print(f"Debug: pump_variable = {self.pump_variable}")
+        print(f"Debug: pump_variable_sum = {self.pump_variable_sum}")
+        print(f"Debug: manual_pump_load = {self.manual_pump_load}")
+
         if not self.pump_enabled:
             throttle_value = -1.0  # Set to -1 when pump is disabled
-        elif input_channel is None:
+            print("Debug: Pump is disabled")
+        elif input_channel is None or input_channel == 'None':
             # No direct input channel, use variable pump sum if enabled
+            print("Debug: No direct input channel")
             if self.pump_variable:
                 throttle_value = pump_idle + (pump_multiplier * self.pump_variable_sum)
+                print(f"Debug: Using variable pump sum. Calculated throttle: {throttle_value}")
             else:
                 throttle_value = pump_idle + pump_multiplier
+                print(f"Debug: Not using variable pump sum. Calculated throttle: {throttle_value}")
 
             # Add manual pump load
             throttle_value += self.manual_pump_load
+            print(f"Debug: After adding manual pump load. Throttle: {throttle_value}")
+        elif isinstance(input_channel, int) and 0 <= input_channel < len(values):
+            throttle_value = values[input_channel]
+            print(f"Debug: Using direct input channel {input_channel}. Throttle: {throttle_value}")
         else:
-            # Direct input channel specified
-            print(f"Using input channel {input_channel} for pump control.")
-            if isinstance(input_channel, int) and 0 <= input_channel < len(values):
-                throttle_value = values[input_channel]
-            else:
-                print(f"Warning: Invalid input channel {input_channel}. Using pump_idle.")
-                throttle_value = pump_idle
+            print(f"Warning: Invalid input channel {input_channel}. Using pump_idle.")
+            throttle_value = pump_idle
 
         throttle_value = max(-1.0, min(1.0, throttle_value))
+        print(f"Debug: Final throttle value after clamping: {throttle_value}")
 
         self.kit.continuous_servo[pump_channel].throttle = throttle_value
 
