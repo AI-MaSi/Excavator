@@ -39,10 +39,9 @@ except ImportError:
 
 
 class PWM_hat:
-    def __init__(self, inputs: int, config_file: str, simulation_mode: bool = False, pump_variable: bool = True,
+    def __init__(self, config_file: str, simulation_mode: bool = False, pump_variable: bool = True,
                  tracks_disabled: bool = False, input_rate_threshold: float = 5, deadzone: int = 6) -> None:
         pwm_channels = 16
-        print(f"PWM channels in use: {pwm_channels}")
 
         self.simulation_mode = simulation_mode
 
@@ -54,8 +53,10 @@ class PWM_hat:
         self.tracks_disabled = tracks_disabled
 
         self.values = [0.0 for _ in range(pwm_channels)]
-        self.num_inputs = inputs
+        self.num_inputs = self.calculate_num_inputs()
         self.num_outputs = pwm_channels
+
+        print(f"PWM channels in use: {pwm_channels}, input in use: {self.num_inputs}")
 
         self.input_rate_threshold = input_rate_threshold
         self.input_event = threading.Event()
@@ -81,16 +82,26 @@ class PWM_hat:
             print("Using ServoKitStub for simulation.")
             self.kit = ServoKitStub(channels=pwm_channels)
 
-        self.reset()
         self.validate_configuration()
+        self.reset()
 
         if input_rate_threshold > 0:    # Start monitoring if threshold is set
             self.start_monitoring()
+
+    def calculate_num_inputs(self) -> int:
+        """Calculate the number of input channels specified in the configuration."""
+        input_channels = set()
+        for config in self.channel_configs.values():
+            input_channel = config.get('input_channel')
+            if isinstance(input_channel, int):
+                input_channels.add(input_channel)
+        return len(input_channels)
 
     def validate_configuration(self) -> None:
         """Validate the configuration file."""
         required_keys = ['type', 'input_channel', 'output_channel', 'direction', 'offset']
         angle_specific_keys = ['multiplier_positive', 'multiplier_negative', 'gamma_positive', 'gamma_negative']
+        pump_specific_keys = ['idle', 'multiplier']
 
         for channel_name, config in self.channel_configs.items():
             # Validate existence of required keys
@@ -99,28 +110,27 @@ class PWM_hat:
                     raise ValueError(f"Missing '{key}' in configuration for channel '{channel_name}'")
 
             # Validate types of operation
-            if config['type'] not in ['angle', 'throttle', 'switch', 'none', 'pump']:
+            if config['type'] not in ['angle', 'pump']:
                 raise ValueError(f"Invalid type '{config['type']}' for channel '{channel_name}'")
 
             # Validate input_channel
-            if isinstance(config['input_channel'], int):
-                if not (0 <= config['input_channel'] < self.num_inputs):
-                    raise ValueError(
-                        f"Input channel {config['input_channel']} out of range for channel '{channel_name}'")
-            elif config['input_channel'] != 'none':
-                raise ValueError(
-                    f"Input channel must be an integer or 'none', got {type(config['input_channel'])} for channel '{channel_name}'")
+            if config['input_channel'] != 'None':
+                if not isinstance(config['input_channel'], int) or not (0 <= config['input_channel'] < self.num_inputs):
+                    raise ValueError(f"Invalid input_channel {config['input_channel']} for channel '{channel_name}'")
 
             # Validate output_channel
-            if isinstance(config['output_channel'], int):
-                if not (0 <= config['output_channel'] < self.num_outputs):
-                    raise ValueError(
-                        f"Output channel {config['output_channel']} out of range for channel '{channel_name}'")
-            else:
-                raise ValueError(
-                    f"Output channel must be an integer, got {type(config['output_channel'])} for channel '{channel_name}'")
+            if not isinstance(config['output_channel'], int) or not (0 <= config['output_channel'] < self.num_outputs):
+                raise ValueError(f"Invalid output_channel {config['output_channel']} for channel '{channel_name}'")
 
-            # Validate gamma values for angles
+            # Validate direction
+            if config['direction'] not in [-1, 1]:
+                raise ValueError(f"Invalid direction {config['direction']} for channel '{channel_name}'")
+
+            # Validate offset
+            if not (-30 <= config['offset'] <= 30):
+                raise ValueError(f"Offset {config['offset']} out of range (-30 to 30) for channel '{channel_name}'")
+
+            # Validate angle-specific configuration
             if config['type'] == 'angle':
                 for key in angle_specific_keys:
                     if key not in config:
@@ -133,12 +143,24 @@ class PWM_hat:
                         if not (1 <= abs(config[key]) <= 50):
                             raise ValueError(f"{key} {config[key]} out of range (1 to 50) for channel '{channel_name}'")
 
-            # Validate offset for reasonable adjustments
-            if not (-30 <= config['offset'] <= 30):
-                raise ValueError(f"Offset {config['offset']} out of range (-30 to 30) for channel '{channel_name}'")
+                # Validate affects_pump
+                if 'affects_pump' not in config or not isinstance(config['affects_pump'], bool):
+                    raise ValueError(f"Missing or invalid 'affects_pump' for angle type channel '{channel_name}'")
 
-        print("Validating configs done. Jee!")
-        print("------------------------------------------\n")
+            # Validate pump-specific configuration
+            elif config['type'] == 'pump':
+                for key in pump_specific_keys:
+                    if key not in config:
+                        raise ValueError(f"Missing '{key}' in configuration for pump type channel '{channel_name}'")
+
+                if not (-1 <= config['idle'] <= 1):
+                    raise ValueError(f"Idle {config['idle']} out of range (-1 to 1) for pump channel '{channel_name}'")
+
+                if not (0 < config['multiplier'] <= 10):
+                    raise ValueError(
+                        f"Multiplier {config['multiplier']} out of range (0 to 10) for pump channel '{channel_name}'")
+
+        print("Configuration validation completed successfully.")
 
     def start_monitoring(self) -> None:
         """Start the input rate monitoring thread."""
@@ -169,10 +191,10 @@ class PWM_hat:
             else:
                 # If we've timed out, check if we've exceeded our threshold
                 if time.time() - self.last_input_time > 1.0 / self.input_rate_threshold:
-                    print("Input rate too low. Resetting...")
+                    #print("Input rate too low. Resetting...")
                     self.reset(reset_pump=False)
 
-    def update_values(self, raw_values, min_cap=-1, max_cap=1, return_servo_angles=False) :
+    def update_values(self, raw_values, min_cap=-1, max_cap=1, return_servo_angles=False):
         self.return_servo_angles = return_servo_angles
         self.servo_angles.clear()
 
@@ -181,7 +203,7 @@ class PWM_hat:
             raise ValueError("Input values are None")
 
         # Turn single input value to a list
-        if isinstance(raw_values, float) or isinstance(raw_values, int):
+        if isinstance(raw_values, (float, int)):
             raw_values = [raw_values]
 
         if len(raw_values) != self.num_inputs:
@@ -193,7 +215,7 @@ class PWM_hat:
         self.pump_variable_sum = 0.0
         for channel_name, config in self.channel_configs.items():
             input_channel = config['input_channel']
-            if input_channel == 'none' or input_channel >= len(raw_values):
+            if input_channel is None or not isinstance(input_channel, int) or input_channel >= len(raw_values):
                 continue
 
             # Check if the value is within the limits
@@ -221,11 +243,12 @@ class PWM_hat:
         pump_channel = pump_config['output_channel']
         pump_multiplier = pump_config['multiplier']
         pump_idle = pump_config['idle']
-        input_channel = pump_config.get('input_channel', None)
+        input_channel = pump_config.get('input_channel')
 
         if not self.pump_enabled:
             throttle_value = -1.0  # Set to -1 when pump is disabled
         elif input_channel is None:
+            # No direct input channel, use variable pump sum if enabled
             if self.pump_variable:
                 throttle_value = pump_idle + (pump_multiplier * self.pump_variable_sum)
             else:
@@ -234,8 +257,13 @@ class PWM_hat:
             # Add manual pump load
             throttle_value += self.manual_pump_load
         else:
-            # pump_variable arg does not affect anything if input channel is set for the pump
-            throttle_value = values[input_channel]
+            # Direct input channel specified
+            print(f"Using input channel {input_channel} for pump control.")
+            if isinstance(input_channel, int) and 0 <= input_channel < len(values):
+                throttle_value = values[input_channel]
+            else:
+                print(f"Warning: Invalid input channel {input_channel}. Using pump_idle.")
+                throttle_value = pump_idle
 
         throttle_value = max(-1.0, min(1.0, throttle_value))
 
@@ -250,6 +278,7 @@ class PWM_hat:
                     continue
 
                 output_channel = config['output_channel']
+                #print(f"Output channel: {output_channel}")
                 if output_channel >= len(values):
                     print(f"Channel '{channel_name}': No data available.")
                     continue

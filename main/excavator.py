@@ -5,8 +5,9 @@ import aiohttp
 import time
 import hashlib
 import json
+import struct
 
-from main.control_modules import (
+from control_modules import (
     ADC_sensors,
     PWM_controller,
     IMU_sensors,
@@ -32,6 +33,7 @@ class Excavator:
         self.last_received_timestamp = 0
 
         self._initialize_components()
+        self.print_input_mappings()
 
     def load_config(self, config_path: str):
         with open(config_path, 'r') as config_file:
@@ -48,7 +50,7 @@ class Excavator:
         # Initialize PWM controller
         self.pwm = PWM_controller.PWM_hat(
             config_file=self.config['pwm_config'],
-            inputs=self.config['inputs'],
+            #pwm_inputs=self.config['pwm_inputs'],
             simulation_mode=self.config['simulation'],
             pump_variable=self.config['pump_variable'],
             tracks_disabled=self.config['tracks_disabled'],
@@ -82,6 +84,17 @@ class Excavator:
     def calculate_checksum(values, timestamp):
         data = json.dumps(values) + str(timestamp)
         return hashlib.md5(data.encode()).hexdigest()
+
+    @staticmethod
+    def handle_excavator_inputs(control_values):
+        """
+        Process and map the received control values here.
+        """
+        # (trackR, trackL, scoop, lift_boom, tilt_boom, center_rotate, aux1, aux2)
+        processed_values = control_values[:8]  # Take first 8 values. Zero based index
+
+        # Add any additional processing logic here if needed
+        return processed_values
 
     async def start(self):
         self.logger.info("Starting Excavator system...")
@@ -118,14 +131,19 @@ class Excavator:
                 loop_start = asyncio.get_event_loop().time()
 
                 pressures = self.adc.read_scaled()
+                #self.logger.debug(f"ADC pressures: {pressures}")
                 pump_rpm = self.rpm.read_rpm()
-                imu_data = self.imu.read_all()
+                #self.logger.debug(f"Pump RPM: {pump_rpm}")
+                imu_data = self.imu.read_all(read_mode='raw')
+                #self.logger.debug(f"IMU data: {imu_data}")
 
                 sensor_data = {
                     'pressures': pressures,
                     'pump_rpm': pump_rpm,
                     'imu_data': imu_data
                 }
+
+                self.logger.debug(f"Collected sensor data: {sensor_data}")
 
                 # Skip sending if the data hasn't changed
                 if sensor_data == self.last_sent_data:
@@ -134,7 +152,7 @@ class Excavator:
                     continue
 
                 timestamp = time.time()
-                checksum = self.calculate_checksum(sensor_data, timestamp)
+                checksum = Excavator.calculate_checksum(sensor_data, timestamp)
 
                 payload = {
                     "values": sensor_data,
@@ -142,7 +160,14 @@ class Excavator:
                     "checksum": checksum
                 }
 
-                async with self.http_session.post(server_url, json=payload) as response:
+                json_payload = json.dumps(payload)
+                message_size = len(json_payload)
+                size_header = struct.pack('>I', message_size)
+
+                self.logger.debug(f"Total payload sensor data: {payload}")
+
+                async with self.http_session.post(server_url, data=size_header + json_payload.encode(),
+                                                  headers={'Content-Type': 'application/octet-stream'}) as response:
                     if response.status == 200:
                         self.logger.debug(f"Sent sensor data: {sensor_data}")
                         self.last_sent_data = sensor_data
@@ -167,20 +192,33 @@ class Excavator:
 
                 async with self.http_session.get(server_url) as response:
                     if response.status == 200:
-                        control_data = await response.json()
+                        size_header = await response.content.read(4)
+                        message_size = struct.unpack('>I', size_header)[0]
+                        json_data = await response.content.read(message_size)
+                        control_data = json.loads(json_data.decode())
 
                         # Verify timestamp and checksum
                         if control_data['timestamp'] <= self.last_received_timestamp:
                             self.logger.debug("Skipping receive - old data")
                         else:
-                            calculated_checksum = self.calculate_checksum(control_data['values'],
+                            calculated_checksum = Excavator.calculate_checksum(control_data['values'],
                                                                           control_data['timestamp'])
                             if calculated_checksum != control_data['checksum']:
                                 self.logger.error("Checksum mismatch in received data")
                             else:
                                 self.last_received_timestamp = control_data['timestamp']
-                                angles = self.pwm.update_values(control_data['values'], return_servo_angles=True)
+
+                                #print(f"Received control data: {control_data['values']}")
+
+                                # Process the control data
+                                processed_values = Excavator.handle_excavator_inputs(control_data['values'])
+
+                                #print(f"Processed values: {processed_values}")
+                                # Update PWM controller with processed values
+                                angles = self.pwm.update_values(processed_values, return_servo_angles=True)
                                 self.logger.debug(f"Servo angles: {angles}")
+                                print(f"Servo angles: {angles}")
+
                     elif response.status == 204:
                         self.logger.debug("No new control data available")
                     else:

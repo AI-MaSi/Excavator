@@ -4,7 +4,7 @@
 CHANNEL_CONFIGS:
 
   pump:
-    input_channel: none           # The index of the input data array. In Python, indexing is zero-based, meaning the first value is at index 0.
+    input_channel: None           # The index of the input data array. In Python, indexing is zero-based, meaning the first value is at index 0.
     output_channel: 9             # The PWM hat output channel, same as printed on the PCB. Also Zero-based!
     type: pump                    # type of the controlled thing. this is very WIP, just use "angle" for now
     offset: 0                     # pump does not use this but im lazy, the validator checks this so just leave this to 0 for now

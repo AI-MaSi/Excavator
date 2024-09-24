@@ -3,8 +3,8 @@
 # TODO: LISÄÄ PUUTTUVAT
 
 # System settings
-simulation: false
-num_outputs: 31  # 4x(3+3) IMU accelerometer and gyro data, 7 pressure sensors, 1 RPM sensor
+simulation: False
+num_outputs: 31  # 4x(3+3) IMU accelerometer and gyro data (read raw), 7 pressure sensors, 1 RPM sensor
 
 # Network settings
 addr: '192.168.0.131'  # Address where the HTTP server will run
@@ -12,10 +12,11 @@ port: 8000  # Port for the HTTP server
 
 # PWM controller settings
 pwm_config: 'configuration_files/excavator_channel_configs.yaml'
+pwm_inputs: 8        # TODO: update to automatic calculation, from channel_configs!
 pump_variable: true
 tracks_disabled: true
-input_rate_threshold: 0
-deadzone: 0
+input_rate_threshold: 5
+deadzone: 1
 
 # Sensor settings
 adc_config: 'configuration_files/excavator_sensor_configs.yaml'
@@ -27,5 +28,5 @@ decimals: 3
 log_level: 'DEBUG'  # INFO, DEBUG, WARNING, ERROR
 
 # Performance
-send_frequency: 2  # Hz, how often to send sensor data
-receive_frequency: 1  # Hz, how often to receive control data
+send_frequency: 10  # Hz, how often to send sensor data
+receive_frequency: 20  # Hz, how often to receive control data

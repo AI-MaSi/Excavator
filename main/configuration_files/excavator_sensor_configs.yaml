@@ -70,12 +70,12 @@ FILTER_CONFIG:
 
 RPM_SENSORS:
   RPM_pump:
-    GPIO_pin: 21
+    GPIO pin: 21
     magnets: 14
     # GPIO pin number for the sensor and the number of magnets on the rotating part
 
 
-ANGLE_SENSORS:
+#ANGLE_SENSORS:
     # Excavator has none
 
 
@@ -114,6 +114,11 @@ PRESSURE_SENSORS:
 
 IMU_CONFIG:
   multiplexer_address: 0x71
-  multiplexer_channels: [0,1,2,3]   # ISM330DHCX IMU are connected to multiplexer channels 0, 1, 2, 3
+  multiplexer_channels: [0, 1, 2, 3]
+  channel_names:
+    0: 'imu_scoop'
+    1: 'imu_tiltBoom'
+    2: 'imu_liftBoom'
+    3: 'imu_carriage'
   accelerometer_data_rate: 'Rate.RATE_26_HZ'
   gyro_data_rate: 'Rate.RATE_26_HZ'

@@ -117,7 +117,7 @@ class ADC_hat:
         for sensor_name, sensor_config in {**self.pressure_sensors, **self.angle_sensors}.items():
             voltage = self._read_raw(sensor_config)
             if voltage is not None:
-                raw_readings[sensor_name] = voltage
+                raw_readings[sensor_name] = round(voltage,self.decimals)
 
         return raw_readings
 
@@ -146,7 +146,7 @@ class ADC_hat:
                 voltage = self._read_raw(sensor_config)
                 if voltage is not None:
                     scaled_value = self.calibrate_pressure(voltage, sensor_config)
-                    scaled_readings[sensor_name] = scaled_value
+                    scaled_readings[sensor_name] = round(scaled_value,self.decimals)
                     self._update_sensor_range('pressure', sensor_name, scaled_value)
 
         if read is None or read == 'angle':
@@ -154,7 +154,7 @@ class ADC_hat:
                 voltage = self._read_raw(sensor_config)
                 if voltage is not None:
                     scaled_value = self.calibrate_angle(voltage, sensor_config)
-                    scaled_readings[sensor_name] = scaled_value
+                    scaled_readings[sensor_name] = round(scaled_value,self.decimals)
                     self._update_sensor_range('angle', sensor_name, scaled_value)
 
         return scaled_readings

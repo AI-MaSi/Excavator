@@ -11,7 +11,7 @@ async def main():
     logger.info("Starting the Excavator system")
 
     # Create an Excavator instance
-    excavator = Excavator('excavator_config.yaml')
+    excavator = Excavator('configuration_files/excavator_config.yaml')
 
     # Print input mappings for debugging
     excavator.print_input_mappings()
