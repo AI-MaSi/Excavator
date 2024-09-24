@@ -1,35 +1,25 @@
-# shut up excavator yes beep beep f you too
-# this uses the same config file as the masi_driver
-# set to run every time excavator boots up, after service "show_ip.service"
-from adafruit_servokit import ServoKit
+# stop the beeping at startup
 import sys
 import os
-import yaml
 
-# Define path
-excavator_main_dir = '/home/pi/GitHub/Excavator/main'
-sys.path.append(excavator_main_dir)
+# Get the absolute path of the directory containing the module
+module_path = os.path.abspath(os.path.join('..', 'main', 'control_modules'))
 
-# Define the configuration file
-config_file_name = 'configuration_files/driver_config_Motionplatform.yaml'
+# Add it to the Python path
+if module_path not in sys.path:
+    sys.path.append(module_path)
 
-# Construct the full path
-config_file_path = os.path.join(excavator_main_dir, config_file_name)
+# Now you can import the module
+from PWM_controller import PWM_hat
 
-# Load configurations from the .yaml file using the full path
-with open(config_file_path, 'r') as file:
-    configs = yaml.safe_load(file)
-    channel_configs = configs['CHANNEL_CONFIGS']
+path = '../main/configuration_files/excavator_channel_configs.yaml'
 
+pwm = PWM_hat(
+    config_file=path,
+    inputs=8,
+    simulation_mode=False,
+	input_rate_threshold=0,	# set rate to 0 (or None) to disable rate monitoring
+)
 
-kit = ServoKit(channels=16)
-center_val_servo = 90
-
-if 'pump' in channel_configs and channel_configs['pump']['type'] == 'pump':
-	kit.continuous_servo[channel_configs['pump']['output_channel']].throttle = -1
-
-# resetting these not needed but why not
-# this does not care about offset
-for channel_name, config in channel_configs.items():
-	if config['type'] == 'angle':
-		kit.servo[config['output_channel']].angle = center_val_servo
+# no need to explicitly call pwm.reset() as it is called in the constructor
+# also no need to call pwm.stop_monitoring() as input threshold is set to 0
