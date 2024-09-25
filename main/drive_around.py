@@ -1,5 +1,4 @@
-import universal_connection_manager
-from control_modules import PWM_controller
+from control_modules import PWM_controller, socket_manager
 
 
 
@@ -25,7 +24,7 @@ pwm = PWM_controller.PWM_hat(config_file='configuration_files/excavator_channel_
                              )
 
 # init socket
-socket = universal_connection_manager.MasiSocketManager()
+socket = socket_manager.MasiSocketManager()
 
 
 # set up Excavator as server.
@@ -97,6 +96,10 @@ def run():
 
             #if pump_decrease:
             #    pwm.update_pump(0.15)
+
+            # example, reload configs
+            #if float_values[13]:
+            #    pwm.reload_config()
 
             control_values = float_values[:8]
             pwm.update_values(control_values)

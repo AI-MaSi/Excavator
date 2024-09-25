@@ -33,7 +33,7 @@ class Excavator:
         self.last_received_timestamp = 0
 
         self._initialize_components()
-        self.print_input_mappings()
+        #self.print_input_mappings()
 
     def load_config(self, config_path: str):
         with open(config_path, 'r') as config_file:
@@ -217,7 +217,6 @@ class Excavator:
                                 # Update PWM controller with processed values
                                 angles = self.pwm.update_values(processed_values, return_servo_angles=True)
                                 self.logger.debug(f"Servo angles: {angles}")
-                                print(f"Servo angles: {angles}")
 
                     elif response.status == 204:
                         self.logger.debug("No new control data available")

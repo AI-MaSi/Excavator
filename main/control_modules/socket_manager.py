@@ -300,6 +300,7 @@ class MasiSocketManager:
             print("Threads stopped succesfully!")
 
     def send_data(self, data):
+        # This method uses self.local_output_datatype for packing data.
 
         # pack data (without checksum). Use local_output_datatype
         packed_data = struct.pack(self.endian_specifier + self.local_output_datatype * len(data), *data)  # local datatype here??
@@ -318,6 +319,7 @@ class MasiSocketManager:
         return None
 
     def get_latest_received(self):
+        # This method uses self.connected_output_datatype for unpacking received data.
         with self.latest_data_lock:
             if self.latest_recvd is None:
                 return None  # Silently handle the no-data-yet case
@@ -436,47 +438,6 @@ class MasiSocketManager:
         # add the checksum as the last value in the list
         packed_values = packed_data + struct.pack((self.endian_specifier + self.checksum_format), checksum)
         return packed_values
-
-    """
-    def _save_buffer(self):
-        # Saves all buffered data to file if buffer size exceeds the limit.
-        with self.data_save_lock:
-            packed_data_list = []
-            for timestamp, data in self.data_buffer:
-                print("Timestamp:", type(timestamp), timestamp)
-                print("Data types before casting:", [type(d) for d in data])
-
-                # Assuming timestamp needs to be packed as an unsigned int ('I')
-                # and each data point as a float ('f'), correct these as necessary:
-                try:
-                    timestamp = int(timestamp)  # Ensure timestamp is an integer, adjust as needed
-                    data = [float(d) for d in data]  # Convert data points to float
-                except ValueError as e:
-                    print("Type conversion error:", e)
-                    continue  # Skip this entry if conversion fails
-
-                print("Data types after casting:", [type(d) for d in data])
-
-                # Prepare the format string
-                format_string = self.endian_specifier + self.unix_format + (self.pack_datatype * len(data))
-                print("Format string:", format_string)
-
-                try:
-                    # Pack the timestamp and data together for each item
-                    packed_data = struct.pack(format_string, timestamp, *data)
-                    packed_data_list.append(packed_data)
-                except struct.error as e:
-                    print("Struct packing error:", e)
-                    print("Failed data entry:", data)
-                    continue  # Skip this entry if packing fails
-
-            # Write all packed data to the file at once
-            with open(self.filepath, 'ab') as f:
-                f.writelines(packed_data_list)
-
-            print("Saved data to file...")
-            self.data_buffer.clear()
-            """
 
     def __save_buffer(self):
         packed_data_list = []

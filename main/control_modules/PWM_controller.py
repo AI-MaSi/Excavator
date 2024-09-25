@@ -364,7 +364,7 @@ class PWM_hat:
         # Update pump state immediately
         # self.handle_pump(self.values)
 
-    def update_config(self, config_file):
+    def reload_config(self, config_file):
         """Update the configuration file and reinitialize the controller."""
         # Reset the controller
         self.reset()
