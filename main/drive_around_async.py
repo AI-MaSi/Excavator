@@ -7,7 +7,7 @@ port = 5111
 
 identification_number = 0  # 0 excavator, 1 Mevea, 2 Motion Platform, more can be added...
 inputs = 20  # Number of inputs received from the other end
-outputs = 3  # Number of outputs I'm going to send. three values for testing
+outputs = 4  # Number of outputs I'm going to send. three values for testing
 
 # Initialize PWM controller
 # For this demo, we're not fetching the full configuration from the excavator_config.yaml file,
@@ -43,8 +43,8 @@ if not handshake_result:
 loop_frequency, int_scale = extra_args[0], extra_args[1]
 print(f"Received extra arguments: Loop_freq ({loop_frequency}), int_scale ({int_scale})")
 
-# Update the PWM-controller safety threshold to be 50% of the loop_frequency
-pwm.set_threshold(loop_frequency * 0.50)
+# Update the PWM-controller safety threshold to be 10% of the loop_frequency
+pwm.set_threshold(loop_frequency * 0.10)
 
 # Switch socket communication to UDP (to save bandwidth)
 socket.tcp_to_udp()
@@ -128,12 +128,13 @@ async def sensor_signal_loop(frequency):
         # Send sensor data or feedback back to the client
         # Note: We're sending floats here. If you need to send integers,
         # you would need to use float_to_int() function from the sending end
-        imu_scoop_angles = imu.read_ism330(channel=3)
-        print(f"IMU scoop kalman: {imu_scoop_angles}")
+        imu_scoop_angles = imu.read_ism330(channel=3, read_mode='angles')
+        imu_values = list(imu_scoop_angles.values())
+        print(f"IMU scoop kalman: {imu_values}")
 
         # Placeholder, I need to first check the IMU data (and remove names etc., only values for UDP!)
-        feedback = [0.0] * outputs
-        socket.send_data(feedback)
+        #feedback = [6.9] * outputs
+        socket.send_data(imu_values)
 
         # Wait to maintain 5Hz frequency
         elapsed_time = time.time() - start_time

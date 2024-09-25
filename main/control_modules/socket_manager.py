@@ -229,11 +229,13 @@ class MasiSocketManager:
 
     def tcp_to_udp(self, socket_buffer_size=64):
         print("Reconfiguring to UDP...")
+        # Store the TCP address information before closing the socket
+        tcp_addr = self.connected_addr if self.socket_type == 'client' else self.local_addr
+
         # Close existing TCP connection if it's a connected socket distinct from the listening socket
         if hasattr(self, 'connected_socket') and self.connected_socket:
             self.connected_socket.close()
             print("Closed existing TCP connected socket.")
-            self.connected_socket = None  # Reset connected socket to avoid reuse
 
         # Close the listening socket if it exists
         if self.local_socket:
@@ -243,22 +245,17 @@ class MasiSocketManager:
         # Create a new socket for UDP
         self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, socket_buffer_size)
-        # self.local_socket.setblocking(False)
 
-        # Set up as a UDP server
+        # Set up as a UDP server or client
         if self.socket_type == 'server':
-            self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.local_socket.bind(self.local_addr)
-            print(f"Socket reconfigured as a UDP-server! Listening on {self.local_addr}...")
-            self.network_protocol = 'udp'
-            return True
-
-        # Set up as a UDP client
+            self.local_socket.bind(tcp_addr)
+            print(f"Socket reconfigured as a UDP-server! Listening on {tcp_addr}...")
         elif self.socket_type == 'client':
-            # For UDP client, no need to connect
-            print("Socket reconfigured as a UDP-client!")
-            self.network_protocol = 'udp'
-            return True
+            self.connected_addr = tcp_addr  # Keep the server's address for the client
+            print(f"Socket reconfigured as a UDP-client! Server address set to {tcp_addr}")
+
+        self.network_protocol = 'udp'
+        return True
 
     def start_data_recv_thread(self):
         if self.data_reception_thread is None or not self.data_reception_thread.is_alive():
@@ -306,13 +303,11 @@ class MasiSocketManager:
         packed_data = struct.pack(self.endian_specifier + self.local_output_datatype * len(data), *data)  # local datatype here??
 
         if packed_data is not None:
-            # add checksum as the last value of the list
             final_data = self._add_checksum(packed_data)
 
-            # send the data
             if self.network_protocol == 'tcp':
                 self.connected_socket.send(final_data)
-            else:  # should be UDP haha
+            else:  # UDP
                 self.local_socket.sendto(final_data, self.connected_addr)
 
             return final_data
@@ -516,16 +511,18 @@ class MasiSocketManager:
         try:
             if self.network_protocol == 'tcp':
                 full_data = self.connected_socket.recv(self.recv_bytes)
-            else:
+            else:  # UDP
                 full_data, addr = self.local_socket.recvfrom(self.recv_bytes)
+                if self.socket_type == 'server':
+                    self.connected_addr = addr  # Update only for server
 
             if not full_data or len(full_data) != self.recv_bytes:
                 print("No new data or incomplete data received.")
-                return None  # Unified return for no or incorrect data
+                return None
 
-            return full_data  # full received data for further processing
+            return full_data
         except Exception as e:
-            print(f"Error receiving data (receive_data): {e}")
+            print(f"Error receiving data: {e}")
             return None
 
     def __receive_extra_args(self, num_args):
@@ -547,7 +544,7 @@ class MasiSocketManager:
                 f"Handshake confirmed with Mevea device at {self.connected_addr} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
         else:
             print(
-                f"Handshake received from {device_name} with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
+                f"Handshake received from {device_name} ({self.connected_addr}) with {self.recvd_num_inputs} inputs and {self.recvd_num_outputs} outputs.")
 
         print(f"Received extra arguments: {recvd_extra_args}")
 
