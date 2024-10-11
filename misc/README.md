@@ -1,4 +1,4 @@
-# Startup Script Configuration
+# Startup Script Configuration (for shut_up.py)
 
 This README explains how to set up the `shut_up.py` script to run automatically at system startup using systemctl.
 
