@@ -164,3 +164,4 @@ cython_debug/
 .idea/modules.xml
 .idea/vcs.xml
 /misc/ignored/
+/misc/plotting/
