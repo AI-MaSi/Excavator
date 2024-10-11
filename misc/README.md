@@ -2,6 +2,10 @@
 
 This README explains how to set up the `shut_up.py` script to run automatically at system startup using systemctl.
 
+## Why?
+
+The constant ESC beeping is very annoying.
+
 ## Prerequisites
 
 - Ensure `shut_up.py` is located at `/home/pi/Documents/masi/shut_up.py`
