@@ -8,56 +8,53 @@ RPM (Revolutions Per Minute) sensors and center position sensors.
 Key features:
 1. Configurable GPIO sensors using a YAML configuration file
 2. Support for RPM sensors with configurable number of magnets
-3. Real-time RPM calculation using threaded measurements
+3. High-performance RPM calculation using hardware interrupts and efficient timing
 4. Center position sensing for positional feedback
 5. Clean GPIO setup and cleanup procedures
 
 The module includes two main classes:
 1. RPMSensor:
    - Initializes GPIO for RPM sensing
-   - Calculates RPM in real-time using a separate thread
+   - Calculates RPM in real-time using hardware interrupts
    - Provides methods to read current RPM
 
-2. CenterPositionSensor:
-   - Initializes GPIO for position sensing
-   - Provides method to check if sensor is in center position
-
-Usage:
-1. Create a YAML configuration file defining your GPIO sensor setup (for RPM sensors)
-2. Initialize the appropriate sensor class with the configuration
-3. Use the provided methods to read sensor data
-4. Ensure to call the cleanup method when done to release GPIO resources
+2. GPIOSensor:
+   - Base class for GPIO sensors
+   - Provides method to read current sensor state
 """
 
-from time import time, sleep
+from time import time
 import threading
 import yaml
 from typing import Dict
+from collections import deque
+from statistics import mean
 
 try:
     import RPi.GPIO as GPIO
 except ImportError:
     print("RPi.GPIO module not found. Make sure you're running on a Raspberry Pi.")
-    # TODO: simlation mode, prob not needed here...
-
 
 class RPMSensor:
-    def __init__(self, config_file: str, sensor_name: str, decimals: int = 2):
+    def __init__(self, config_file: str, sensor_name: str, decimals: int = 1, window_size: int = 10):
         """
         Initialize RPM sensor with configuration from a YAML file.
 
         :param config_file: Path to the YAML configuration file.
         :param sensor_name: Name of the sensor in the configuration.
         :param decimals: Number of decimal places for RPM value.
+        :param window_size: Size of the moving average window for RPM calculation.
         """
         self.sensor_configs = self._load_config(config_file, sensor_name)
         self.sensor_pin = self.sensor_configs['GPIO pin']
         self.magnets = self.sensor_configs['magnets']
-        self.pulse_count = 0
-        self.rpm = 0
         self.decimals = decimals
+        self.window_size = window_size
+        self.pulse_times = deque(maxlen=window_size)
+        self.last_pulse_time = time()
+        self.rpm = 0
+        self.lock = threading.Lock()
         self._setup_gpio()
-        self._start_measurement()
 
     def _load_config(self, config_file: str, sensor_name: str) -> Dict:
         """Load configuration from YAML file."""
@@ -69,41 +66,33 @@ class RPMSensor:
             raise ValueError(f"Error parsing configuration file: {e}")
 
     def _setup_gpio(self):
-        """Set up GPIO for the RPM sensor."""
+        """Set up GPIO for the RPM sensor using hardware interrupt."""
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.add_event_detect(self.sensor_pin, GPIO.FALLING, callback=self._sensor_callback)
+        GPIO.add_event_detect(self.sensor_pin, GPIO.FALLING, callback=self._sensor_callback, bouncetime=1)
 
     def _sensor_callback(self, channel):
         """Callback function for GPIO event detection."""
-        self.pulse_count += 1
+        current_time = time()
+        with self.lock:
+            self.pulse_times.append(current_time - self.last_pulse_time)
+            self.last_pulse_time = current_time
+            self._calculate_rpm()
 
     def _calculate_rpm(self):
-        """Calculate RPM based on pulse count."""
-        last_checked_time = time()
-        while True:
-            current_time = time()
-            elapsed_time = current_time - last_checked_time
-
-            if elapsed_time >= 0.1:  # Update every 100ms
-                self.rpm = (self.pulse_count / self.magnets) * 60 / elapsed_time
-                self.pulse_count = 0
-                last_checked_time = current_time
-
-            sleep(0.001)
-
-    def _start_measurement(self):
-        """Start the RPM measurement thread."""
-        self.thread = threading.Thread(target=self._calculate_rpm)
-        self.thread.daemon = True
-        self.thread.start()
+        """Calculate RPM based on recent pulse times."""
+        if len(self.pulse_times) >= 2:
+            avg_time_between_pulses = mean(self.pulse_times)
+            self.rpm = 60 / (avg_time_between_pulses * self.magnets)
 
     def read_rpm(self) -> float:
         """Read the current RPM value."""
-        return round(self.rpm, self.decimals)
+        with self.lock:
+            return round(self.rpm, self.decimals)
 
     def cleanup(self):
         """Clean up GPIO resources."""
+        GPIO.remove_event_detect(self.sensor_pin)
         GPIO.cleanup(self.sensor_pin)
 
 
