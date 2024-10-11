@@ -27,7 +27,7 @@ Usage:
 
 
 import threading
-import yaml
+import yaml # PyYAML
 import time
 
 try:
@@ -40,7 +40,7 @@ except ImportError:
 
 class PWM_hat:
     def __init__(self, config_file: str, simulation_mode: bool = False, pump_variable: bool = True,
-                 tracks_disabled: bool = False, input_rate_threshold: float = 5, deadzone: int = 6) -> None:
+                 tracks_disabled: bool = False, input_rate_threshold: float = 5, deadzone: float = 6) -> None:
         pwm_channels = 16
 
         self.simulation_mode = simulation_mode
@@ -56,13 +56,20 @@ class PWM_hat:
         self.num_inputs = self.calculate_num_inputs()
         self.num_outputs = pwm_channels
 
-        print(f"PWM channels in use: {pwm_channels}, input in use: {self.num_inputs}")
+        print(f"PWM channels in use: {pwm_channels}, inputs in use: {self.num_inputs}")
 
         self.input_rate_threshold = input_rate_threshold
+        self.skip_rate_checking = (input_rate_threshold == 0)
+        self.is_safe_state = not self.skip_rate_checking
+
         self.input_event = threading.Event()
-        self.last_input_time = time.time()
         self.monitor_thread = None
         self.running = False
+
+        self.is_safe_state = True
+        self.input_count = 0
+        self.last_input_time = time.time()
+        self.input_timestamps = []
 
         self.center_val_servo = 90
         self.deadzone = deadzone
@@ -83,9 +90,16 @@ class PWM_hat:
             self.kit = ServoKitStub(channels=pwm_channels)
 
         self.validate_configuration()
+        self.defined_channel_types = self.get_defined_channel_types()
+
+        # set servo angles to None at start
+        self.servo_angles = {f"{channel_name} angle": None
+                             for channel_name, config in self.channel_configs.items()
+                             if config['type'] == 'angle'}
+
         self.reset()
 
-        if input_rate_threshold > 0:    # Start monitoring if threshold is set
+        if not self.skip_rate_checking:    # Start monitoring if threshold is set
             self.start_monitoring()
 
     def calculate_num_inputs(self) -> int:
@@ -164,6 +178,10 @@ class PWM_hat:
 
     def start_monitoring(self) -> None:
         """Start the input rate monitoring thread."""
+        if self.skip_rate_checking:
+            print("Input rate checking is disabled.")
+            return
+
         if self.monitor_thread is None or not self.monitor_thread.is_alive():
             self.running = True
             self.monitor_thread = threading.Thread(target=self.monitor_input_rate, daemon=True)
@@ -181,22 +199,55 @@ class PWM_hat:
             print("Stopped input rate monitoring...")
 
     def monitor_input_rate(self) -> None:
-        """Monitor input rate using event-based approach."""
         print("Monitoring input rate...")
         while self.running:
-            # Wait for an input event or timeout
             if self.input_event.wait(timeout=1.0 / self.input_rate_threshold):
                 self.input_event.clear()
-                self.last_input_time = time.time()
-            else:
-                # If we've timed out, check if we've exceeded our threshold
-                if time.time() - self.last_input_time > 1.0 / self.input_rate_threshold:
-                    #print("Input rate too low. Resetting...")
-                    self.reset(reset_pump=False)
+                current_time = time.time()
+                time_diff = current_time - self.last_input_time
+                self.last_input_time = current_time
 
-    def update_values(self, raw_values, min_cap=-1, max_cap=1, return_servo_angles=False):
-        self.return_servo_angles = return_servo_angles
-        self.servo_angles.clear()
+                if time_diff > 0:
+                    current_rate = 1 / time_diff
+                    if current_rate >= self.input_rate_threshold:
+                        self.input_count += 1
+                        # Require consecutive good inputs. 25% of threshold rate, rounded down
+                        if self.input_count >= int(self.input_rate_threshold * 0.25):
+                            self.is_safe_state = True
+                            self.input_count = 0
+                    else:
+                        self.input_count = 0
+
+                    # Save the timestamp for monitoring
+                    self.input_timestamps.append(current_time)
+
+                    # Remove timestamps older than 30 seconds
+                    self.input_timestamps = [t for t in self.input_timestamps if current_time - t <= 30]
+
+            else:
+                if self.is_safe_state:
+                    print("Input rate too low. Entering safe state...")
+                    self.reset(reset_pump=False)
+                    self.is_safe_state = False
+                    self.input_count = 0
+
+    def update_values(self, raw_values, min_cap=-1, max_cap=1):
+        # Reset all angles to None at the start of each update
+        for key in self.servo_angles:
+            self.servo_angles[key] = None
+
+        # Signal the monitoring thread that we have new input
+        if not self.skip_rate_checking:
+            self.input_event.set()
+
+        #print(f"Debug: update_values called with raw_values: {raw_values}")
+        #print(f"Debug: Current safe state: {self.is_safe_state}")
+        #print(f"Debug: skip_rate_checking: {self.skip_rate_checking}")
+
+
+        if not self.skip_rate_checking and not self.is_safe_state:
+            print(f"System in safe state. Ignoring input. Average rate: {self.get_average_input_rate():.2f}Hz")
+            return
 
         if raw_values is None:
             self.reset()
@@ -230,13 +281,13 @@ class PWM_hat:
             if config.get('affects_pump', False):
                 self.pump_variable_sum += abs(capped_value)
 
-        self.handle_pump(self.values)
-        self.handle_angles(self.values)
-        # Signal the monitoring thread that we have new input
-        self.input_event.set()
+        # Handle pump if configured
+        if 'pump' in self.defined_channel_types:
+            self.handle_pump(self.values)
 
-        if self.return_servo_angles:
-            return self.servo_angles.copy()
+        # Handle angles if configured
+        if 'angle' in self.defined_channel_types:
+            self.handle_angles(self.values)
 
     def handle_pump(self, values):
         pump_config = self.channel_configs['pump']
@@ -260,7 +311,7 @@ class PWM_hat:
                 throttle_value = pump_idle + (pump_multiplier * self.pump_variable_sum)
                 #print(f"Debug: Using variable pump sum. Calculated throttle: {throttle_value}")
             else:
-                throttle_value = pump_idle + pump_multiplier
+                throttle_value = pump_idle + (pump_multiplier / 10)
                 #print(f"Debug: Not using variable pump sum. Calculated throttle: {throttle_value}")
 
             # Add manual pump load
@@ -287,7 +338,7 @@ class PWM_hat:
                     continue
 
                 output_channel = config['output_channel']
-                #print(f"Output channel: {output_channel}")
+
                 if output_channel >= len(values):
                     print(f"Channel '{channel_name}': No data available.")
                     continue
@@ -311,9 +362,7 @@ class PWM_hat:
                 angle = max(0, min(180, angle))
 
                 self.kit.servo[config['output_channel']].angle = angle
-
-                if self.return_servo_angles:
-                    self.servo_angles[f"{channel_name} angle"] = round(angle, 2)
+                self.servo_angles[f"{channel_name} angle"] = round(angle, 1)
 
     def reset(self, reset_pump=True, pump_reset_point=-1.0):
         """
@@ -329,6 +378,9 @@ class PWM_hat:
 
         if reset_pump and 'pump' in self.channel_configs:
             self.kit.continuous_servo[self.channel_configs['pump']['output_channel']].throttle = pump_reset_point
+
+        self.is_safe_state = False
+        self.input_count = 0
 
     def set_threshold(self, number_value):
         """Update the input rate threshold value."""
@@ -363,6 +415,14 @@ class PWM_hat:
         print(f"Pump enabled set to: {self.pump_enabled}!")
         # Update pump state immediately
         # self.handle_pump(self.values)
+
+    def toggle_pump_variable(self, bool_value):
+        """Enable/Disable pump variable sum (vs static speed)"""
+        if not isinstance(bool_value, bool):
+            print("Pump variable value must be boolean.")
+            return
+        self.pump_variable = bool_value
+        print(f"Pump variable set to: {self.pump_variable}!")
 
     def reload_config(self, config_file):
         """Update the configuration file and reinitialize the controller."""
@@ -405,6 +465,30 @@ class PWM_hat:
                 print(f"Input {input_num}: {names}")
             else:
                 print(f"Input {input_num}: Not assigned")
+
+    def get_defined_channel_types(self):
+        return set(config['type'] for config in self.channel_configs.values())
+
+    def get_average_input_rate(self) -> float:
+        """
+        Calculate the average input rate over the last 30 seconds.
+
+        :return: Average input rate in Hz, or 0 if no inputs in the last 30 seconds.
+        """
+        current_time = time.time()
+
+        # Filter timestamps to last 30 seconds
+        recent_timestamps = [t for t in self.input_timestamps if current_time - t <= 30]
+
+        if len(recent_timestamps) < 2:
+            return 0.0  # Not enough data to calculate rate
+
+        # Calculate rate based on number of inputs and time span
+        time_span = recent_timestamps[-1] - recent_timestamps[0]
+        if time_span > 0:
+            return (len(recent_timestamps) - 1) / time_span
+        else:
+            return 0.0  # Avoid division by zero
 
     def update_pump(self, adjustment, debug=False):
         """
