@@ -12,13 +12,12 @@ port: 8000  # Port for the HTTP server
 
 # PWM controller settings
 pwm_config: 'configuration_files/excavator_channel_configs.yaml'
-pwm_inputs: 8        # TODO: update to automatic calculation, from channel_configs!
-pump_variable: true
-tracks_disabled: true
+pump_variable: True
+tracks_disabled: True
 input_rate_threshold: 5
 deadzone: 1
 
-# Sensor settings
+# Sensor settings. These can be used as "shortcuts" for the other configs.
 adc_config: 'configuration_files/excavator_sensor_configs.yaml'
 imu_config: 'configuration_files/excavator_sensor_configs.yaml'
 gpio_config: 'configuration_files/excavator_sensor_configs.yaml'
