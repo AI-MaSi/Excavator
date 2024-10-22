@@ -1,4 +1,3 @@
-# remember to change font_path!
 import subprocess
 import os
 import board
@@ -6,6 +5,10 @@ import digitalio
 import adafruit_ssd1306
 from PIL import Image, ImageDraw, ImageFont
 from time import sleep, time
+
+FONT_PATH = '/home/pi/Desktop/Test-bench/misc/oled/Montserrat-VariableFont_wght.ttf'
+TIME_DELAY = 5  # switch between screens every 5 seconds
+
 
 # OLED setup
 RESET_PIN = digitalio.DigitalInOut(board.D4)
@@ -82,11 +85,10 @@ def update_display(interface, network_name, IP, rssi=None, show_cpu_temp=False):
     image = Image.new("1", (width, height))
     draw = ImageDraw.Draw(image)
 
-    font_path = '/home/pi/Documents/masi/misc/oled/Montserrat-VariableFont_wght.ttf'
     font_size = 12
     font_size_ip = 19
-    font_savonia = ImageFont.truetype(font_path, font_size)
-    font_savonia_ip = ImageFont.truetype(font_path, font_size_ip)
+    font_savonia = ImageFont.truetype(FONT_PATH, font_size)
+    font_savonia_ip = ImageFont.truetype(FONT_PATH, font_size_ip)
 
     if show_cpu_temp:
         cpu_temp = get_cpu_temperature()
@@ -125,7 +127,7 @@ last_toggle_time = time()
 
 while True:
     current_time = time()
-    if current_time - last_toggle_time >= 5:
+    if current_time - last_toggle_time >= TIME_DELAY:
         toggle_display = not toggle_display
         last_toggle_time = current_time
 
