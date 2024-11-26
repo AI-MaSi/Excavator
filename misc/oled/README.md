@@ -34,7 +34,7 @@ This project provides a Python script to display real-time network and system st
 2. **Create and Activate Virtual Environment**:
    ```bash
    # Navigate to your project directory
-   cd /path/to/oled.py/folder
+   cd /path/to/oled.py
 
    # Create virtual environment
    python3 -m venv oled_screen_venv
