@@ -21,7 +21,6 @@ This project provides a Python script to display real-time network and system st
 - Required Python libraries (will be installed in virtual environment):
   - adafruit-circuitpython-ssd1306
   - PIL (Pillow)
-  - pyyaml
   - rpi-lgpio (for Raspberry Pi 5 only)
 
 ## Installation
