@@ -33,6 +33,8 @@ This project provides a Python script to display real-time network and system st
 
 2. **Wiring**:
    - Connect the SSD1306 OLED display to the Raspberry Pi using I2C.
+     ![WhatsApp Image 2024-11-26 at 18 57_edited](https://github.com/user-attachments/assets/5e1ff0fb-b704-4cd6-b4a3-3521ce9d9232)
+
    - Ensure the correct I2C address (default is 0x3D) and reset pin (D4) are specified in the script.
 
 3. **Configuration**:
@@ -52,7 +54,7 @@ This project provides a Python script to display real-time network and system st
    - For wired connections, it will display "Wired" as the network name.
    - Every 5 seconds, the display toggles between the network information and CPU temperature.
 
-3. **Automatic Startup** (Recommended):
+3. **Automatic Startup (Recommended)**:
    To run the script automatically at system startup after the network is available, you can set up a systemd service:
 
    a. Create a new service file:
