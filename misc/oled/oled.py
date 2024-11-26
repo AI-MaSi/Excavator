@@ -6,7 +6,7 @@ import adafruit_ssd1306
 from PIL import Image, ImageDraw, ImageFont
 from time import sleep, time
 
-FONT_PATH = '/home/pi/Desktop/Test-bench/misc/oled/Montserrat-VariableFont_wght.ttf'
+FONT_PATH = '/path/to/your/font.ttf'
 TIME_DELAY = 5  # switch between screens every 5 seconds
 
 

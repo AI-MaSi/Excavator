@@ -13,37 +13,59 @@ This project provides a Python script to display real-time network and system st
 ## Requirements
 
 ### Hardware:
-- Raspberry Pi
+- Raspberry Pi (Including Raspberry Pi 5)
 - SSD1306 OLED Display (128x64 pixels)
 
 ### Software:
 - Python 3.x
-- Required Python libraries:
+- Required Python libraries (will be installed in virtual environment):
   - adafruit-circuitpython-ssd1306
   - PIL (Pillow)
   - pyyaml
+  - rpi-lgpio (for Raspberry Pi 5 only)
 
 ## Installation
 
-1. **Install Required Libraries**: Run the following command to install the necessary Python libraries:
-
+1. **Enable I2C**:
    ```bash
-   pip install adafruit-circuitpython-ssd1306 Pillow pyyaml
+   sudo raspi-config
+   ```
+   Navigate to: Interface Options → I2C → Enable
+
+2. **Create and Activate Virtual Environment**:
+   ```bash
+   # Navigate to your project directory
+   cd /path/to/oled.py/folder
+
+   # Create virtual environment
+   python3 -m venv oled_screen_venv
+
+   # Activate virtual environment
+   source oled_screen_venv/bin/activate
    ```
 
-2. **Wiring**:
+3. **Install Required Libraries**:
+   ```bash
+   # Install base requirements
+   pip install adafruit-circuitpython-ssd1306 Pillow pyyaml
+
+   # For Raspberry Pi 5 only
+   pip install rpi-lgpio
+   ```
+
+4. **Wiring**:
    - Connect the SSD1306 OLED display to the Raspberry Pi using I2C.
      ![WhatsApp Image 2024-11-26 at 18 57_edited](https://github.com/user-attachments/assets/5e1ff0fb-b704-4cd6-b4a3-3521ce9d9232)
 
    - Ensure the correct I2C address (default is 0x3D) and reset pin (D4) are specified in the script.
 
-3. **Configuration**:
+5. **Configuration**:
    - Update the `font_path` in the script to point to a valid .ttf font file on your Raspberry Pi.
-   - Ensure I2C is enabled on your Raspberry Pi. You can enable I2C via `raspi-config` under "Interfacing Options."
+   - Verify I2C is working by running: `i2cdetect -y 1`
 
 ## Usage
 
-1. **Run the Script**: Execute the script using Python 3:
+1. **Run the Script**: Make sure your virtual environment is activated, then execute:
 
    ```bash
    python3 oled.py
@@ -54,36 +76,37 @@ This project provides a Python script to display real-time network and system st
    - For wired connections, it will display "Wired" as the network name.
    - Every 5 seconds, the display toggles between the network information and CPU temperature.
 
-3. **Automatic Startup (Recommended)**:
-   To run the script automatically at system startup after the network is available, you can set up a systemd service:
+3. **Automatic Startup (Using Virtual Environment)**:
+   To run the script automatically at system startup with the virtual environment:
 
    a. Create a new service file:
       ```bash
       sudo nano /etc/systemd/system/oled-display.service
       ```
 
-   b. Add the following content to the file (adjust paths as necessary):
+   b. Add the following content (adjust paths as necessary):
       ```
       [Unit]
       Description=OLED Network and System Status Display
       After=network.target
 
       [Service]
-      ExecStart=/usr/bin/python3 /path/to/your/oled.py
-      Restart=always
+      Type=simple
       User=pi
+      WorkingDirectory=/path/to/your/project
+      Environment=PATH=/path/to/your/oled_screen_venv/bin:$PATH
+      ExecStart=/path/to/your/oled_screen_venv/bin/python3 /path/to/your/oled.py
+      Restart=always
 
       [Install]
       WantedBy=multi-user.target
       ```
 
-   c. Save and close the file, then enable and start the service:
+   c. Enable and start the service:
       ```bash
       sudo systemctl enable oled-display.service
       sudo systemctl start oled-display.service
       ```
-
-   This will ensure that your OLED display script runs automatically after the network is available on system startup.
 
 ## Customization
 
@@ -97,5 +120,6 @@ This project provides a Python script to display real-time network and system st
   - Verify that I2C is enabled on the Raspberry Pi.
 - **Font Not Found**:
   - Make sure the `font_path` points to a valid font file. You can download a font like Montserrat from Google Fonts and place it in your project directory.
-
-
+- **Virtual Environment Issues**:
+  - Ensure the virtual environment is activated before running pip install commands
+  - Check that the paths in the systemd service file match your actual installation paths
