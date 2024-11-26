@@ -1,10 +1,11 @@
-# Config file for the test bench PWM hat
+# Config file for AI-MaSi excavator
+# channel names "pump", "trackR" and "trackL" are reserved for special behavior. Other names can be freely chosen.
 
 
 CHANNEL_CONFIGS:
 
-  pump:
-    input_channel: None           # The index of the input data array. In Python, indexing is zero-based, meaning the first value is at index 0.
+  pump: # name of the channel. Name "pump" is reserved for the pump control channel, and it has special behavior.
+    input_channel: None           # The index of the input data array. In Python, indexing is zero-based, meaning the first value is at index 0. Channel "pump" does not use direct control.
     output_channel: 9             # The PWM hat output channel, same as printed on the PCB. Also Zero-based!
     type: pump                    # type of the controlled thing. this is very WIP, just use "angle" for now
     offset: 0                     # pump does not use this but im lazy, the validator checks this so just leave this to 0 for now
@@ -13,10 +14,10 @@ CHANNEL_CONFIGS:
     multiplier: 2.0               # how much pump speeds up when "affects_pump" channels are active
 
 
-  trackR:
+  trackR: # names trackR and trackL also have special behavior! They are used to control the tracks of the excavator.
     input_channel: 6
     output_channel: 0
-    type: angle
+    type: angle                   # even though tracks don't use angles, it's best to keep this as "angle" for now. Prob better to depreciate and just set output specific PWM range.
     affects_pump: false           # Set to True if you want this channel to inrease pump speed when the servo is moved.
     offset: 0                     # Servo start point offset. 0 is the middle of the servo range (90).
     direction: 1
@@ -39,7 +40,7 @@ CHANNEL_CONFIGS:
     gamma_negative: 0.2
 
 
-  scoop:
+  scoop: # otherwise you are free to name the channels as you like.
     input_channel: 0
     output_channel: 2
     type: angle
@@ -111,6 +112,4 @@ CHANNEL_CONFIGS:
     multiplier_negative: 5
     gamma_positive: 1.0
     gamma_negative: 1.0
-
-
 

@@ -1,6 +1,6 @@
 """
 This module implements a PWM (Pulse Width Modulation) controller for servo motors and other PWM-controlled devices.
-It is designed to work with the Adafruit ServoKit library but can also run in a simulation mode.
+It is designed on top of Adafruit ServoKit library.
 
 Key features:
 1. Configurable PWM channels using a YAML configuration file
@@ -24,6 +24,11 @@ Usage:
 3. Call update_values() method with your input values to control the PWM outputs
 
 """
+
+#TODO: Better Debugging with Logging!
+#TODO: Instead of ServoKit, use the Adafruit_PCA9685 library directly (for more control)
+#TODO: channel specific PMW ranges!
+#TODO: well not that todo but currently we're controlling motors with angle values, so deprecate the "type" parameter (this goes with the PCA9685 library)
 
 
 import threading
@@ -82,7 +87,7 @@ class PWM_hat:
         self.manual_pump_load = 0.0
 
         if SERVOKIT_AVAILABLE and not self.simulation_mode:
-            self.kit = ServoKit(channels=pwm_channels)
+            self.kit = ServoKit(channels=pwm_channels) # refrence_clock_speed=25000000, frequency=50
         else:
             if not self.simulation_mode:
                 print("ServoKit is not available. Falling back to simulation mode.")
@@ -231,7 +236,7 @@ class PWM_hat:
                     self.is_safe_state = False
                     self.input_count = 0
 
-    def update_values(self, raw_values, min_cap=-1, max_cap=1):
+    def update_values(self, raw_values, min_cap=-1, max_cap=1, debug=False):
         # Reset all angles to None at the start of each update
         for key in self.servo_angles:
             self.servo_angles[key] = None
@@ -240,9 +245,11 @@ class PWM_hat:
         if not self.skip_rate_checking:
             self.input_event.set()
 
-        #print(f"Debug: update_values called with raw_values: {raw_values}")
-        #print(f"Debug: Current safe state: {self.is_safe_state}")
-        #print(f"Debug: skip_rate_checking: {self.skip_rate_checking}")
+        if debug:
+            print(f"Debug: update_values called with raw_values: {raw_values}")
+            print(f"Debug: Current safe state: {self.is_safe_state}")
+            print(f"Debug: skip_rate_checking: {self.skip_rate_checking}")
+
 
 
         if not self.skip_rate_checking and not self.is_safe_state:
@@ -289,17 +296,18 @@ class PWM_hat:
         if 'angle' in self.defined_channel_types:
             self.handle_angles(self.values)
 
-    def handle_pump(self, values):
+    def handle_pump(self, values, debug=False):
         pump_config = self.channel_configs['pump']
         pump_channel = pump_config['output_channel']
         pump_multiplier = pump_config['multiplier']
         pump_idle = pump_config['idle']
         input_channel = pump_config.get('input_channel')
 
-        # print(f"Debug: input_channel = {input_channel}, type = {type(input_channel)}")
-        # print(f"Debug: pump_variable = {self.pump_variable}")
-        # print(f"Debug: pump_variable_sum = {self.pump_variable_sum}")
-        # print(f"Debug: manual_pump_load = {self.manual_pump_load}")
+        if debug:
+            print(f"Debug: input_channel = {input_channel}, type = {type(input_channel)}")
+            print(f"Debug: pump_variable = {self.pump_variable}")
+            print(f"Debug: pump_variable_sum = {self.pump_variable_sum}")
+            print(f"Debug: manual_pump_load = {self.manual_pump_load}")
 
         if not self.pump_enabled:
             throttle_value = -1.0  # Set to -1 when pump is disabled
@@ -449,20 +457,25 @@ class PWM_hat:
         print(f"Configuration updated successfully from {config_file}")
 
     def print_input_mappings(self):
-        """Print the input mappings for each channel."""
+        """Print the input and output mappings for each channel."""
         print("Input mappings:")
-        input_to_name = {}
+        input_to_name_and_output = {}
+
         for channel_name, config in self.channel_configs.items():
             input_channel = config['input_channel']
+            output_channel = config.get('output_channel', 'N/A')  # Get output channel or default to 'N/A'
+
             if input_channel != 'none' and isinstance(input_channel, int):
-                if input_channel not in input_to_name:
-                    input_to_name[input_channel] = []
-                input_to_name[input_channel].append(channel_name)
+                if input_channel not in input_to_name_and_output:
+                    input_to_name_and_output[input_channel] = []
+                input_to_name_and_output[input_channel].append((channel_name, output_channel))
 
         for input_num in range(self.num_inputs):
-            if input_num in input_to_name:
-                names = ', '.join(input_to_name[input_num])
-                print(f"Input {input_num}: {names}")
+            if input_num in input_to_name_and_output:
+                names_and_outputs = ', '.join(
+                    f"{name} (PWM output {output})" for name, output in input_to_name_and_output[input_num]
+                )
+                print(f"Input {input_num}: {names_and_outputs}")
             else:
                 print(f"Input {input_num}: Not assigned")
 
@@ -538,7 +551,7 @@ class ServoStub:
     @angle.setter
     def angle(self, value):
         self._angle = max(0, min(180, value))
-        print(f"Servo angle set to: {self._angle}")
+        print(f"[SIMULATION] Servo angle set to: {self._angle} degrees")
 
 class ContinuousServoStub:
     def __init__(self):
@@ -551,5 +564,4 @@ class ContinuousServoStub:
     @throttle.setter
     def throttle(self, value):
         self._throttle = max(-1, min(1, value))
-        print(f"Continuous servo throttle set to: {self._throttle}")
-
+        print(f"[SIMULATION] Continuous servo throttle set to: {self._throttle}")

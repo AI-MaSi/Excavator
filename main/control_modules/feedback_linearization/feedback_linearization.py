@@ -30,7 +30,7 @@ class FeedbackLinearization:
 
     def custom_boom_linearization(self, pump_pressure, cylinder_pressures, boom_data, desired_angles):
         """
-        Perform feedback linearization for a custom hydraulic boom system.
+        Perform feedback linearization for hydraulic system.
 
         Args:
         pump_pressure (float): Current pump pressure

@@ -1,0 +1,29 @@
+
+# !please see excavator_channel_configs.yaml for more information on the parameters!
+
+CHANNEL_CONFIGS:
+
+    example_servo:
+        input_channel: 0
+        output_channel: 0
+        type: angle
+        affects_pump: false
+        offset: 0
+        direction: 1
+        multiplier_positive: 40
+        multiplier_negative: 40
+        gamma_positive: 1.0
+        gamma_negative: 1.0
+
+
+    example_servo2:
+        input_channel: 1
+        output_channel: 1
+        type: angle
+        affects_pump: false
+        offset: 0
+        direction: -1
+        multiplier_positive: 50
+        multiplier_negative: 50
+        gamma_positive: 1.0
+        gamma_negative: 1.0

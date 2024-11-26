@@ -1,0 +1,23 @@
+CHANNEL_CONFIGS:
+
+    example_servo:
+        input_channel: 0
+        output_channel: 0
+        affects_pump: False
+        center: 1500     # Center pulse width in microseconds
+        direction: 1
+        gamma_positive: 1.0
+        gamma_negative: 1.0
+        pulse_min: 1000  # Minimum pulse width in microseconds
+        pulse_max: 2000  # Maximum pulse width in microseconds
+
+    example_servo69:
+        input_channel: 1
+        output_channel: 1
+        affects_pump: False
+        center: 1500     # Center pulse width in microseconds
+        direction: 1
+        gamma_positive: 1.0
+        gamma_negative: 1.0
+        pulse_min: 1000  # Minimum pulse width in microseconds
+        pulse_max: 2000  # Maximum pulse width in microseconds
