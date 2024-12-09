@@ -42,7 +42,7 @@ sudo apt-get install gstreamer1.0-qt5
 
 On excavator:
 ```bash
-gst-launch-1.0 v4l2src device=/dev/video0 ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec ! videoconvert ! x264enc tune=zerolatency bitrate=2000 speed-preset=ultrafast ! rtph264pay ! udpsink host=<receiver_IP> port=8081
+gst-launch-1.0 v4l2src device=/dev/video0 ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec ! videoconvert ! x264enc tune=zerolatency bitrate=2000 speed-preset=ultrafast ! rtph264pay mtu=1200 ! udpsink host=<receiver_IP> port=8081
 ```
 
 On receiving PC:
