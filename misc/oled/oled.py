@@ -6,18 +6,19 @@ import adafruit_ssd1306
 from PIL import Image, ImageDraw, ImageFont
 from time import sleep, time
 
-FONT_PATH = '/path/to/your/font.ttf'
+FONT_PATH = '/home/kaivuri/Documents/masi/misc/oled/Montserrat-VariableFont_wght.ttf'
 TIME_DELAY = 5  # switch between screens every 5 seconds
-
 
 # OLED setup
 RESET_PIN = digitalio.DigitalInOut(board.D4)
 i2c = board.I2C()
 oled = adafruit_ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3D, reset=RESET_PIN)
 
+
 def clear_display():
     oled.fill(0)
     oled.show()
+
 
 def get_active_interface():
     try:
@@ -27,6 +28,7 @@ def get_active_interface():
     except subprocess.CalledProcessError:
         return None
 
+
 def get_ip_address(interface):
     try:
         cmd = f"ip addr show {interface} | grep 'inet ' | awk '{{print $2}}' | cut -d'/' -f1"
@@ -34,6 +36,7 @@ def get_ip_address(interface):
         return IP
     except subprocess.CalledProcessError:
         return "No IP Found"
+
 
 def get_ssid(interface):
     try:
@@ -43,13 +46,56 @@ def get_ssid(interface):
     except subprocess.CalledProcessError:
         return "Not Connected"
 
+
 def get_rssi(interface):
     try:
+        # First try to get Signal level in standard format
         cmd = f"iwconfig {interface} | grep 'Signal level' | awk '{{print $4}}' | cut -d'=' -f2"
         rssi = subprocess.check_output(cmd, shell=True).decode("utf-8").strip()
+        print(f"before: {rssi}")
+
+        # Check if the format is XX/100
+        if '/' in rssi:
+            numerator, denominator = rssi.split('/')
+            # Convert percentage to approximate dBm value
+            # Typically, 100% ≈ -50 dBm, 0% ≈ -100 dBm
+            percentage = float(numerator)
+            fine_tune = 20 # to make the bars make more sense
+            rssi_dbm = -100 + (percentage / 100.0) * 50 + fine_tune
+            print(f"after: {rssi_dbm}")
+            return int(rssi_dbm)
+
+        # If it's already in dBm format, just return the integer
         return int(rssi)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, ValueError):
         return None
+
+
+def draw_wifi_signal(draw, rssi, x, y):
+    if rssi is None:
+        return
+
+    # Adjust thresholds for percentage-based values converted to dBm
+    bars = 0
+    if rssi > -65:  # About 70% signal strength
+        bars = 3
+    elif rssi > -75:  # About 50% signal strength
+        bars = 2
+    elif rssi > -85:  # About 30% signal strength
+        bars = 1
+
+    bar_width = 5
+    bar_height = 3
+    spacing = 2
+
+    for i in range(bars):
+        draw.rectangle(
+            (x, y - i * (bar_height + spacing),
+             x + bar_width, y - i * (bar_height + spacing) + bar_height),
+            outline=255,
+            fill=255
+        )
+
 
 def get_cpu_temperature():
     try:
@@ -59,6 +105,7 @@ def get_cpu_temperature():
             return temp
     except IOError:
         return None
+
 
 def draw_wifi_signal(draw, rssi, x, y):
     if rssi is None:
@@ -77,7 +124,9 @@ def draw_wifi_signal(draw, rssi, x, y):
     spacing = 2
 
     for i in range(bars):
-        draw.rectangle((x, y - i * (bar_height + spacing), x + bar_width, y - i * (bar_height + spacing) + bar_height), outline=255, fill=255)
+        draw.rectangle((x, y - i * (bar_height + spacing), x + bar_width, y - i * (bar_height + spacing) + bar_height),
+                       outline=255, fill=255)
+
 
 def update_display(interface, network_name, IP, rssi=None, show_cpu_temp=False):
     width = oled.width
@@ -119,6 +168,7 @@ def update_display(interface, network_name, IP, rssi=None, show_cpu_temp=False):
     oled.image(image)
     oled.show()
 
+
 clear_display()
 
 previous_network_name, previous_IP, previous_rssi = None, None, None
@@ -136,7 +186,8 @@ while True:
     network_name = get_ssid(interface) if "wlan" in interface else "Wired" if interface else ""
     rssi = get_rssi(interface) if "wlan" in interface else None
 
-    if network_name != previous_network_name or IP != previous_IP or (rssi and previous_rssi != rssi) or toggle_display != previous_toggle_display:
+    if network_name != previous_network_name or IP != previous_IP or (
+            rssi and previous_rssi != rssi) or toggle_display != previous_toggle_display:
         update_display(interface, network_name, IP, rssi, show_cpu_temp=toggle_display)
         previous_network_name, previous_IP, previous_rssi, previous_toggle_display = network_name, IP, rssi, toggle_display
 

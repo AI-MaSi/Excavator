@@ -2,28 +2,11 @@
 
 This repository contains the configuration files for the excavator control system. These YAML files are used to set up and customize the behavior of various control modules.
 
-## Files
-
-1. `excavator_channel_configs.yaml`
-   - Configures PWM channels for different components (e.g., pump, tracks, boom, scoop)
-   - Defines input/output mappings, servo offsets, and response curves
-
-2. `excavator_config.yaml`
-   - Contains system-wide settings
-   - Specifies network configuration, PWM controller settings, and sensor parameters
-   - Sets logging levels and performance parameters
-
-3. `excavator_sensor_configs.yaml`
-   - Configures various sensors: ADC, RPM, pressure, and IMU
-   - Defines filtering options and calibration values
-
 ## Key Configuration Areas
 
 - **PWM Control**: Fine-tune servo and motor responses
-- **Network Settings**: Set IP address and port for communication
 - **Sensor Calibration**: Adjust sensor readings for accuracy
-- **Filter Configuration**: Customize data filtering for smooth operation
-- **Performance Tuning**: Set data send/receive frequencies
+
 
 ## Usage
 

@@ -1,0 +1,90 @@
+# Config file for AI-MaSi excavator with updated PCA format
+CHANNEL_CONFIGS:
+
+    trackR:
+        input_channel: 6
+        output_channel: 0
+        affects_pump: False
+        center: 1500
+        direction: 1
+        gamma_positive: 0.2
+        gamma_negative: 0.2
+        pulse_min: 1100     # Conservative range for servos
+        pulse_max: 1900
+
+    trackL:
+        input_channel: 7
+        output_channel: 1
+        affects_pump: False
+        center: 1500
+        direction: 1
+        gamma_positive: 0.2
+        gamma_negative: 0.2
+        pulse_min: 1100
+        pulse_max: 1900
+
+    scoop:
+        input_channel: 0
+        output_channel: 2
+        affects_pump: True
+        center: 1500
+        direction: -1
+        gamma_positive: 0.2
+        gamma_negative: 0.2
+        pulse_min: 1100
+        pulse_max: 1900
+
+    lift_boom:
+        input_channel: 1
+        output_channel: 3
+        affects_pump: True
+        center: 1500
+        direction: -1
+        gamma_positive: 0.2
+        gamma_negative: 0.2
+        pulse_min: 1100
+        pulse_max: 1900
+
+    tilt_boom:
+        input_channel: 4
+        output_channel: 4
+        affects_pump: True
+        center: 1500
+        direction: 1
+        gamma_positive: 0.2
+        gamma_negative: 0.2
+        pulse_min: 1100
+        pulse_max: 1900
+
+    rotate:
+        input_channel: 3
+        output_channel: 5
+        affects_pump: False
+        center: 1500
+        direction: -1
+        gamma_positive: 1.0
+        gamma_negative: 1.0
+        pulse_min: 1100
+        pulse_max: 1900
+
+    tool1:
+        input_channel: 5
+        output_channel: 6
+        affects_pump: False
+        center: 1500
+        direction: 1
+        gamma_positive: 1.0
+        gamma_negative: 1.0
+        pulse_min: 1100
+        pulse_max: 1900
+
+    tool2:
+        input_channel: 2
+        output_channel: 7
+        affects_pump: True
+        center: 1500
+        direction: 1
+        gamma_positive: 1.0
+        gamma_negative: 1.0
+        pulse_min: 1100
+        pulse_max: 1900

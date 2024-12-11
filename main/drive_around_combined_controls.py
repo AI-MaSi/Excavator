@@ -1,8 +1,8 @@
 import asyncio
 import time
-from control_modules import PWM_controller, socket_manager #ADC_sensors #IMU_sensors
+from control_modules import PCA9685_controller, socket_manager #, ADC_complete
 
-addr = '192.168.0.136'
+addr = '192.168.0.132'
 port = 5111
 
 identification_number = 0  # 0 excavator, 1 Mevea, 2 Motion Platform, more can be added...
@@ -10,14 +10,17 @@ inputs = 20  # Number of inputs received from the other end
 outputs = 0  # Number of outputs I'm going to send.
 
 # Initialize PWM controller
-pwm = PWM_controller.PWM_hat(
-    config_file='configuration_files/excavator_channel_configs.yaml',
-    simulation_mode=False,
+pwm = PCA9685_controller.PWM_controller(
+    config_file='configuration_files/channel_configs.yaml',
     pump_variable=True,
-    tracks_disabled=True,
+    tracks_disabled=False,
     deadzone=0.8,
     input_rate_threshold=5
+           # simulation_move arg removed for now, automatic usage
 )
+
+# Initialize ADC controller
+#adc = ADC_complete.SimplifiedADC('configuration_files/sensor_configs.yaml')
 
 # Initialize socket
 socket = socket_manager.MasiSocketManager()
@@ -69,6 +72,9 @@ async def control_signal_loop(frequency):
     step = 0
     button_state = ButtonState()
 
+    # for pump load adjustment
+    pump_adjustment = 0
+
     while True:
         start_time = time.time()
 
@@ -77,7 +83,7 @@ async def control_signal_loop(frequency):
         if value_list is not None:
             float_values = int_to_float(value_list)
 
-            control_values = float_values[:8]
+            control_values = float_values[:8] # foward the first 8 values (joystick values) to the PWM controller
             pwm.update_values(control_values)
 
             # print average input rate roughly every second
@@ -102,10 +108,14 @@ async def control_signal_loop(frequency):
 
             # Button checks (mostly placeholders)
             if button_state.check_button(8, float_values[8]):
+                #pump_adjustment -= 0.001
+                #pwm.update_pump(pump_adjustment)
                 print("Right stick rocker up pressed")
 
 
             if button_state.check_button(9, float_values[9]):
+                #pump_adjustment += 0.001
+                #pwm.update_pump(pump_adjustment)
                 print("Right stick rocker down pressed")
 
             if button_state.check_button(10, float_values[10]):
@@ -118,17 +128,19 @@ async def control_signal_loop(frequency):
 
             if button_state.check_button(12, float_values[12]):
                 print("Reloading PWM controller configuration...")
-                pwm.reload_config(config_file='configuration_files/excavator_channel_configs.yaml')
+                pwm.reload_config(config_file='configuration_files/channel_configs.yaml')
 
             if button_state.check_button(13, float_values[13]):
                 print("Right stick button mid pressed")
 
 
             if button_state.check_button(14, float_values[14]):
+                #pwm.toggle_pump_variable(False)
                 print("Left stick rocker up pressed")
 
 
             if button_state.check_button(15, float_values[15]):
+                #pwm.toggle_pump_variable(True)
                 print("Left stick rocker down pressed")
 
 
@@ -137,28 +149,37 @@ async def control_signal_loop(frequency):
 
 
             if button_state.check_button(17, float_values[17]):
+                #pwm.set_tracks(False)
+                # TODO: reset tracks value when they are disabled!
                 print("Left stick button top pressed")
 
 
             if button_state.check_button(18, float_values[18]):
+                #pwm.set_tracks(True)
+                # TODO: reset tracks value when they are disabled!
                 print("Left stick button bottom pressed")
 
 
             if button_state.check_button(19, float_values[19]):
+                pwm.reset_pump_load()
                 print("Left stick button mid pressed")
+
+            #readings = adc.read_raw()
+
+            # Print readings
+            #for sensor, voltage in readings.items():
+            #    print(f"{sensor}: {voltage}V")
 
 
         elapsed_time = time.time() - start_time
         await asyncio.sleep(max(0, interval - elapsed_time))
 
-def run():
-    socket.start_data_recv_thread()
-    asyncio.run(async_main())
 
 if __name__ == "__main__":
     try:
-        run()
+        socket.start_data_recv_thread()
+        asyncio.run(async_main())
     finally:
         pwm.reset()
         socket.stop_all()
-        pwm.stop_monitoring()
+        pwm._stop_monitoring()

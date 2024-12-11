@@ -85,8 +85,8 @@ class PWM_controller:
         pulse_min = 0  # find good safe values!
         pulse_max = 4095  # find good safe values!
         pump_idle_min = -1.0
-        pump_idle_max = 0.3
-        pump_multiplier_max = 10.0
+        pump_idle_max = 0.6
+        pump_multiplier_max = 1.0
 
         required_keys = ['input_channel', 'output_channel', 'pulse_min', 'pulse_max', 'center']
         pump_required_keys = ['idle', 'multiplier']
@@ -345,6 +345,8 @@ class PWM_controller:
         throttle_value = max(-1.0, min(1.0, throttle_value))
         pulse_width = pump_config['pulse_min'] + (pump_config['pulse_max'] - pump_config['pulse_min']) * (
                 (throttle_value + 1) / 2)
+
+        # print(f"Pump throttle: {throttle_value:.2f} ({pulse_width:.2f}us)")
         duty_cycle = int((pulse_width / 20000) * 65535)  # Convert microseconds to duty cycle
 
         if pump_channel < len(self.pca.channels):
