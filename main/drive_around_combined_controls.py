@@ -12,11 +12,10 @@ inputs = 20  # Number of inputs received from the other end
 outputs = 18  # 6*3 imu values
 
 # Initialize PWM controller
-pwm = PCA9685_controller.PWM_controller(
+pwm = PCA9685_controller.PWMcontroller(
     config_file='configuration_files/channel_configs.yaml',
     pump_variable=True,
-    tracks_disabled=False,
-    deadzone=0.8,
+    toggle_channels=False,
     input_rate_threshold=5
     # simulation_move arg removed for now, automatic usage
 )

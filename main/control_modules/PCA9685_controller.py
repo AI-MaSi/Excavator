@@ -3,11 +3,13 @@
 import threading
 import yaml
 import time
+from collections import deque
 
 try:
     from adafruit_pca9685 import PCA9685
     import board
     import busio
+
     SERVOKIT_AVAILABLE = True
 except ImportError:
     SERVOKIT_AVAILABLE = False
@@ -15,23 +17,25 @@ except ImportError:
     time.sleep(3)
 
 
-class PWM_controller:
-    # simulation mode check removed as it comes on automatically
+class PWMcontroller:
+    NUM_CHANNELS = 16  # PCA9685 hardware constant
+
     def __init__(self, config_file: str, pump_variable: bool = False,
-                 tracks_disabled: bool = False, input_rate_threshold: float = 0, deadzone: float = 0) -> None:
-
+                 toggle_channels: bool = True, input_rate_threshold: float = 0) -> None:
         self.pump_variable = pump_variable
-        self.tracks_disabled = tracks_disabled
-        self.deadzone = deadzone
+        self.toggle_channels = toggle_channels
+        self.time_window = 10
 
+        # Load and validate config
         with open(config_file, 'r') as file:
             configs = yaml.safe_load(file)
             self.channel_configs = configs['CHANNEL_CONFIGS']
 
-        self.num_channels = 16
-        self.values = [0.0 for _ in range(self.num_channels)]
-        self.num_inputs = self.calculate_num_inputs()
+        self._validate_configuration(self.channel_configs)
 
+        self.values = [0.0 for _ in range(self.NUM_CHANNELS)]
+
+        self.num_inputs = None  # calculated and updated inside _build_channel_data()
         self.input_rate_threshold = input_rate_threshold
         self.skip_rate_checking = (input_rate_threshold == 0)
         self.is_safe_state = not self.skip_rate_checking
@@ -42,11 +46,15 @@ class PWM_controller:
 
         self.input_count = 0
         self.last_input_time = time.time()
-        self.input_timestamps = []
+        max_inputs = int(self.time_window * (self.input_rate_threshold or 20))
+        self.input_timestamps = deque(maxlen=max_inputs)
 
         self.pump_enabled = True
         self.pump_variable_sum = 0.0
         self.manual_pump_load = 0.0
+
+        # Build optimized data structures
+        self._channel_data, self._pump_data = self._build_channel_data()
 
         if SERVOKIT_AVAILABLE:
             i2c = busio.I2C(board.SCL, board.SDA)
@@ -55,122 +63,207 @@ class PWM_controller:
         else:
             self.pca = PCA9685Stub()
 
-        self._validate_configuration(self.channel_configs)
-
         self.reset()
 
         if not self.skip_rate_checking:
             self._start_monitoring()
         return
 
-    def calculate_num_inputs(self) -> int:
+    def _build_channel_data(self):
+        """
+        Build optimized channel data structures from configuration.
+        Updates self.num_inputs and returns tuple of (channel_data, pump_data)
+        """
+        channel_data = {}
         input_channels = set()
-        for config in self.channel_configs.values():
+        pump_data = None
+
+        for channel_name, config in self.channel_configs.items():
             input_channel = config.get('input_channel')
+
+            # Fix: Normalize None values
+            if input_channel in [None, "None", "none", "null"]:
+                input_channel = None
+
             if isinstance(input_channel, int):
                 input_channels.add(input_channel)
-        return len(input_channels)
+
+            # Handle pump config separately
+            if channel_name == 'pump':
+                pump_data = {
+                    'channel': config['output_channel'],
+                    'multiplier': config['multiplier'],
+                    'idle': config['idle'],
+                    'input_channel': input_channel,
+                    'pulse_min': config['pulse_min'],
+                    'pulse_max': config['pulse_max']
+                }
+                continue
+
+            channel_data[channel_name] = {
+                'input_channel': input_channel,
+                'output_channel': config['output_channel'],
+                'deadzone_threshold': config['deadzone'] / 100.0 * 2,
+                'affects_pump': config.get('affects_pump', False),
+                'toggleable': config.get('toggleable', False),
+                'gamma_pos': config['gamma_positive'],
+                'gamma_neg': config['gamma_negative'],
+                'pulse_max': config['pulse_max'],
+                'pulse_min': config['pulse_min'],
+                'direction': config['direction'],
+                'center': config.get('center')
+            }
+
+            channel_data[channel_name]['pulse_range'] = (
+                    channel_data[channel_name]['pulse_max'] -
+                    channel_data[channel_name]['pulse_min']
+            )
+
+            # Fix: Properly handle center: None by checking for both None and string "None"
+            if channel_data[channel_name]['center'] is None or channel_data[channel_name]['center'] == "None" or \
+                    channel_data[channel_name]['center'] == "none" or channel_data[channel_name]['center'] == "null":
+                channel_data[channel_name]['center'] = (
+                        channel_data[channel_name]['pulse_min'] +
+                        (channel_data[channel_name]['pulse_range'] / 2)
+                )
+
+        self.num_inputs = len(input_channels)
+        return channel_data, pump_data
 
     @staticmethod
     def _validate_configuration(config):
-        """
-        Validate the given configuration.
+        # Define validation constants once
+        VALIDATION_LIMITS = {
+            'channels': 16,
+            'gamma': {'min': 0.1, 'max': 3.0},
+            'pulse': {'min': 0, 'max': 4095},
+            'pump': {
+                'idle': {'min': -1.0, 'max': 0.6},
+                'multiplier': {'max': 1.0}
+            }
+        }
 
-        :param config: Configuration dictionary to validate
-        :raises ValueError: If the configuration is invalid
-        """
-        channels = 16
-        gamma_min = 0.1
-        gamma_max = 3.0
-        pulse_min = 0  # find good safe values!
-        pulse_max = 4095  # find good safe values!
-        pump_idle_min = -1.0
-        pump_idle_max = 0.6
-        pump_multiplier_max = 1.0
+        # required keys
+        REQUIRED_CHANNEL_KEYS = {
+            'input_channel',
+            'output_channel',
+            'pulse_min',
+            'pulse_max',
+            'direction'
+        }
+        REQUIRED_PUMP_KEYS = {'idle', 'multiplier'}
 
-        required_keys = ['input_channel', 'output_channel', 'pulse_min', 'pulse_max', 'center']
-        pump_required_keys = ['idle', 'multiplier']
+        # Track used channels for duplicate detection
+        used_channels = {
+            'input': {},
+            'output': {}
+        }
 
-        used_input_channels = {}
-        used_output_channels = {}
+        # Collection of all validation errors
+        errors = []
 
-        for channel_name, channel_config in config.items():
-            # Check for required keys
-            for key in required_keys:
-                if key not in channel_config:
-                    raise ValueError(f"Missing '{key}' in configuration for channel '{channel_name}'")
+        for channel_name, config_data in config.items():
+            # Check required keys exist
+            missing_keys = REQUIRED_CHANNEL_KEYS - set(config_data.keys())
+            if missing_keys:
+                errors.append(f"Missing required keys {missing_keys} in configuration for channel '{channel_name}'")
 
-            # Check for duplicate input channels
-            input_channel = channel_config['input_channel']
-            if input_channel != 'None' and isinstance(input_channel, int):
-                if input_channel in used_input_channels:
-                    raise ValueError(
-                        f"Input channel {input_channel} is used by both '{channel_name}' and '{used_input_channels[input_channel]}'")
-                used_input_channels[input_channel] = channel_name
-
-            # Check for duplicate output channels
-            output_channel = channel_config['output_channel']
-            if output_channel in used_output_channels:
-                raise ValueError(
-                    f"Output channel {output_channel} is used by both '{channel_name}' and '{used_output_channels[output_channel]}'")
-            used_output_channels[output_channel] = channel_name
-
-            # Validate servo range
-            if channel_config['pulse_min'] >= channel_config['pulse_max']:
-                raise ValueError(f"pulse_min must be less than pulse_max for channel '{channel_name}'")
-
-            if channel_config['center'] < channel_config['pulse_min'] or channel_config['center'] > channel_config[
-                'pulse_max']:
-                raise ValueError(f"center must be between pulse_min and pulse_max for channel '{channel_name}'")
-
-            # Validate pulse width ranges
-            if not (pulse_min <= channel_config['pulse_min'] <= pulse_max):
-                raise ValueError(f"pulse_min must be between {pulse_min} and {pulse_max} for channel '{channel_name}'")
-            if not (pulse_min <= channel_config['pulse_max'] <= pulse_max):
-                raise ValueError(f"pulse_max must be between {pulse_min} and {pulse_max} for channel '{channel_name}'")
-            if not (pulse_min <= channel_config['center'] <= pulse_max):
-                raise ValueError(f"center must be between {pulse_min} and {pulse_max} for channel '{channel_name}'")
-
-            # Validate input and output channels
-            if not (0 <= channel_config['output_channel'] < channels):
-                raise ValueError(f"output_channel must be between 0 and {channels - 1} for channel '{channel_name}'")
-
-            if channel_config['input_channel'] != 'None' and not isinstance(channel_config['input_channel'], int):
-                raise ValueError(f"input_channel must be an integer or 'None' for channel '{channel_name}'")
-
-            if isinstance(channel_config['input_channel'], int) and not (
-                    0 <= channel_config['input_channel'] < channels):
-                raise ValueError(f"input_channel must be between 0 and {channels - 1} for channel '{channel_name}'")
-
-            # Validate direction
-            if 'direction' in channel_config and channel_config['direction'] not in [-1, 1]:
-                raise ValueError(f"direction must be either -1 or 1 for channel '{channel_name}'")
-
-            # Validate gamma values
-            for gamma_key in ['gamma_positive', 'gamma_negative']:
-                if gamma_key in channel_config:
-                    gamma_value = channel_config[gamma_key]
-                    if not (gamma_min <= gamma_value <= gamma_max):
-                        raise ValueError(
-                            f"{gamma_key} must be between {gamma_min} and {gamma_max} for channel '{channel_name}'")
-
-            # Validate affects_pump
-            if 'affects_pump' in channel_config and not isinstance(channel_config['affects_pump'], bool):
-                raise ValueError(f"affects_pump must be a boolean for channel '{channel_name}'")
-
-            # Pump-specific validations
+            # Special handling for pump channel
             if channel_name == 'pump':
-                for key in pump_required_keys:
-                    if key not in channel_config:
-                        raise ValueError(f"Missing '{key}' in configuration for pump channel")
+                missing_pump_keys = REQUIRED_PUMP_KEYS - set(config_data.keys())
+                if missing_pump_keys:
+                    errors.append(f"Missing required pump keys {missing_pump_keys}")
 
-                if not (pump_idle_min <= channel_config['idle'] <= pump_idle_max):
-                    raise ValueError(f"idle must be between {pump_idle_min} and {pump_idle_max} for pump channel")
+                # Validate pump specific values
+                if 'idle' in config_data and not (VALIDATION_LIMITS['pump']['idle']['min'] <= config_data['idle'] <=
+                                                  VALIDATION_LIMITS['pump']['idle']['max']):
+                    errors.append(
+                        f"Pump idle must be between {VALIDATION_LIMITS['pump']['idle']['min']} and {VALIDATION_LIMITS['pump']['idle']['max']}")
 
-                if not (0 < channel_config['multiplier'] <= pump_multiplier_max):
-                    raise ValueError(f"multiplier must be between 0 and {pump_multiplier_max} for pump channel")
+                if 'multiplier' in config_data and not (
+                        0 < config_data['multiplier'] <= VALIDATION_LIMITS['pump']['multiplier']['max']):
+                    errors.append(
+                        f"Pump multiplier must be between 0 and {VALIDATION_LIMITS['pump']['multiplier']['max']}")
+                continue
 
-        return
+            # Validate direction (now required)
+            if 'direction' in config_data and config_data['direction'] not in [-1, 1]:
+                errors.append(f"direction must be either -1 or 1 for channel '{channel_name}'")
+
+            # Validate input channel
+            if 'input_channel' in config_data:
+                input_channel = config_data['input_channel']
+                # Fix: Check against all variations of None properly
+                is_none_value = (input_channel is None or
+                                 input_channel == "None" or
+                                 input_channel == "none" or
+                                 input_channel == "null")
+
+                if not is_none_value and not isinstance(input_channel, int):
+                    errors.append(
+                        f"Input channel must be an integer or None for channel '{channel_name}', got {type(input_channel).__name__}")
+                elif not is_none_value:  # Now we know it's an int
+                    if input_channel in used_channels['input']:
+                        errors.append(
+                            f"Input channel {input_channel} is used by both '{channel_name}' and '{used_channels['input'][input_channel]}'")
+                    if not (0 <= input_channel < VALIDATION_LIMITS['channels']):
+                        errors.append(f"Input channel must be between 0 and {VALIDATION_LIMITS['channels'] - 1}")
+                    used_channels['input'][input_channel] = channel_name
+
+            # Validate output channel
+            if 'output_channel' in config_data:
+                output_channel = config_data['output_channel']
+                if not isinstance(output_channel, int):
+                    errors.append(
+                        f"Output channel must be an integer for channel '{channel_name}', got {type(output_channel).__name__}")
+                else:
+                    if output_channel in used_channels['output']:
+                        errors.append(
+                            f"Output channel {output_channel} is used by both '{channel_name}' and '{used_channels['output'][output_channel]}'")
+                    if not (0 <= output_channel < VALIDATION_LIMITS['channels']):
+                        errors.append(f"Output channel must be between 0 and {VALIDATION_LIMITS['channels'] - 1}")
+                    used_channels['output'][output_channel] = channel_name
+
+            # Validate pulse ranges
+            if 'pulse_min' in config_data and 'pulse_max' in config_data:
+                if config_data['pulse_min'] >= config_data['pulse_max']:
+                    errors.append(f"pulse_min must be less than pulse_max for channel '{channel_name}'")
+
+                for pulse_key in ['pulse_min', 'pulse_max']:
+                    if not (VALIDATION_LIMITS['pulse']['min'] <= config_data[pulse_key] <= VALIDATION_LIMITS['pulse'][
+                        'max']):
+                        errors.append(
+                            f"{pulse_key} must be between {VALIDATION_LIMITS['pulse']['min']} and {VALIDATION_LIMITS['pulse']['max']}")
+
+            # Validate center if provided and not None/none/null
+            if 'center' in config_data and config_data['center'] is not None and config_data['center'] != "None" and \
+                    config_data['center'] != "none" and config_data['center'] != "null":
+                # First ensure center is numeric
+                if not isinstance(config_data['center'], (int, float)):
+                    errors.append(
+                        f"center must be a number or None for channel '{channel_name}', got {type(config_data['center']).__name__}")
+                # Then validate the value
+                elif not (config_data['pulse_min'] <= config_data['center'] <= config_data['pulse_max']):
+                    errors.append(f"center must be between pulse_min and pulse_max for channel '{channel_name}'")
+
+            # Validate gamma values if provided
+            for gamma_key in ['gamma_positive', 'gamma_negative']:
+                if gamma_key in config_data:
+                    gamma_value = config_data[gamma_key]
+                    if not (VALIDATION_LIMITS['gamma']['min'] <= gamma_value <= VALIDATION_LIMITS['gamma']['max']):
+                        errors.append(
+                            f"{gamma_key} must be between {VALIDATION_LIMITS['gamma']['min']} and {VALIDATION_LIMITS['gamma']['max']}")
+
+            # Validate boolean fields
+            for bool_field in ['affects_pump', 'toggleable']:
+                if bool_field in config_data and not isinstance(config_data[bool_field], bool):
+                    errors.append(f"{bool_field} must be a boolean for channel '{channel_name}'")
+
+        # If any errors were found, raise them all together
+        if errors:
+            raise ValueError("\n".join(errors))
+
+        return True
 
     def _start_monitoring(self) -> None:
         """Start the input rate monitoring thread."""
@@ -196,7 +289,13 @@ class PWM_controller:
             print("Stopped input rate monitoring...")
         return
 
-    def monitor_input_rate(self) -> None:
+    def monitor_input_rate(self, limit_percentage=0.25) -> None:
+        """
+        Monitor the input rate and ensure it stays above the threshold.
+
+        Args:
+            limit_percentage: Percentage of threshold rate required for consecutive inputs
+        """
         print("Monitoring input rate...")
         while self.running:
             if self.input_event.wait(timeout=1.0 / self.input_rate_threshold):
@@ -210,17 +309,14 @@ class PWM_controller:
                     if current_rate >= self.input_rate_threshold:
                         self.input_count += 1
                         # Require consecutive good inputs. 25% of threshold rate, rounded down
-                        if self.input_count >= int(self.input_rate_threshold * 0.25):
+                        if self.input_count >= int(self.input_rate_threshold * limit_percentage):
                             self.is_safe_state = True
                             self.input_count = 0
                     else:
                         self.input_count = 0
 
-                    # Save the timestamp for monitoring
+                    # Add timestamp to deque - old timestamps are automatically removed
                     self.input_timestamps.append(current_time)
-
-                    # Remove timestamps older than 30 seconds
-                    self.input_timestamps = [t for t in self.input_timestamps if current_time - t <= 30]
 
             else:
                 if self.is_safe_state:
@@ -230,134 +326,147 @@ class PWM_controller:
                     self.input_count = 0
 
     def update_values(self, raw_value_list):
-        # input limits
-        min_cap = -1
-        max_cap = 1
+        """
+        Update channel values based on input and handle both channel and pump outputs.
 
+        Args:
+            raw_value_list: List of raw input values to process
+        """
+        # Safety checks
         if not self.skip_rate_checking:
-            # Wake up the monitoring thread
             self.input_event.set()
 
-        if not self.skip_rate_checking and not self.is_safe_state:
-            print(f"System in safe state. Ignoring input. Average rate: {self.get_average_input_rate():.2f}Hz")
-            return
+            if not self.is_safe_state:
+                print(f"System in safe state. Ignoring input. Average rate: {self.get_average_input_rate():.2f}Hz")
+                return
 
         if raw_value_list is None:
+            print("Warning: Input values are None, resetting to defaults")
             self.reset()
-            raise ValueError("Input values are None")
+            return
 
+        # Input validation and normalization
         if isinstance(raw_value_list, (float, int)):
-            # convert single value to list
             raw_value_list = [raw_value_list]
 
         if len(raw_value_list) != self.num_inputs:
-            self.reset()
-            raise ValueError(f"Expected {self.num_inputs} inputs, but received {len(raw_value_list)}.")
+            print(
+                f"Warning: Expected {self.num_inputs} inputs, but received {len(raw_value_list)}. Ignoring this update.")
+            return
 
-        deadzone_threshold = self.deadzone / 100.0 * (max_cap - min_cap)
-
+        # Reset pump variable sum before processing channels
         self.pump_variable_sum = 0.0
-        for channel_name, config in self.channel_configs.items():
-            input_channel = config['input_channel']
+
+        # Process all channels using pre-computed data
+        for channel_name, data in self._channel_data.items():
+            input_channel = data['input_channel']
+
+            # Skip if channel has no valid input
             if input_channel is None or not isinstance(input_channel, int) or input_channel >= len(raw_value_list):
                 continue
 
-            capped_value = max(min_cap, min(raw_value_list[input_channel], max_cap))
+            # Get and clamp input value
+            input_value = max(-1, min(raw_value_list[input_channel], 1))
 
-            if abs(capped_value) < deadzone_threshold:
-                capped_value = 0.0
+            # Apply pre-computed deadzone threshold
+            if abs(input_value) < data['deadzone_threshold']:
+                input_value = 0.0
 
-            self.values[config['output_channel']] = capped_value
+            # Store processed value
+            self.values[data['output_channel']] = input_value
 
-            if config.get('affects_pump', False):
-                self.pump_variable_sum += abs(capped_value)
+            # Update pump variable sum if channel affects pump
+            if data['affects_pump']:
+                self.pump_variable_sum += abs(input_value)
 
+        # Process outputs for all channels and pump
         self.handle_channels(self.values)
         self.handle_pump(self.values)
-        return
 
     def handle_channels(self, values):
-        for channel_name, config in self.channel_configs.items():
-            if channel_name == 'pump':
-                # Pump has a special handling, so we skip it here
-                continue
+        """
+        Process each channel's output using pre-computed configuration data.
 
-            if self.tracks_disabled and channel_name in ['trackL', 'trackR']:
-                # Tracks have been disabled, so we skip them here
-                continue
-
-            output_channel = config['output_channel']
+        Args:
+            values: List of input values for each channel
+        """
+        for channel_name, data in self._channel_data.items():
+            output_channel = data['output_channel']
 
             if output_channel >= len(values):
                 print(f"Channel '{channel_name}': No data available.")
                 continue
 
-            input_value = values[output_channel]
-            center = config['center']
+            if not self.toggle_channels and data['toggleable']:
+                continue
 
+            input_value = values[output_channel]
+
+            # Use pre-computed gamma values based on input sign
             if input_value >= 0:
-                gamma = config.get('gamma_positive', 1)
+                gamma = data['gamma_pos']
                 normalized_input = input_value
             else:
-                gamma = config.get('gamma_negative', 1)
+                gamma = data['gamma_neg']
                 normalized_input = -input_value
 
+            # Apply gamma correction
             adjusted_input = normalized_input ** gamma
             gamma_corrected_value = adjusted_input if input_value >= 0 else -adjusted_input
 
-            # Map the input (-1 to 1) to the servo range
-            pulse_range = config['pulse_max'] - config['pulse_min']
-            pulse_width = center + (gamma_corrected_value * pulse_range / 2 * config['direction'])
-            pulse_width = max(config['pulse_min'], min(config['pulse_max'], pulse_width))
+            # Use pre-computed pulse range and center values
+            pulse_width = data['center'] + (gamma_corrected_value * data['pulse_range'] / 2 * data['direction'])
+            pulse_width = max(data['pulse_min'], min(data['pulse_max'], pulse_width))
 
-            duty_cycle = int((pulse_width / 20000) * 65535)  # Convert microseconds to duty cycle
+            # Convert to duty cycle
+            duty_cycle = int((pulse_width / 20000) * 65535)
 
-            # Check if the channel is available before setting it
             if output_channel < len(self.pca.channels):
                 self.pca.channels[output_channel].duty_cycle = duty_cycle
             else:
                 print(f"Warning: Channel {output_channel} for '{channel_name}' is not available.")
 
     def handle_pump(self, values):
-        if 'pump' not in self.channel_configs:
-            return  # Silently return if pump is not configured
+        """
+        Process the pump output based on configuration.
 
-        pump_config = self.channel_configs['pump']
-        pump_channel = pump_config['output_channel']
-        pump_multiplier = pump_config['multiplier']
-        pump_idle = pump_config['idle']
-        input_channel = pump_config.get('input_channel')
+        Args:
+            values: List of input values for channels
+        """
+        if not hasattr(self, '_pump_data') or self._pump_data is None:
+            return
 
         if not self.pump_enabled:
             throttle_value = -1.0
-        elif input_channel is None or input_channel == 'None':
+        elif self._pump_data['input_channel'] is None or self._pump_data['input_channel'] == "None" or self._pump_data[
+            'input_channel'] == "none" or self._pump_data['input_channel'] == "null":
             if self.pump_variable:
-                throttle_value = pump_idle + (pump_multiplier * self.pump_variable_sum)
+                throttle_value = self._pump_data['idle'] + (self._pump_data['multiplier'] * self.pump_variable_sum / 10)
             else:
-                throttle_value = pump_idle + (pump_multiplier / 10)
+                throttle_value = self._pump_data['idle'] + (self._pump_data['multiplier'] / 10)
             throttle_value += self.manual_pump_load
-        elif isinstance(input_channel, int) and 0 <= input_channel < len(values):
-            throttle_value = values[input_channel]
+        elif isinstance(self._pump_data['input_channel'], int) and 0 <= self._pump_data['input_channel'] < len(values):
+            throttle_value = values[self._pump_data['input_channel']]
         else:
-            print(f"Warning: Invalid input channel {input_channel} for pump. Using pump_idle.")
-            throttle_value = pump_idle
+            throttle_value = self._pump_data['idle']
 
         throttle_value = max(-1.0, min(1.0, throttle_value))
-        pulse_width = pump_config['pulse_min'] + (pump_config['pulse_max'] - pump_config['pulse_min']) * (
+        pulse_width = self._pump_data['pulse_min'] + (self._pump_data['pulse_max'] - self._pump_data['pulse_min']) * (
                 (throttle_value + 1) / 2)
 
-        # print(f"Pump throttle: {throttle_value:.2f} ({pulse_width:.2f}us)")
-        duty_cycle = int((pulse_width / 20000) * 65535)  # Convert microseconds to duty cycle
+        duty_cycle = int((pulse_width / 20000) * 65535)
 
-        if pump_channel < len(self.pca.channels):
-            self.pca.channels[pump_channel].duty_cycle = duty_cycle
-        else:
-            print(f"Warning: Pump channel {pump_channel} is not available.")
+        if self._pump_data['channel'] < len(self.pca.channels):
+            self.pca.channels[self._pump_data['channel']].duty_cycle = duty_cycle
 
     def reset(self, reset_pump=True):
         for channel_name, config in self.channel_configs.items():
             if channel_name != 'pump':
-                center = config['center']
+                # Fix: Handle case where center is None or string "None" by calculating it on the fly
+                center = config.get('center')
+                if center is None or center == "None" or center == "none" or center == "null":
+                    center = config['pulse_min'] + (config['pulse_max'] - config['pulse_min']) / 2
+
                 duty_cycle = int((center / 20000) * 65535)  # Convert microseconds to duty cycle
                 if config['output_channel'] < len(self.pca.channels):
                     self.pca.channels[config['output_channel']].duty_cycle = duty_cycle
@@ -387,22 +496,13 @@ class PWM_controller:
         print(f"Threshold rate set to: {self.input_rate_threshold}Hz")
         return
 
-    def set_deadzone(self, int_value):
-        """Update the Deadzone value"""
-        if not isinstance(int_value, int):
-            print("Deadzone value must be an integer.")
-            return
-        self.deadzone = int_value
-        print(f"Deadzone set to: {self.deadzone}%")
-        return
-
-    def set_tracks(self, bool_value):
-        """Enable/Disable tracks"""
+    def disable_channels(self, bool_value):
+        """Enable/Disable channels with toggleable state """
         if not isinstance(bool_value, bool):
-            print("Tracks value value must be boolean.")
+            print("State value value must be boolean.")
             return
-        self.tracks_disabled = bool_value
-        print(f"Tracks boolean set to: {self.tracks_disabled}!")
+        self.toggle_channels = bool_value
+        print(f"State boolean set to: {self.toggle_channels}!")
         return
 
     def set_pump(self, bool_value):
@@ -426,42 +526,48 @@ class PWM_controller:
     def reload_config(self, config_file: str):
         """
         Reload the configuration from the specified file.
-
-        :param config_file: Path to the new configuration file
         """
+        self.reset(reset_pump=True)  # stop everything first
         print(f"Reloading configuration from {config_file}")
 
-        # Load the new configuration
-        with open(config_file, 'r') as file:
-            new_configs = yaml.safe_load(file)
-            new_channel_configs = new_configs['CHANNEL_CONFIGS']
-
-        # Validate the new configuration
         try:
-            self._validate_configuration(new_channel_configs)
-        except ValueError as e:
-            print(f"Error in new configuration: {e}")
-            print("Keeping the current configuration")
+            # Load and validate new configuration
+            with open(config_file, 'r') as file:
+                new_configs = yaml.safe_load(file)
+                new_channel_configs = new_configs['CHANNEL_CONFIGS']
+
+            try:
+                self._validate_configuration(new_channel_configs)
+            except ValueError as e:
+                print(f"Error in new configuration: {e}")
+                print("Keeping the current configuration")
+                return False
+
+            # Stop monitoring temporarily
+            was_monitoring = self.running
+            if was_monitoring:
+                self._stop_monitoring()
+
+            # Update configuration and rebuild data structures
+            self.channel_configs = new_channel_configs
+            self._channel_data, self._pump_data = self._build_channel_data()
+
+            # Reset all channels to their new center positions
+            self.reset(reset_pump=True)
+
+            # Restart monitoring if it was running
+            if was_monitoring:
+                self._start_monitoring()
+
+            print("Configuration reloaded successfully")
+            return True
+
+        except FileNotFoundError:
+            print(f"Error: Config file '{config_file}' not found")
             return False
-
-        # Stop monitoring temporarily
-        was_monitoring = self.running
-        if was_monitoring:
-            self._stop_monitoring()
-
-        # Update the configuration
-        self.channel_configs = new_channel_configs
-        self.num_inputs = self.calculate_num_inputs()
-
-        # Reset all channels to their new center positions
-        self.reset(reset_pump=True)
-
-        # Restart monitoring if it was running before
-        if was_monitoring:
-            self._start_monitoring()
-
-        print("Configuration reloaded successfully")
-        return True
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+            return False
 
     def print_input_mappings(self):
         """Print the input and output mappings for each channel."""
@@ -472,7 +578,9 @@ class PWM_controller:
             input_channel = config['input_channel']
             output_channel = config.get('output_channel', 'N/A')  # Get output channel or default to 'N/A'
 
-            if input_channel != 'none' and isinstance(input_channel, int):
+            # Fix: Check against None, "None", "none", and "null"
+            if input_channel is not None and input_channel != "None" and input_channel != "none" and input_channel != "null" and isinstance(
+                    input_channel, int):
                 if input_channel not in input_to_name_and_output:
                     input_to_name_and_output[input_channel] = []
                 input_to_name_and_output[input_channel].append((channel_name, output_channel))
@@ -489,14 +597,14 @@ class PWM_controller:
 
     def get_average_input_rate(self) -> float:
         """
-        Calculate the average input rate over the last 30 seconds.
+        Calculate the average input rate over the last time_window seconds.
 
-        :return: Average input rate in Hz, or 0 if no inputs in the last 30 seconds.
+        :return: Average input rate in Hz, or 0 if no inputs in the last time_window seconds.
         """
         current_time = time.time()
 
-        # Filter timestamps to last 30 seconds
-        recent_timestamps = [t for t in self.input_timestamps if current_time - t <= 30]
+        # Filter timestamps to last time_window seconds
+        recent_timestamps = [t for t in self.input_timestamps if current_time - t <= self.time_window]
 
         if len(recent_timestamps) < 2:
             return 0.0  # Not enough data to calculate rate
@@ -508,7 +616,7 @@ class PWM_controller:
         else:
             return 0.0  # Avoid division by zero
 
-    def update_pump(self,adjustment):
+    def update_pump(self, adjustment):
         """
         Manually update the pump load.
 
@@ -523,7 +631,7 @@ class PWM_controller:
         pump_min = -1.0
         pump_max = 0.3
 
-        self.manual_pump_load = max(pump_min, min(pump_max, self.manual_pump_load + adjustment/10))
+        self.manual_pump_load = max(pump_min, min(pump_max, self.manual_pump_load + adjustment / 10))
         return
 
     def reset_pump_load(self):
