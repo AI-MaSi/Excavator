@@ -1,4 +1,3 @@
-
 # simple code for bluetooth driving. All channels available!
 
 # import PWM (servo controller)
@@ -21,7 +20,7 @@ def main(pwm, controller):
         'LeftJoystickY': 0
     }
 
-    pwm.print_input_mappings()
+    print(pwm.get_input_mapping())
     sleep(5)
 
     while True:
@@ -35,7 +34,7 @@ def main(pwm, controller):
             joy_values = controller.read()
             print(f"joystick values: {joy_values}")
 
-            # we should modify the trigger values so that they can be flipped with bumper values
+
             # flip the LeftTrigger if the LeftBumper is pressed
             if joy_values['LeftBumper']:
                 joy_values['LeftTrigger'] = -joy_values['LeftTrigger']
@@ -105,7 +104,10 @@ def main(pwm, controller):
             pwm.update_values(controller_list)
             #print(f"controller_list: {controller_list}")
 
-        sleep(0.02)  # rough estimate of the loop time 50 Hz
+            #print(f"rate: {pwm.get_average_input_rate()} Hz")
+
+
+        sleep(0.02)  # rough 50Hz, good enough here
 
 
 if __name__ == '__main__':

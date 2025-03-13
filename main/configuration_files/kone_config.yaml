@@ -1,4 +1,5 @@
-# Config file for AI-MaSi excavator with updated PCA format
+# Config file for student excavator with updated PCA format
+# NOT THE AI-MASI EXCAVATOR! Cables are short, thats why the I/O is different.
 
 # TODO: check errors, log all of them before raising. Small QoL.
 

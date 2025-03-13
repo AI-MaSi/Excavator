@@ -18,25 +18,27 @@ except ImportError:
 
 
 class PWMcontroller:
-    NUM_CHANNELS = 16  # PCA9685 hardware constant
 
     def __init__(self, config_file: str, pump_variable: bool = False,
                  toggle_channels: bool = True, input_rate_threshold: float = 0) -> None:
         self.pump_variable = pump_variable
         self.toggle_channels = toggle_channels
-        self.time_window = 10
+        # Default time window for input rate monitoring
+        self.time_window = 5
 
         # Load and validate config
         with open(config_file, 'r') as file:
             configs = yaml.safe_load(file)
             self.channel_configs = configs['CHANNEL_CONFIGS']
 
+        # Check if the configuration is valid
         self._validate_configuration(self.channel_configs)
 
-        self.values = [0.0 for _ in range(self.NUM_CHANNELS)]
+        self.values = [0.0 for _ in range(16)] # 16 channels available on the PCA9685, safety default
 
         self.num_inputs = None  # calculated and updated inside _build_channel_data()
         self.input_rate_threshold = input_rate_threshold
+        # Skip rate checking altogether if threshold is 0
         self.skip_rate_checking = (input_rate_threshold == 0)
         self.is_safe_state = not self.skip_rate_checking
 
@@ -69,6 +71,15 @@ class PWMcontroller:
             self._start_monitoring()
         return
 
+    @staticmethod
+    def normalize_none_value(value):
+        """
+        Helper function to normalize None-like values to Python None or return original value.
+        Returns None if value is a string representing None, otherwise returns the original value.
+        """
+        none_values = [None, "None", "none", "null", "NONE", "Null", "NULL", "", "n/a", "N/A"]
+        return None if value in none_values else value
+
     def _build_channel_data(self):
         """
         Build optimized channel data structures from configuration.
@@ -79,12 +90,10 @@ class PWMcontroller:
         pump_data = None
 
         for channel_name, config in self.channel_configs.items():
-            input_channel = config.get('input_channel')
+            # Normalize the input channel to either None or its actual value
+            input_channel = self.normalize_none_value(config.get('input_channel'))
 
-            # Fix: Normalize None values
-            if input_channel in [None, "None", "none", "null"]:
-                input_channel = None
-
+            # Add to input_channels if it's a valid int (already normalized to None if it was "none", etc.)
             if isinstance(input_channel, int):
                 input_channels.add(input_channel)
 
@@ -100,6 +109,9 @@ class PWMcontroller:
                 }
                 continue
 
+            # Normalize the center value to either None or its actual value
+            center = self.normalize_none_value(config.get('center'))
+
             channel_data[channel_name] = {
                 'input_channel': input_channel,
                 'output_channel': config['output_channel'],
@@ -111,7 +123,7 @@ class PWMcontroller:
                 'pulse_max': config['pulse_max'],
                 'pulse_min': config['pulse_min'],
                 'direction': config['direction'],
-                'center': config.get('center')
+                'center': center
             }
 
             channel_data[channel_name]['pulse_range'] = (
@@ -119,9 +131,8 @@ class PWMcontroller:
                     channel_data[channel_name]['pulse_min']
             )
 
-            # Fix: Properly handle center: None by checking for both None and string "None"
-            if channel_data[channel_name]['center'] is None or channel_data[channel_name]['center'] == "None" or \
-                    channel_data[channel_name]['center'] == "none" or channel_data[channel_name]['center'] == "null":
+            # Generate center value automatically if it's None (already normalized)
+            if channel_data[channel_name]['center'] is None:
                 channel_data[channel_name]['center'] = (
                         channel_data[channel_name]['pulse_min'] +
                         (channel_data[channel_name]['pulse_range'] / 2)
@@ -130,16 +141,16 @@ class PWMcontroller:
         self.num_inputs = len(input_channels)
         return channel_data, pump_data
 
-    @staticmethod
-    def _validate_configuration(config):
+    @classmethod
+    def _validate_configuration(cls, config):
         # Define validation constants once
         VALIDATION_LIMITS = {
-            'channels': 16,
+            'channels': 16,  # adafruit hat limitation
             'gamma': {'min': 0.1, 'max': 3.0},
             'pulse': {'min': 0, 'max': 4095},
             'pump': {
                 'idle': {'min': -1.0, 'max': 0.6},
-                'multiplier': {'max': 1.0}
+                'multiplier': {'min': 0.0, 'max': 1.0}
             }
         }
 
@@ -192,23 +203,21 @@ class PWMcontroller:
 
             # Validate input channel
             if 'input_channel' in config_data:
-                input_channel = config_data['input_channel']
-                # Fix: Check against all variations of None properly
-                is_none_value = (input_channel is None or
-                                 input_channel == "None" or
-                                 input_channel == "none" or
-                                 input_channel == "null")
+                # Normalize the input_channel value
+                input_channel = cls.normalize_none_value(config_data['input_channel'])
 
-                if not is_none_value and not isinstance(input_channel, int):
-                    errors.append(
-                        f"Input channel must be an integer or None for channel '{channel_name}', got {type(input_channel).__name__}")
-                elif not is_none_value:  # Now we know it's an int
-                    if input_channel in used_channels['input']:
+                # Only validate if it's not None
+                if input_channel is not None:
+                    if not isinstance(input_channel, int):
                         errors.append(
-                            f"Input channel {input_channel} is used by both '{channel_name}' and '{used_channels['input'][input_channel]}'")
-                    if not (0 <= input_channel < VALIDATION_LIMITS['channels']):
-                        errors.append(f"Input channel must be between 0 and {VALIDATION_LIMITS['channels'] - 1}")
-                    used_channels['input'][input_channel] = channel_name
+                            f"Input channel must be an integer or None for channel '{channel_name}', got {type(input_channel).__name__}")
+                    else:
+                        if input_channel in used_channels['input']:
+                            errors.append(
+                                f"Input channel {input_channel} is used by both '{channel_name}' and '{used_channels['input'][input_channel]}'")
+                        if not (0 <= input_channel < VALIDATION_LIMITS['channels']):
+                            errors.append(f"Input channel must be between 0 and {VALIDATION_LIMITS['channels'] - 1}")
+                        used_channels['input'][input_channel] = channel_name
 
             # Validate output channel
             if 'output_channel' in config_data:
@@ -235,15 +244,15 @@ class PWMcontroller:
                         errors.append(
                             f"{pulse_key} must be between {VALIDATION_LIMITS['pulse']['min']} and {VALIDATION_LIMITS['pulse']['max']}")
 
-            # Validate center if provided and not None/none/null
-            if 'center' in config_data and config_data['center'] is not None and config_data['center'] != "None" and \
-                    config_data['center'] != "none" and config_data['center'] != "null":
+            # Validate center if provided and not None
+            center = cls.normalize_none_value(config_data.get('center'))
+            if center is not None:
                 # First ensure center is numeric
-                if not isinstance(config_data['center'], (int, float)):
+                if not isinstance(center, (int, float)):
                     errors.append(
-                        f"center must be a number or None for channel '{channel_name}', got {type(config_data['center']).__name__}")
+                        f"center must be a number or None for channel '{channel_name}', got {type(center).__name__}")
                 # Then validate the value
-                elif not (config_data['pulse_min'] <= config_data['center'] <= config_data['pulse_max']):
+                elif not (config_data['pulse_min'] <= center <= config_data['pulse_max']):
                     errors.append(f"center must be between pulse_min and pulse_max for channel '{channel_name}'")
 
             # Validate gamma values if provided
@@ -429,24 +438,23 @@ class PWMcontroller:
     def handle_pump(self, values):
         """
         Process the pump output based on configuration.
-
-        Args:
-            values: List of input values for channels
         """
         if not hasattr(self, '_pump_data') or self._pump_data is None:
             return
 
+        # Get and normalize the input channel
+        input_channel = self._pump_data['input_channel']  # Should already be normalized from _build_channel_data
+
         if not self.pump_enabled:
             throttle_value = -1.0
-        elif self._pump_data['input_channel'] is None or self._pump_data['input_channel'] == "None" or self._pump_data[
-            'input_channel'] == "none" or self._pump_data['input_channel'] == "null":
+        elif input_channel is None:  # Already normalized, simple check
             if self.pump_variable:
                 throttle_value = self._pump_data['idle'] + (self._pump_data['multiplier'] * self.pump_variable_sum / 10)
             else:
                 throttle_value = self._pump_data['idle'] + (self._pump_data['multiplier'] / 10)
             throttle_value += self.manual_pump_load
-        elif isinstance(self._pump_data['input_channel'], int) and 0 <= self._pump_data['input_channel'] < len(values):
-            throttle_value = values[self._pump_data['input_channel']]
+        elif isinstance(input_channel, int) and 0 <= input_channel < len(values):
+            throttle_value = values[input_channel]
         else:
             throttle_value = self._pump_data['idle']
 
@@ -462,9 +470,11 @@ class PWMcontroller:
     def reset(self, reset_pump=True):
         for channel_name, config in self.channel_configs.items():
             if channel_name != 'pump':
-                # Fix: Handle case where center is None or string "None" by calculating it on the fly
-                center = config.get('center')
-                if center is None or center == "None" or center == "none" or center == "null":
+                # Normalize center value
+                center = self.normalize_none_value(config.get('center'))
+
+                # If center is None, calculate it
+                if center is None:
                     center = config['pulse_min'] + (config['pulse_max'] - config['pulse_min']) / 2
 
                 duty_cycle = int((center / 20000) * 65535)  # Convert microseconds to duty cycle
@@ -485,7 +495,6 @@ class PWMcontroller:
 
         self.is_safe_state = False
         self.input_count = 0
-        return
 
     def set_threshold(self, number_value):
         """Update the input rate threshold value."""
@@ -569,31 +578,31 @@ class PWMcontroller:
             print(f"Error loading configuration: {e}")
             return False
 
-    def print_input_mappings(self):
-        """Print the input and output mappings for each channel."""
-        print("Input mappings:")
-        input_to_name_and_output = {}
+    def get_input_mapping(self):
+        """
+        Get the input and output mappings for each channel.
 
+        Returns:
+            dict: A dictionary with channel names as keys, and values containing:
+                - 'input_num': The input channel number
+                - 'output_channel': The corresponding output channel
+        """
+        result = {}
+
+        # Process each channel in the config
         for channel_name, config in self.channel_configs.items():
-            input_channel = config['input_channel']
-            output_channel = config.get('output_channel', 'N/A')  # Get output channel or default to 'N/A'
+            # Get and normalize input channel
+            input_channel = self.normalize_none_value(config['input_channel'])
+            output_channel = config.get('output_channel', 'N/A')
 
-            # Fix: Check against None, "None", "none", and "null"
-            if input_channel is not None and input_channel != "None" and input_channel != "none" and input_channel != "null" and isinstance(
-                    input_channel, int):
-                if input_channel not in input_to_name_and_output:
-                    input_to_name_and_output[input_channel] = []
-                input_to_name_and_output[input_channel].append((channel_name, output_channel))
+            # If input_channel is valid, add to the result
+            if input_channel is not None and isinstance(input_channel, int):
+                result[channel_name] = {
+                    'input_num': input_channel,
+                    'output_channel': output_channel
+                }
 
-        for input_num in range(self.num_inputs):
-            if input_num in input_to_name_and_output:
-                names_and_outputs = ', '.join(
-                    f"{name} (PWM output {output})" for name, output in input_to_name_and_output[input_num]
-                )
-                print(f"Input {input_num}: {names_and_outputs}")
-            else:
-                print(f"Input {input_num}: Not assigned")
-        return
+        return result
 
     def get_average_input_rate(self) -> float:
         """
@@ -627,7 +636,7 @@ class PWMcontroller:
             print("Pump adjustment value must be a number.")
             return
 
-        # Absolute limits for pump load. ESC dependant
+        # Absolute limits for pump load. ESC dependant but hardcoded for now.
         pump_min = -1.0
         pump_max = 0.3
 
