@@ -6,13 +6,12 @@ import adafruit_ssd1306
 from PIL import Image, ImageDraw, ImageFont
 from time import sleep, time
 
-FONT_PATH = '/home/kaivuri/Documents/masi/misc/oled/Montserrat-VariableFont_wght.ttf'
+FONT_PATH = '.../Montserrat-VariableFont_wght.ttf' # update to your font path
 TIME_DELAY = 5  # switch between screens every 5 seconds
 
 # OLED setup
-RESET_PIN = digitalio.DigitalInOut(board.D4)
 i2c = board.I2C()
-oled = adafruit_ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3D, reset=RESET_PIN)
+oled = adafruit_ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3D, reset=None)
 
 
 def clear_display():
@@ -105,27 +104,6 @@ def get_cpu_temperature():
             return temp
     except IOError:
         return None
-
-
-def draw_wifi_signal(draw, rssi, x, y):
-    if rssi is None:
-        return
-
-    bars = 0
-    if rssi > -50:
-        bars = 3
-    elif rssi > -60:
-        bars = 2
-    elif rssi > -70:
-        bars = 1
-
-    bar_width = 5
-    bar_height = 3
-    spacing = 2
-
-    for i in range(bars):
-        draw.rectangle((x, y - i * (bar_height + spacing), x + bar_width, y - i * (bar_height + spacing) + bar_height),
-                       outline=255, fill=255)
 
 
 def update_display(interface, network_name, IP, rssi=None, show_cpu_temp=False):

@@ -56,7 +56,7 @@ This project provides a Python script to display real-time network and system st
    - Connect the SSD1306 OLED display to the Raspberry Pi using I2C.
      ![WhatsApp Image 2024-11-26 at 18 57_edited](https://github.com/user-attachments/assets/5e1ff0fb-b704-4cd6-b4a3-3521ce9d9232)
 
-   - Ensure the correct I2C address (default is 0x3D) and reset pin (D4) are specified in the script.
+   - Ensure the correct I2C address (default is 0x3D) is specified in the script.
 
 5. **Configuration**:
    - Update the `font_path` in the script to point to a valid .ttf font file on your Raspberry Pi.
