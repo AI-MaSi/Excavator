@@ -6,7 +6,7 @@ import adafruit_ssd1306
 from PIL import Image, ImageDraw, ImageFont
 from time import sleep, time
 
-FONT_PATH = '.../Montserrat-VariableFont_wght.ttf' # update to your font path
+FONT_PATH = 'Montserrat-VariableFont_wght.ttf' # update to your font path
 TIME_DELAY = 5  # switch between screens every 5 seconds
 
 # OLED setup

@@ -46,10 +46,7 @@ This project provides a Python script to display real-time network and system st
 3. **Install Required Libraries**:
    ```bash
    # Install base requirements
-   pip install adafruit-circuitpython-ssd1306 Pillow
-
-   # For Raspberry Pi 5 only
-   pip install rpi-lgpio
+   pip install adafruit-circuitpython-ssd1306 Pillow rpi-lgpio
    ```
 
 4. **Wiring**:
@@ -91,14 +88,19 @@ This project provides a Python script to display real-time network and system st
 
       [Service]
       Type=simple
-      User=pi
+      User=<username>
       WorkingDirectory=/path/to/your/project
-      Environment=PATH=/path/to/your/oled_screen_venv/bin:$PATH
       ExecStart=/path/to/your/oled_screen_venv/bin/python3 /path/to/your/oled.py
-      Restart=always
+      StandardOutput=journal
+      StandardError=journal
+      Restart=on-failure
+      RestartSec=5
+      StartLimitBurst=3
+      StartLimitInterval=60
 
       [Install]
       WantedBy=multi-user.target
+
       ```
 
    c. Enable and start the service:
@@ -122,3 +124,6 @@ This project provides a Python script to display real-time network and system st
 - **Virtual Environment Issues**:
   - Ensure the virtual environment is activated before running pip install commands
   - Check that the paths in the systemd service file match your actual installation paths
+- **Debugging**:
+  - Command `jorunalctl -u <service-name>.service` shows what might have gone wrong with the service setup.
+
