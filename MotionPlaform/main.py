@@ -1,3 +1,5 @@
+# This drives the small excavator, thats all.
+
 from modules.NiDAQ_controller import NiDAQJoysticks
 from modules.udp_socket import UDPSocket
 from time import sleep
@@ -37,5 +39,5 @@ if client.handshake(timeout=30.0):
             if not success:
                 break
 
-        sleep(0.08) # 125hsim   z ish
+        sleep(0.08) # 125hz ish
 

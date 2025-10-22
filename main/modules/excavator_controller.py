@@ -31,17 +31,19 @@ class ControllerConfig:
     ki0: float = 1.0
     kd0: float = 0.00
 
-    kp1: float = 1.0  # Boom # 1.8 best atm for all!
-    ki1: float = 0.7 # 0.4 best atm for all!
-    kd1: float = 0.00
+    # 22.10.2025 3.0 / 0.5
 
-    kp2: float = 1.0  # Arm
-    ki2: float = 0.7
-    kd2: float = 0.0
+    kp1: float = 4.0 # lift
+    ki1: float = 1.0
+    kd1: float = 0.5
 
-    kp3: float = 1.0  # Bucket # 2.0 / 0.5
-    ki3: float = 0.7
-    kd3: float = 0.00
+    kp2: float = 4.0  # tilt
+    ki2: float = 1.0
+    kd2: float = 0.5
+
+    kp3: float = 4.0  # scoop
+    ki3: float = 1.0
+    kd3: float = 0.5
 
     output_limits: Tuple[float, float] = (-1.0, 1.0)
     control_frequency: float = 100.0  # Hz
@@ -67,7 +69,7 @@ class ExcavatorController:
             ik_method="svd",
             use_relative_mode=False,
             ik_params={
-                "k_val": 1.75, # 1.75 best atm
+                "k_val": 2.0, # 1.75 best atm
                 "min_singular_value": 1e-6,
                 "lambda_val": 0.1,
                 "position_weight": 1.0,
