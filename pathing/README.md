@@ -13,6 +13,7 @@ Known issues (or missing stuff to test):
   - Fix: Use prismatic joints in simulation or create controller that adds linkage rate to the direct joint control.
 - Way to measure slew (= center rotation) is missing!
 - Valve simulation is missing!
+- PWM impulse for valve deadband?
 - Some logging issues ja bugs
 
 

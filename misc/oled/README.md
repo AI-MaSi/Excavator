@@ -46,7 +46,17 @@ This project provides a Python script to display real-time network and system st
 3. **Install Required Libraries**:
    ```bash
    # Install base requirements
+<<<<<<< Updated upstream
    pip install adafruit-circuitpython-ssd1306 Pillow rpi-lgpio
+=======
+   pip install adafruit-circuitpython-ssd1306 Pillow
+
+   # For Raspberry Pi 4
+   pip install RPi.gpio
+
+   # For Raspberry Pi 5
+   pip install rpi-lgpio
+>>>>>>> Stashed changes
    ```
 
 4. **Wiring**:

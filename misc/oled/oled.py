@@ -51,7 +51,6 @@ def get_rssi(interface):
         # First try to get Signal level in standard format
         cmd = f"iwconfig {interface} | grep 'Signal level' | awk '{{print $4}}' | cut -d'=' -f2"
         rssi = subprocess.check_output(cmd, shell=True).decode("utf-8").strip()
-        print(f"before: {rssi}")
 
         # Check if the format is XX/100
         if '/' in rssi:

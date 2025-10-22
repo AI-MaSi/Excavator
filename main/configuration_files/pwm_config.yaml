@@ -21,8 +21,8 @@ CHANNEL_CONFIGS:
         toggleable: False
         center: 1572
         direction: 1
-        gamma_positive: 1.0
-        gamma_negative: 1.0
+        gamma_positive: 0.7 # we want to go up a bit more aggressive. Maybe test with different pulse max as well!
+        gamma_negative: 0.7
         pulse_min: 1150 # extend
         pulse_max: 1780 # retract
         deadzone: 5
@@ -35,8 +35,8 @@ CHANNEL_CONFIGS:
         toggleable: False
         center: 1487
         direction: 1
-        gamma_positive: 1.0
-        gamma_negative: 1.0
+        gamma_positive: 0.7
+        gamma_negative: 0.7
         pulse_min: 1150 # extend, +50 more than retract
         pulse_max: 1800 # extend
         deadzone: 5
@@ -49,8 +49,8 @@ CHANNEL_CONFIGS:
         toggleable: False
         center: 1413 #1413
         direction: -1
-        gamma_positive: 1.0
-        gamma_negative: 1.0
+        gamma_positive: 0.7
+        gamma_negative: 0.7
         pulse_min: 1200 # direction -1, so extend
         pulse_max: 1850 # retract
         deadzone: 5
@@ -88,8 +88,8 @@ CHANNEL_CONFIGS:
         toggleable: False
         center: 1552
         direction: 1
-        gamma_positive: 1.0 #0.4
-        gamma_negative: 1.0 #0.7
+        gamma_positive: 0.4
+        gamma_negative: 0.7
         pulse_min: 1500
         pulse_max: 1630
         deadzone: 5
