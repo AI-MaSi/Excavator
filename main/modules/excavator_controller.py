@@ -27,23 +27,23 @@ from .quaternion_math import quat_from_axis_angle
 @dataclass
 class ControllerConfig:
     """Configuration for the excavator controller."""
-    kp0: float = 25.0   # Slew
+    kp0: float = 70.0   # Slew # 55.0
     ki0: float = 1.0
     kd0: float = 0.00
 
     # 22.10.2025 3.0 / 0.5
 
-    kp1: float = 4.0 # lift
-    ki1: float = 1.0
-    kd1: float = 0.5
+    kp1: float = 20.0#12.0 # lift
+    ki1: float = 5.0#1.0
+    kd1: float = 0.0#1.0
 
-    kp2: float = 4.0  # tilt
-    ki2: float = 1.0
-    kd2: float = 0.5
+    kp2: float = 10.0#10.0  # tilt
+    ki2: float = 1.0#1.0
+    kd2: float = 1.0#3.0
 
-    kp3: float = 4.0  # scoop
-    ki3: float = 1.0
-    kd3: float = 0.5
+    kp3: float = 7.0#10.0  # scoop
+    ki3: float = 1.0#0.5
+    kd3: float = 0.200#3.0
 
     output_limits: Tuple[float, float] = (-1.0, 1.0)
     control_frequency: float = 100.0  # Hz
@@ -69,17 +69,18 @@ class ExcavatorController:
             ik_method="svd",
             use_relative_mode=False,
             ik_params={
-                "k_val": 2.0, # 1.75 best atm
+                "k_val": 1.0,
                 "min_singular_value": 1e-6,
                 "lambda_val": 0.1,
                 "position_weight": 1.0,
-                "rotation_weight": 1.0,
+                "rotation_weight": 0.6,
+                # Direction-based joint prioritization
+                # Note: not used with SimpleIKController!
                 "joint_weights": None,
-                # Direction-based joint prioritization (uncomment to customize):
-                # "direction_strengths_X": [0.5, 0.5, 2.0, 0.0],  # [slew, boom, arm, bucket] for X (forward)
-                # "direction_strengths_Y": [2.0, 0.0, 0.0, 0.0],  # [slew, boom, arm, bucket] for Y (lateral)
-                # "direction_strengths_Z": [0.5, 2.0, 1.0, 0.0],  # [slew, boom, arm, bucket] for Z (lift)
-                # "direction_scale_range": [0.6, 1.3]  # [min, max] Jacobian multipliers (set to [1.0, 1.0] to disable)
+                "direction_strengths_X": [1.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for X (forward)
+                "direction_strengths_Y": [1.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for Y (lateral)
+                "direction_strengths_Z": [1.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for Z (lift)
+                "direction_scale_range": [1.0, 1.0]  # [min, max] Jacobian multipliers (set to [1.0, 1.0] to disable)
             }
         )
         # self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config)  # Advanced with weighting
@@ -117,6 +118,7 @@ class ExcavatorController:
         self._current_orientation_y_deg = 0.0
         self._current_projected_quats = None  # Cache processed quaternions
         self._prev_target_angles = None  # For velocity limiting
+        self._outputs_zeroed = False  # Track whether we've already sent a zero/neutral command
 
         # Performance tracking
         self._loop_times = []
@@ -158,6 +160,13 @@ class ExcavatorController:
 
         # Clear target and controller states to avoid stale jumps on resume
         self.clear_target()
+        # Ensure hardware is commanded to safe (zero) outputs while paused
+        # This guarantees actuators hold still during path planning
+        try:
+            self.hardware.reset(reset_pump=False)
+        except Exception:
+            pass
+        self._outputs_zeroed = True
         print("Controller paused (target cleared)")
 
     def resume(self) -> None:
@@ -173,12 +182,17 @@ class ExcavatorController:
         # Reset velocity limiter to prevent jumps from stale data
         self._prev_target_angles = None
 
+        # Reset IK internal command buffers to avoid stale desired pose
+        try:
+            self.ik_controller.reset()
+        except Exception:
+            pass
+
         # IMPORTANT: Update current state before resuming
         # This prevents IK confusion from stale position data
         self._update_current_state()
 
         self._pause_event.clear()
-        print("Controller resumed (PIDs reset, position updated)")
 
     def give_pose(self, position, rotation_y_deg: float = 0.0) -> None:
         with self._lock:
@@ -186,6 +200,8 @@ class ExcavatorController:
             y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
             y_rotation_rad = np.radians(rotation_y_deg)
             self._target_orientation = quat_from_axis_angle(y_axis, y_rotation_rad)
+        # We're about to actively command again
+        self._outputs_zeroed = False
 
     def clear_target(self) -> None:
         """Clear the current IK target and reset controller state.
@@ -335,7 +351,10 @@ class ExcavatorController:
                 if has_target:
                     self._compute_control_commands()
                 else:
-                    self.hardware.reset(reset_pump=False)
+                    # Only send a neutral command once when there is no target
+                    if not self._outputs_zeroed:
+                        self.hardware.reset(reset_pump=False)
+                        self._outputs_zeroed = True
             except Exception as e:
                 print(f"Control loop error: {e}")
                 self.hardware.reset(reset_pump=True)
@@ -457,7 +476,10 @@ class ExcavatorController:
             return
 
         if target_joint_angles is None:
-            self.hardware.reset(reset_pump=False)
+            # If IK failed, command neutral once (avoid constant zeroing)
+            if not self._outputs_zeroed:
+                self.hardware.reset(reset_pump=False)
+                self._outputs_zeroed = True
             return
 
         def angle_error(target, current):
@@ -483,6 +505,8 @@ class ExcavatorController:
         # DEBUG center rot
         #print(f"Slew command: {pi_outputs[0]:.3f}")
         self.hardware.send_named_pwm_commands(named_commands)
+        # Mark that we are actively commanding
+        self._outputs_zeroed = False
 
     def __del__(self):
         self.stop()

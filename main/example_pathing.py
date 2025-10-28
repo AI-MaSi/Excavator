@@ -600,16 +600,8 @@ def main():
                 data_logger.set_calculation_time(time.time() - calc_start)
 
             # Resume controller and send 0.0 commands for 1 second to wake up PWM
-            print("Resuming controller and waking up PWM controller...")
+            print("Resuming controller...")
             controller.resume()
-
-            # Send 0.0 commands for 1 second to ensure PWM is fully awake
-            print("Sending 0.0 commands to PWM for 1 second...")
-            wake_start = time.perf_counter()
-            while time.perf_counter() - wake_start < 1.0:
-                # Controller is already running, just wait for it to stabilize
-                time.sleep(0.01)
-            print("PWM controller ready!")
             print(f"Executing {direction} path with continuous motion...")
             # Use 4x interpolation for non-A* algorithms (matches simulation)
             exec_interp_factor = interpolation_density if args.algo == 'a_star' else 4 * interpolation_density
@@ -627,9 +619,9 @@ def main():
             if success:
                 print(f"Successfully completed {direction} path!")
 
-                # PAUSE THE MACHINE FIRST (before saving/calculating)
+                # PAUSE: set flag and zero once; systems respect paused state
                 print("Pausing controller before saving data and calculating next path...")
-                controller.pause()  # This calls pwm.reset(reset_pump=False)
+                controller.pause()
 
                 # Save trajectory log immediately after each completion (like simulation)
                 if data_logger is not None:

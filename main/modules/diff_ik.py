@@ -70,10 +70,10 @@ class IKControllerConfig:
             "rotation_weight": 1.0,
             "joint_weights": None,  # Default to uniform weighting
             # Direction-based joint prioritization (task-direction weighting)
-            "direction_strengths_X": [0.5, 0.5, 2.0, 0.0],  # [slew, boom, arm, bucket] for X (forward)
-            "direction_strengths_Y": [2.0, 0.0, 0.0, 0.0],  # [slew, boom, arm, bucket] for Y (lateral)
-            "direction_strengths_Z": [0.5, 2.0, 1.0, 0.0],  # [slew, boom, arm, bucket] for Z (lift)
-            "direction_scale_range": [0.6, 1.3]  # [min, max] multipliers on Jacobian columns
+            "direction_strengths_X": [0.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for X (forward)
+            "direction_strengths_Y": [1.0, 0.0, 0.0, 0.0],  # [slew, boom, arm, bucket] for Y (lateral)
+            "direction_strengths_Z": [0.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for Z (lift)
+            "direction_scale_range": [1.0, 1.0]  # [min, max] multipliers on Jacobian columns. set [1.0,1.0] to disable!
         })
         
         if self.ik_params:

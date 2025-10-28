@@ -45,14 +45,14 @@ class USBSerialReader:
             print(f"Serial connection error: {e}")
             raise
 
-    def send_handshake_config(self, sensor_count=3, lpf_enabled=1, lpf_alpha=0.05, sample_rate=120):
+    def send_handshake_config(self, sensor_count=3, lpf_enabled=1, lpf_alpha=0.99, sample_rate=120):
         """
         Send configuration handshake to Pico with IMU settings.
         
         Args:
             sensor_count: Number of sensors (default: 3)
             lpf_enabled: Low-pass filter enabled (1/0, default: 1)
-            lpf_alpha: Low-pass filter alpha value (default: 0.05)
+            lpf_alpha: Low-pass filter alpha value (default: 0.95)
             sample_rate: Sample rate in Hz (default: 120)
         """
         if not self.ser or not self.ser.is_open:

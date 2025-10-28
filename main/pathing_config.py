@@ -15,17 +15,17 @@ class EnvironmentConfig:
     # TODO: irl / sim Y pos flipped!
 
     # Point A configuration
-    point_a_pos: Tuple[float, float, float] = (0.37, 0.1, -0.1)
+    point_a_pos: Tuple[float, float, float] = (0.60, 0.10, -0.1)
     point_a_rotation_deg: float = 0.0 # y axis rotation. 0 = horizontal
     
     # Point B configuration  
-    point_b_pos: Tuple[float, float, float] = (0.68, -0.1, -0.1)
+    point_b_pos: Tuple[float, float, float] = (0.45, -0.10, -0.1)
     point_b_rotation_deg: float = 0.0
     
     # Single wall configuration (matches real hardware format)
     wall_size: Tuple[float, float, float] = (0.08, 0.500, 0.30)  # [width, depth, height]
     wall_pos: Tuple[float, float, float] = (0.55, 0.0, -0.15)     # Wall center position
-    wall_rot: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)  # Quaternion rotation
+    wall_rot: Tuple[float, float, float, float] = (0.9238795, 0.0, 0.0, 0.3826834)  # Quaternion rotation
 
 
 @dataclass
@@ -33,14 +33,14 @@ class PathExecutionConfig:
     """Unified configuration for path execution in both sim and real systems."""
 
     # Motion parameters
-    speed_mps: float = 0.04  # Speed in meters per second -> def 0.02
-    interpolation_factor: int = 10  # Points added between waypoints (higher = smoother)
+    speed_mps: float = 0.10  # Speed in meters per second
+    interpolation_factor: int = 1  # Points added between waypoints (higher = smoother)
 
 
     update_frequency: float = 100.0  # Hz - target update frequency.
 
     # Path planning parameters
-    grid_resolution: float = 0.01  # A* grid cell size in meters
+    grid_resolution: float = 0.020  # A* grid cell size in meters
     safety_margin: float = 0.06  # Obstacle safety margin in meters.
     max_iterations: int = 10000  # Max iterations for sampling-based planners (RRT, RRT*)
     num_samples: int = 1500  # Number of samples for PRM planner
@@ -63,8 +63,8 @@ class PathExecutionConfig:
 
     # Final target verification. No new *end* target point will be given until these are met.
     # Note: this does not affect the points between endpoints, these are followed blindly ("trying to keep up")
-    final_target_tolerance: float = 0.020  # Final target reaching tolerance in meters (2,0cm)
-    orientation_tolerance: float = 0.01  # Orientation tolerance in radians (~6deg)
+    final_target_tolerance: float = 0.015  # Final target tolerance in meters (15 mm)
+    orientation_tolerance: float = 0.0872665  # Orientation tolerance in radians (~5 deg)
     
     # Optional progress feedback
     progress_update_interval: float = 2.0  # How often to print progress (seconds)
