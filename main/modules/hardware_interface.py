@@ -101,7 +101,7 @@ class HardwareInterface:
     """
     
     def __init__(self, 
-                 config_file: str = "configuration_files/linear_config.yaml",
+                 config_file: str = "configuration_files/servo_config.yaml",
                  pump_variable: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
@@ -200,7 +200,7 @@ class HardwareInterface:
     def _imu_reader_thread(self) -> None:
         """Background thread for continuous IMU reading."""
         next_run_time = time.perf_counter()
-        read_period = 1.0 / 240.0  # 4.16ms = 240Hz
+        read_period = 1.0 / 240.0  # 4.16ms = 240Hz. About twice the serial read rate.
 
         while True:
             try:

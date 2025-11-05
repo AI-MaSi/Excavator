@@ -68,12 +68,7 @@ class IKControllerConfig:
         params.update({
             "position_weight": 1.0,
             "rotation_weight": 1.0,
-            "joint_weights": None,  # Default to uniform weighting
-            # Direction-based joint prioritization (task-direction weighting)
-            "direction_strengths_X": [0.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for X (forward)
-            "direction_strengths_Y": [1.0, 0.0, 0.0, 0.0],  # [slew, boom, arm, bucket] for Y (lateral)
-            "direction_strengths_Z": [0.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for Z (lift)
-            "direction_scale_range": [1.0, 1.0]  # [min, max] multipliers on Jacobian columns. set [1.0,1.0] to disable!
+            "joint_weights": None  # Default to uniform weighting
         })
         
         if self.ik_params:
@@ -239,57 +234,12 @@ class IKController:
         # Compute Jacobian
         jacobian = compute_jacobian(joint_quats, self.robot_config)
 
-        # === Joint Prioritization: Task-Direction-Based Weighting ===
-        # Weight Jacobian columns based on task direction to prefer certain joints for certain motions
-        # This creates more intuitive and efficient motion patterns
-
-        # Get direction weighting parameters from config
-        scale_range = self.cfg.ik_params.get("direction_scale_range", [1.0, 1.0])
-        min_scale, max_scale = scale_range[0], scale_range[1]
-
-        # Check if direction weighting is enabled (disabled if scale_range is [1.0, 1.0])
-        direction_weighting_enabled = abs(max_scale - min_scale) > 1e-6
-
-        if direction_weighting_enabled:
-            # Compute normalized task-space direction (XYZ only)
-            position_error = self.ee_pos_des - ee_pos
-            pos_err = position_error[:3]
-            norm = np.linalg.norm(pos_err) + 1e-8
-            task_dir = pos_err / norm  # unit vector in XYZ
-
-            # Get joint–axis preference table from config
-            # [slew, boom, arm, bucket] vs. [X, Y, Z]
-            strengths_X = np.array(self.cfg.ik_params.get("direction_strengths_X"), dtype=np.float32)
-            strengths_Y = np.array(self.cfg.ik_params.get("direction_strengths_Y"), dtype=np.float32)
-            strengths_Z = np.array(self.cfg.ik_params.get("direction_strengths_Z"), dtype=np.float32)
-
-            # Weighted blend depending on current task direction
-            joint_scores = (abs(task_dir[0]) * strengths_X +
-                           abs(task_dir[1]) * strengths_Y +
-                           abs(task_dir[2]) * strengths_Z)  # shape (4,)
-
-            # Map to practical scaling factors
-            if joint_scores.max() - joint_scores.min() < 1e-6:
-                column_scales = np.ones_like(joint_scores)
-            else:
-                normalized = (joint_scores - joint_scores.min()) / (joint_scores.max() - joint_scores.min())
-                column_scales = min_scale + (max_scale - min_scale) * normalized
-
-            # Apply scaling to each Jacobian column (all task rows)
-            J_weighted = jacobian.copy()
-            for j in range(J_weighted.shape[1]):
-                J_weighted[:, j] *= column_scales[j]
-
-            # Optionally log for debugging (uncomment to see scales)
-            # print(f"[IK] task_dir={task_dir.round(2)}, scales={column_scales.round(2)}")
-        else:
-            # Direction weighting disabled - use unweighted Jacobian
-            J_weighted = jacobian.copy()
-
-        # === End Joint Prioritization ===
+        # Use unweighted Jacobian; prioritize joints only via 'joint_weights'
+        J_weighted = jacobian.copy()
 
         # Compute pose error and solve IK
         if self.cfg.command_type == "position":
+            position_error = self.ee_pos_des - ee_pos
             jacobian_pos = J_weighted[0:3, :]
             delta_joint_angles = self._compute_delta_joint_angles(position_error, jacobian_pos)
         else:
@@ -326,47 +276,50 @@ class IKController:
         delta_pose = np.asarray(delta_pose, dtype=np.float32)
         jacobian = np.asarray(jacobian, dtype=np.float32)
         
-        # Get joint weights
+        # Get joint weights (higher = more preferred/more movement)
         joint_weights = self.cfg.ik_params.get("joint_weights", None)
         if joint_weights is None:
-            joint_weights = [1.0] * jacobian.shape[1]  # Default to uniform weighting
-        
-        # Build weight matrix
-        w_inv = self._build_weight_matrix_inv(joint_weights)
+            joint_weights = [1.0] * jacobian.shape[1]
 
-        if self.cfg.ik_method == "pinv":
-            return ik_method_pinv(jacobian, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
-        elif self.cfg.ik_method == "svd":
+        # Build weight matrix W (diagonal of multipliers)
+        w_mat = self._build_weight_matrix(joint_weights)
+
+        # Apply weighting depending on method
+        method = self.cfg.ik_method
+        if method == "pinv":
+            # Use Jacobian with column scaling, map back via W
+            jac_w = np.dot(jacobian, w_mat)
+            dq_prime = ik_method_pinv(jac_w, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
+            return np.dot(w_mat, dq_prime)
+        elif method == "svd":
             return ik_method_svd(
                 jacobian, delta_pose,
                 np.float32(self.cfg.ik_params["k_val"]),
                 np.float32(self.cfg.ik_params["min_singular_value"]),
-                w_inv
+                w_mat
             )
-        elif self.cfg.ik_method == "trans":
-            return ik_method_transpose(jacobian, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
-        elif self.cfg.ik_method == "dls":
-            return ik_method_damped_least_squares(jacobian, delta_pose, np.float32(self.cfg.ik_params["lambda_val"]), w_inv)
+        elif method == "trans":
+            # For transpose, scaling columns and using J_w^T gives W * J^T * e directly
+            jac_w = np.dot(jacobian, w_mat)
+            return ik_method_transpose(jac_w, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
+        elif method == "dls":
+            return ik_method_damped_least_squares(jacobian, delta_pose, np.float32(self.cfg.ik_params["lambda_val"]), w_mat)
         else:
             raise ValueError(f"Unknown IK method: {self.cfg.ik_method}")
-    
-    def _build_weight_matrix_inv(self, joint_weights) -> np.ndarray:
-        """Build inverse weight matrix for joint weighting.
+
+    def _build_weight_matrix(self, joint_weights) -> np.ndarray:
+        """Build weight matrix for joint weighting (multipliers).
 
         Args:
-            joint_weights: List of weights for each joint (higher = more preferred)
+            joint_weights: List of per-joint multipliers (higher = more preferred)
 
         Returns:
-            Inverse weight matrix W^{-1} of shape [num_joints, num_joints]
+            Diagonal weight matrix W of shape [num_joints, num_joints]
         """
         w = np.asarray(joint_weights, dtype=np.float32)
-
-        # Validation: prevent division by zero
-        w = np.clip(w, 1e-6, None)  # Ensure all weights are at least 1e-6
-
-        # Create diagonal matrix with inverse weights
-        w_inv = np.diag(1.0 / w)
-        return w_inv
+        # Prevent degenerate zeros; allow near-zero to effectively disable a joint
+        w = np.clip(w, 1e-6, None)
+        return np.diag(w)
 
 
 class SimpleIKController:

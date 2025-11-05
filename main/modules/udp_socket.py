@@ -54,6 +54,8 @@ class UDPSocket:
 
         # Format: timestamp (4 bytes) + data (N bytes)
         # Using 32-bit timestamp (milliseconds since epoch % 2^32)
+        # TODO: Allow user to specify struct pack format as argument (e.g., 'h' for int16, 'f' for float)
+        #       recv_size = num_outputs * sizeof(datatype)
         self.send_format = f'<I{self.num_outputs}b'  # Timestamp + signed bytes
         self.recv_format = f'<I{self.num_inputs}b'
 
@@ -273,6 +275,3 @@ class UDPSocket:
         if self.socket:
             self.socket.close()
             print("Socket closed")
-
-
-# Note: Removed NetworkSafePWMController to keep this module focused on UDP.

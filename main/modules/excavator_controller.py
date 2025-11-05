@@ -27,28 +27,42 @@ from .quaternion_math import quat_from_axis_angle
 @dataclass
 class ControllerConfig:
     """Configuration for the excavator controller."""
-    kp0: float = 70.0   # Slew # 55.0
-    ki0: float = 1.0
-    kd0: float = 0.00
+    kp0: float = 5.0   # 5.0 # Slew
+    ki0: float = 0.20    # 0.2
+    kd0: float = 0.00   # 0.0
 
-    # 22.10.2025 3.0 / 0.5
+    # 29.10.2025 pwm control update!
 
-    kp1: float = 20.0#12.0 # lift
-    ki1: float = 5.0#1.0
-    kd1: float = 0.0#1.0
+    #kp1: float = 15.0 # 15.0 # lift
+    #ki1: float = 4.0  # 2.0
+    #kd1: float = 1.0  # 1.0
 
-    kp2: float = 10.0#10.0  # tilt
-    ki2: float = 1.0#1.0
-    kd2: float = 1.0#3.0
+    #kp2: float = 10.0 # 10.0  # tilt
+    #ki2: float = 4.0  # 2.0
+    #kd2: float = 0.2  # 0.2
 
-    kp3: float = 7.0#10.0  # scoop
-    ki3: float = 1.0#0.5
-    kd3: float = 0.200#3.0
+    #kp3: float = 10.0  # 10.0  # scoop
+    #ki3: float = 2.0  # 2.0
+    #kd3: float = 0.2  # 0.2
+
+    # 01.11.2025 pwm control update!
+
+    kp1: float = 15.0 # 15.0 # lift
+    ki1: float = 4.0  # 2.0
+    kd1: float = 1.0  # 1.0
+
+    kp2: float = 10.0 # 10.0  # tilt
+    ki2: float = 4.0  # 2.0
+    kd2: float = 0.2  # 0.2
+
+    kp3: float = 10.0  # 10.0  # scoop
+    ki3: float = 2.0  # 2.0
+    kd3: float = 0.2  # 0.2
 
     output_limits: Tuple[float, float] = (-1.0, 1.0)
     control_frequency: float = 100.0  # Hz
-    enable_velocity_limiting: bool = False
-    max_joint_velocity: float = 0.005  # rad/iter when velocity limiting enabled (currently disabled)
+    enable_velocity_limiting: bool = True
+    max_joint_velocity: float = 0.00090 #0.00070  # rad/iter when velocity limiting enabled
 
 
 class ExcavatorController:
@@ -70,21 +84,21 @@ class ExcavatorController:
             use_relative_mode=False,
             ik_params={
                 "k_val": 1.0,
-                "min_singular_value": 1e-6,
-                "lambda_val": 0.1,
+                "min_singular_value": 1e-4,
+                "lambda_val": 0.08,
                 "position_weight": 1.0,
-                "rotation_weight": 0.6,
+                "rotation_weight": 1.0,
                 # Direction-based joint prioritization
                 # Note: not used with SimpleIKController!
-                "joint_weights": None,
-                "direction_strengths_X": [1.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for X (forward)
-                "direction_strengths_Y": [1.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for Y (lateral)
-                "direction_strengths_Z": [1.0, 1.0, 1.0, 1.0],  # [slew, boom, arm, bucket] for Z (lift)
-                "direction_scale_range": [1.0, 1.0]  # [min, max] Jacobian multipliers (set to [1.0, 1.0] to disable)
+                "joint_weights": [1.0, 1.0, 1.0, 1.0], #None,
+                # "direction_strengths_X": [1.0, 1.0, 0.1, 1.0],  # Deprecated: removed in IK; using joint_weights only
+                # "direction_strengths_Y": [1.0, 1.0, 1.0, 1.0],  # Deprecated
+                # "direction_strengths_Z": [1.0, 1.0, 1.0, 1.0],  # Deprecated
+                # "direction_scale_range": [0.5, 1.5]  # Deprecated
             }
         )
-        # self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config)  # Advanced with weighting
-        self.ik_controller = diff_ik.SimpleIKController(self.ik_config, self.robot_config)  # Simple baseline
+        self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config)  # Advanced with weighting
+        #self.ik_controller = diff_ik.SimpleIKController(self.ik_config, self.robot_config)  # Simple baseline
 
         # PID controllers for joints
         joint_configs = [

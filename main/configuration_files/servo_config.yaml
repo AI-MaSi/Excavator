@@ -1,0 +1,72 @@
+# servo control
+
+# TODO:
+# add nudges to small deltas, to get the valve moving
+
+CHANNEL_CONFIGS:
+
+    pump:
+        output_channel: 9
+        pulse_min: 1000
+        pulse_max: 1700
+        idle: 0.40
+        multiplier: 0.4
+
+    lift_boom:
+        output_channel: 3           # PCA9685 hardware channel (0-15)
+        affects_pump: True          # whether this valve affects pump load calculation
+        toggleable: False           # whether this channel can be toggled on/off
+        center: 1572                # neutral PWM position (microseconds)
+        direction: 1                # +1 or -1, maps input sign to physical direction
+        pulse_min: 1350             # min PWM limit (sets max negative velocity)
+        pulse_max: 1785             # max PWM limit (sets max positive velocity)
+        deadzone: 0.5               # input deadzone % - servos quiet below this (cuts the input value)
+        # Deadband compensation
+        deadband_us: 140.0          # skip over servo dead zone (packs the input value over the dead area)
+        # Dither - adds vibration to prevent valve stiction
+        dither_enable: true         # enable/disable anti-stiction dither
+        dither_amp_us: 12.0         # vibration amplitude (microseconds)
+        dither_hz: 25.0             # vibration frequency (Hz)
+
+    tilt_boom:
+        output_channel: 4
+        affects_pump: True
+        toggleable: False
+        center: 1487
+        direction: 1
+        pulse_min: 1220     # ret
+        pulse_max: 1700     # ext
+        deadzone: 0.5
+        # Simple deadband - skip over dead zone
+        deadband_us: 140.0
+        # Dither settings
+        dither_enable: True
+        dither_amp_us: 12.0
+        dither_hz: 25.0
+
+    scoop:
+        output_channel: 2
+        affects_pump: True  # we can leave this true but use toggle_pump_variable(False) in the controller for static speed
+        toggleable: False
+        center: 1413        # 1413
+        direction: -1
+        pulse_min: 1190     # direction -1, so extend
+        pulse_max: 1600     # retract
+        deadzone: 0.5
+        # Simple deadband - skip over dead zone
+        deadband_us: 140.0
+        dither_enable: true
+        dither_amp_us: 12.0
+        dither_hz: 25.0
+
+    rotate:
+        output_channel: 5
+        affects_pump: False
+        toggleable: False
+        center: 1552
+        direction: 1
+        pulse_min: 1510
+        pulse_max: 1617
+        deadzone: 0.5
+        deadband_us: 10.0
+        dither_enable: false     # direct servo control, no need to dither
