@@ -5,6 +5,7 @@ import random
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+import argparse
 
 # ============================================================
 # DATA COLLECTION SETTINGS
@@ -35,13 +36,23 @@ OUTPUT_DIR = Path("hydraulic_data")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ============================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================
+parser = argparse.ArgumentParser(description='Simple drive controller with optional data logging')
+parser.add_argument('--debug', action='store_true',
+                    help='Enable debug mode: prints pulse widths (us) for all commanded channels')
+args = parser.parse_args()
+
+DEBUG_PULSE_WIDTHS = args.debug
+
+# ============================================================
 # INITIALIZE HARDWARE & NETWORK
 # ============================================================
 server = UDPSocket(local_id=2)
 server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=0, is_server=True)
 
 hardware = HardwareInterface(
-    config_file="configuration_files/linear_config.yaml",
+    config_file="configuration_files/servo_config.yaml",
     pump_variable=False,
     toggle_channels=True,
     input_rate_threshold=5
@@ -52,39 +63,49 @@ while not hardware.is_hardware_ready():
     time.sleep(0.1)
 print("Hardware ready!")
 
+if DEBUG_PULSE_WIDTHS:
+    print("\n" + "="*60)
+    print("  DEBUG MODE ENABLED")
+    print("  Pulse widths (μs) will be printed for all active channels")
+    print("  Use this to find where valve movement actually starts")
+    print("="*60 + "\n")
+
 # ============================================================
 # DATA COLLECTION SETUP
 # ============================================================
 class DataLogger:
-    """Collects hydraulic actuator data during manual driving.
+    """Collects hydraulic actuator data for LSTM training.
 
-    Collects at mixed rates:
-    - 100Hz: IMU orientations + valve commands
-    - ~20Hz: Chamber pressures (6 channels + pump pressure)
+    Data format (Egli-style approach):
+    - 100Hz: valve commands, joint positions (IMU pitch), joint velocities, pressures
+    - Joint order: [lift, tilt, scoop] (matching IMU order: boom, arm, bucket)
+    - Saves as CSV for easy post-processing
     """
 
     def __init__(self):
         self.start_time = None
         self.is_logging = False
 
-        # Data storage (100Hz)
+        # Data storage (100Hz) - all lists of same length
         self.timestamps = []
-        self.valve_commands = []  # Focus on 3 hydraulic actuators: [scoop, lift, tilt]
-        self.imu_quaternions = []  # 3 IMUs (boom, arm, bucket) - each is [w,x,y,z]
+        self.valve_commands = []     # Shape: (N, 3) - [lift, tilt, scoop]
+        self.joint_positions = []    # Shape: (N, 3) - [lift, tilt, scoop] pitch angles (rad)
+        self.joint_velocities = []   # Shape: (N, 3) - [lift, tilt, scoop] (rad/s)
+        self.joint_pressures = []    # Shape: (N, 3) - [lift, tilt, scoop] averaged chambers (V)
 
-        # Pressure data (~20Hz, will be upsampled/held to 100Hz)
-        self.chamber_pressures = []  # 6 channels (2 per actuator: extend/retract)
-        self.pump_pressure = []  # Pump supply pressure
+        # Previous joint positions for velocity calculation
+        self.prev_joint_positions = None
+        self.prev_timestamp = None
 
-        # Pressure sampling control
+        # Pressure data (~20Hz, will be held to 100Hz)
+        self.last_pressure_reading = None  # Last valid pressure reading
         self.pressure_sample_interval = 1.0 / PRESSURE_SAMPLING_FREQUENCY  # ~50ms
         self.last_pressure_sample_time = None
-        self.last_pressure_reading = None
 
-        # Performance tracking (inspired by excavator_controller.py)
-        self.loop_times = []          # Total loop period (iteration to iteration)
-        self.compute_times = []       # Actual data collection time (without sleep)
-        self.timing_violations = 0    # Count of times compute exceeded target
+        # Performance tracking
+        self.loop_times = []
+        self.compute_times = []
+        self.timing_violations = 0
         self.loop_count = 0
         self.last_loop_time = None
 
@@ -112,7 +133,7 @@ class DataLogger:
         print(f"{'='*60}\n")
 
     def log_sample(self, commands, hardware_interface):
-        """Log a single data sample.
+        """Log a single data sample for LSTM training.
 
         Args:
             commands: List of 8 PWM commands [scoop, lift, extra1, rotate, tilt, extra2, track_r, track_l]
@@ -128,17 +149,39 @@ class DataLogger:
         current_time = time.time() - self.start_time
 
         # ========== 100Hz Data (every sample) ==========
-        # Read IMU data
-        imu_data = hardware_interface.read_imu_data()  # List of 3 quaternions [w,x,y,z]
+        # Read IMU pitch angles directly (CSV stream provides pitch)
+        imu_pitches = hardware_interface.read_imu_pitch()  # List of 3 pitches [rad]
 
-        # Extract only the 3 hydraulic actuator commands (indices 0, 1, 4)
-        # [scoop, lift, tilt] - we don't care about tracks or center rotation
-        hydraulic_commands = [commands[0], commands[1], commands[4]]
+        # Extract valve commands: [lift, tilt, scoop] (reordered to match IMU order)
+        # Original: commands[0]=scoop, commands[1]=lift, commands[4]=tilt
+        valve_cmds = [
+            commands[1],  # lift (boom IMU)
+            commands[4],  # tilt (arm IMU)
+            commands[0],  # scoop (bucket IMU)
+        ]
 
-        # Store high-rate data
-        self.timestamps.append(current_time)
-        self.valve_commands.append(hydraulic_commands.copy())
-        self.imu_quaternions.append(imu_data if imu_data else [None, None, None])
+        # Use streamed pitch directly (radians)
+        if imu_pitches and len(imu_pitches) == 3:
+            joint_pos = [float(imu_pitches[0]), float(imu_pitches[1]), float(imu_pitches[2])]
+        else:
+            joint_pos = [0.0, 0.0, 0.0]  # Fallback if IMU read fails
+
+        # Compute joint velocities (numerical derivative)
+        if self.prev_joint_positions is not None and self.prev_timestamp is not None:
+            dt = current_time - self.prev_timestamp
+            if dt > 0.001:  # Avoid division by very small numbers
+                joint_vel = [
+                    (joint_pos[i] - self.prev_joint_positions[i]) / dt
+                    for i in range(3)
+                ]
+            else:
+                joint_vel = [0.0, 0.0, 0.0]
+        else:
+            joint_vel = [0.0, 0.0, 0.0]  # First sample has no velocity
+
+        # Store for next iteration
+        self.prev_joint_positions = joint_pos.copy()
+        self.prev_timestamp = current_time
 
         # ========== 20Hz Pressure Data (every ~50ms) ==========
         if ENABLE_PRESSURE_LOGGING:
@@ -151,41 +194,47 @@ class DataLogger:
             if should_sample_pressure:
                 # Read pressure sensors from ADC (channels 1-7 only, skip channel 8)
                 try:
-                    pressure_readings = hardware_interface.adc.read_raw()
+                    pressure_readings = hardware_interface.adc.read_sensors()
 
-                    # Extract chamber pressures (6 channels):
-                    # Channels 1-6: [lift_retract, lift_extend, tilt_retract, tilt_extend, scoop_extend, scoop_retract]
-                    # Channel 7: Pump pressure
-                    # Channel 8: SKIP (slew encoder, not a pressure sensor)
-                    chamber_data = [
-                        pressure_readings.get("LiftBoom retract ps", 0.0),
-                        pressure_readings.get("LiftBoom extend ps", 0.0),
-                        pressure_readings.get("TiltBoom retract ps", 0.0),
-                        pressure_readings.get("TiltBoom extend ps", 0.0),
-                        pressure_readings.get("Scoop extend ps", 0.0),
-                        pressure_readings.get("Scoop retract ps", 0.0),
+                    # Extract and average chamber pressures per joint:
+                    # Joint order: [lift, tilt, scoop]
+                    lift_retract = pressure_readings.get("LiftBoom retract ps", 0.0)
+                    lift_extend = pressure_readings.get("LiftBoom extend ps", 0.0)
+                    tilt_retract = pressure_readings.get("TiltBoom retract ps", 0.0)
+                    tilt_extend = pressure_readings.get("TiltBoom extend ps", 0.0)
+                    scoop_extend = pressure_readings.get("Scoop extend ps", 0.0)
+                    scoop_retract = pressure_readings.get("Scoop retract ps", 0.0)
+
+                    # Average the two chambers for each joint
+                    joint_pressures = [
+                        (lift_retract + lift_extend) / 2.0,   # lift
+                        (tilt_retract + tilt_extend) / 2.0,   # tilt
+                        (scoop_extend + scoop_retract) / 2.0, # scoop
                     ]
-                    pump_data = pressure_readings.get("Pump ps", 0.0)
 
-                    self.last_pressure_reading = (chamber_data, pump_data)
+                    self.last_pressure_reading = joint_pressures
                     self.last_pressure_sample_time = current_time
 
                 except Exception as e:
                     print(f"Warning: Pressure read failed: {e}")
                     if self.last_pressure_reading is None:
-                        self.last_pressure_reading = ([0.0] * 6, 0.0)
+                        self.last_pressure_reading = [0.0, 0.0, 0.0]
 
             # Store pressure data (held from last reading if not sampled this cycle)
             if self.last_pressure_reading:
-                self.chamber_pressures.append(self.last_pressure_reading[0].copy())
-                self.pump_pressure.append(self.last_pressure_reading[1])
+                pressures = self.last_pressure_reading.copy()
             else:
-                self.chamber_pressures.append([0.0] * 6)
-                self.pump_pressure.append(0.0)
+                pressures = [0.0, 0.0, 0.0]
         else:
             # Pressure logging disabled - store dummy data
-            self.chamber_pressures.append([0.0] * 6)
-            self.pump_pressure.append(0.0)
+            pressures = [0.0, 0.0, 0.0]
+
+        # Store all data for this sample
+        self.timestamps.append(current_time)
+        self.valve_commands.append(valve_cmds)
+        self.joint_positions.append(joint_pos)
+        self.joint_velocities.append(joint_vel)
+        self.joint_pressures.append(pressures)
 
         compute_end = time.perf_counter()
         return compute_end - compute_start
@@ -227,25 +276,25 @@ class DataLogger:
         """Get current debug information for live monitoring.
 
         Returns:
-            Dict with current IMU angles (deg), loop timing, and data stats
+            Dict with current joint angles (deg), loop timing, and data stats
         """
         debug_info = {}
 
-        # Get current IMU angles in degrees
-        imu_data = hardware_interface.read_imu_data()
-        if imu_data and len(imu_data) == 3:
-            boom_pitch = np.degrees(self.quaternion_to_pitch(imu_data[0]))
-            arm_pitch = np.degrees(self.quaternion_to_pitch(imu_data[1]))
-            bucket_pitch = np.degrees(self.quaternion_to_pitch(imu_data[2]))
+        # Get current joint angles in degrees (from streamed pitch)
+        imu_pitches = hardware_interface.read_imu_pitch()
+        if imu_pitches and len(imu_pitches) == 3:
+            lift_pitch = np.degrees(imu_pitches[0])
+            tilt_pitch = np.degrees(imu_pitches[1])
+            scoop_pitch = np.degrees(imu_pitches[2])
             debug_info['imu_angles'] = {
-                'boom': boom_pitch,
-                'arm': arm_pitch,
-                'bucket': bucket_pitch
+                'lift': lift_pitch,
+                'tilt': tilt_pitch,
+                'scoop': scoop_pitch
             }
         else:
             debug_info['imu_angles'] = None
 
-        # Loop performance (following excavator_controller.py pattern)
+        # Loop performance
         if self.loop_times and self.compute_times:
             loop_times_ms = np.array(self.loop_times) * 1000.0
             compute_times_ms = np.array(self.compute_times) * 1000.0
@@ -284,7 +333,13 @@ class DataLogger:
         return debug_info
 
     def save(self):
-        """Save collected data to disk synchronously.
+        """Save collected data to CSV for LSTM training.
+
+        Saves in format:
+        timestamp, valve_cmd_0, valve_cmd_1, valve_cmd_2,
+                   joint_pos_0, joint_pos_1, joint_pos_2,
+                   joint_vel_0, joint_vel_1, joint_vel_2,
+                   pressure_0, pressure_1, pressure_2
 
         Note: This blocks execution during save. Use save_with_pause()
         to automatically pause hardware during save.
@@ -299,46 +354,47 @@ class DataLogger:
 
         save_start = time.perf_counter()
 
-        # Convert lists to numpy arrays
+        # Convert to numpy arrays
+        timestamps = np.array(self.timestamps)
+        valve_cmds = np.array(self.valve_commands)  # (N, 3)
+        joint_pos = np.array(self.joint_positions)   # (N, 3)
+        joint_vel = np.array(self.joint_velocities)  # (N, 3)
+        pressures = np.array(self.joint_pressures)   # (N, 3)
+
+        # Build CSV data with proper column names
+        # Format: timestamp, valve_cmd_0..2, joint_pos_0..2, joint_vel_0..2, pressure_0..2
+        import pandas as pd
+
         data_dict = {
-            'timestamps': np.array(self.timestamps),
-            'valve_commands': np.array(self.valve_commands),
-            'chamber_pressures': np.array(self.chamber_pressures),
-            'pump_pressure': np.array(self.pump_pressure),
-            'sampling_frequency': SAMPLING_FREQUENCY,
-            'pressure_sampling_frequency': PRESSURE_SAMPLING_FREQUENCY,
-            'collection_date': datetime.now().isoformat(),
-            'command_labels': ['scoop', 'lift', 'tilt'],
-            'pressure_labels': ['lift_retract', 'lift_extend', 'tilt_retract',
-                               'tilt_extend', 'scoop_extend', 'scoop_retract'],
+            'timestamp': timestamps,
+            'valve_cmd_0': valve_cmds[:, 0],  # lift
+            'valve_cmd_1': valve_cmds[:, 1],  # tilt
+            'valve_cmd_2': valve_cmds[:, 2],  # scoop
+            'joint_pos_0': joint_pos[:, 0],   # lift (rad)
+            'joint_pos_1': joint_pos[:, 1],   # tilt (rad)
+            'joint_pos_2': joint_pos[:, 2],   # scoop (rad)
+            'joint_vel_0': joint_vel[:, 0],   # lift (rad/s)
+            'joint_vel_1': joint_vel[:, 1],   # tilt (rad/s)
+            'joint_vel_2': joint_vel[:, 2],   # scoop (rad/s)
+            'pressure_0': pressures[:, 0],    # lift (V)
+            'pressure_1': pressures[:, 1],    # tilt (V)
+            'pressure_2': pressures[:, 2],    # scoop (V)
         }
 
-        # Process IMU data (handle potential None values)
-        imu_array = []
-        for sample in self.imu_quaternions:
-            if sample and all(q is not None for q in sample):
-                imu_array.append([q for q in sample])
-            else:
-                # Fill with identity quaternions if data missing
-                imu_array.append([
-                    np.array([1.0, 0.0, 0.0, 0.0]),
-                    np.array([1.0, 0.0, 0.0, 0.0]),
-                    np.array([1.0, 0.0, 0.0, 0.0])
-                ])
-        data_dict['imu_quaternions'] = np.array(imu_array)
+        df = pd.DataFrame(data_dict)
 
         # Generate filename
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = OUTPUT_DIR / f"manual_drive_{timestamp_str}.npz"
+        filename = OUTPUT_DIR / f"lstm_training_data_{timestamp_str}.csv"
 
-        # Save (this is the slow part - blocking)
-        np.savez_compressed(filename, **data_dict)
+        # Save CSV
+        df.to_csv(filename, index=False)
 
         save_time = time.perf_counter() - save_start
 
         # Print statistics
-        print(f"\nSaved {len(self.timestamps)} samples in {save_time:.1f}s")
-        self.print_statistics(data_dict)
+        print(f"\nSaved {len(timestamps)} samples in {save_time:.1f}s")
+        self.print_statistics(df)
         print(f"\n✓ Data saved to: {filename}")
         print(f"{'='*60}\n")
 
@@ -385,43 +441,59 @@ class DataLogger:
 
         return filename
 
-    def print_statistics(self, data):
-        """Print data collection statistics."""
-        duration_min = data['timestamps'][-1] / 60.0
-        num_samples = len(data['timestamps'])
+    def print_statistics(self, df):
+        """Print data collection statistics.
+
+        Args:
+            df: Pandas DataFrame with collected data
+        """
+        duration_sec = df['timestamp'].iloc[-1]
+        duration_min = duration_sec / 60.0
+        num_samples = len(df)
 
         print(f"\n  === DATA STATISTICS ===")
-        print(f"  Duration: {duration_min:.2f} minutes ({data['timestamps'][-1]:.1f} seconds)")
+        print(f"  Duration: {duration_min:.2f} minutes ({duration_sec:.1f} seconds)")
         print(f"  Samples: {num_samples}")
-        print(f"  Actual sampling rate: {num_samples / data['timestamps'][-1]:.1f} Hz")
+        print(f"  Actual sampling rate: {num_samples / duration_sec:.1f} Hz")
+        print(f"  Format: CSV (ready for LSTM training)")
 
-        # Command statistics (3 hydraulic actuators)
-        commands = data['valve_commands']
-        print(f"\n  Valve Commands (3 hydraulic actuators: scoop, lift, tilt):")
-        print(f"    Shape: {commands.shape}")
-        print(f"    Range: [{commands.min():.2f}, {commands.max():.2f}]")
-        print(f"    Mean: {commands.mean():.2f}")
-        for i, label in enumerate(['Scoop', 'Lift', 'Tilt']):
-            ch_data = commands[:, i]
+        # Valve command statistics
+        print(f"\n  Valve Commands (3 joints: lift, tilt, scoop):")
+        for i, label in enumerate(['Lift', 'Tilt', 'Scoop']):
+            col = f'valve_cmd_{i}'
+            ch_data = df[col].values
             active_pct = (np.abs(ch_data) > 0.1).sum() / len(ch_data) * 100
-            print(f"      {label}: active {active_pct:.1f}% of time")
+            print(f"    {label}: range [{ch_data.min():.2f}, {ch_data.max():.2f}], "
+                  f"active {active_pct:.1f}% of time")
 
-        # IMU statistics
-        imu = data['imu_quaternions']
-        print(f"\n  IMU Quaternions (3 IMUs: boom, arm, bucket):")
-        print(f"    Shape: {imu.shape}")
+        # Joint position statistics
+        print(f"\n  Joint Positions (pitch angles in radians):")
+        for i, label in enumerate(['Lift', 'Tilt', 'Scoop']):
+            col = f'joint_pos_{i}'
+            pos_data = df[col].values
+            print(f"    {label}: range [{pos_data.min():.3f}, {pos_data.max():.3f}] rad "
+                  f"({np.degrees(pos_data.min()):.1f}° to {np.degrees(pos_data.max()):.1f}°)")
+
+        # Joint velocity statistics
+        print(f"\n  Joint Velocities (rad/s):")
+        for i, label in enumerate(['Lift', 'Tilt', 'Scoop']):
+            col = f'joint_vel_{i}'
+            vel_data = df[col].values
+            print(f"    {label}: max {np.abs(vel_data).max():.3f} rad/s "
+                  f"({np.degrees(np.abs(vel_data).max()):.1f}°/s)")
 
         # Pressure statistics
-        pressures = data['chamber_pressures']
-        print(f"\n  Chamber Pressures (6 channels):")
-        print(f"    Shape: {pressures.shape}")
-        print(f"    Range: [{pressures.min():.3f}, {pressures.max():.3f}] V")
-        print(f"    Mean: {pressures.mean():.3f} V")
+        if ENABLE_PRESSURE_LOGGING:
+            print(f"\n  Cylinder Pressures (averaged chambers, V):")
+            for i, label in enumerate(['Lift', 'Tilt', 'Scoop']):
+                col = f'pressure_{i}'
+                press_data = df[col].values
+                print(f"    {label}: range [{press_data.min():.3f}, {press_data.max():.3f}] V, "
+                      f"mean {press_data.mean():.3f} V")
+        else:
+            print(f"\n  Cylinder Pressures: DISABLED (dummy zeros)")
 
-        pump = data['pump_pressure']
-        print(f"\n  Pump Pressure:")
-        print(f"    Range: [{pump.min():.3f}, {pump.max():.3f}] V")
-        print(f"    Mean: {pump.mean():.3f} V")
+        print(f"\n  Joint Order: 0=Lift, 1=Tilt, 2=Scoop")
 
 
 # Initialize data logger
@@ -500,7 +572,7 @@ if server.handshake():
             button_1_prev = button_1
             button_2_prev = button_2
 
-            # Build name-based command mapping (students-friendly, no indexing)
+            # Build name-based command mapping (more friendly to students, no need to mess around with indexes)
             named = {
                 'scoop': right_rl,
                 'lift_boom': right_ud,
@@ -512,6 +584,21 @@ if server.handshake():
 
             # Send commands to hardware (zero unspecified channels per call)
             hardware.send_named_pwm_commands(named, unset_to_zero=True) # unset_to_zero is True by default, but here for clarity
+
+            # Debug: Print pulse widths for all commanded channels
+            if DEBUG_PULSE_WIDTHS and hardware.pwm_controller:
+                debug_str = "[PULSE DEBUG] "
+                pulse_info = []
+                for name, value in named.items():
+                    # Get the pulse width that will be used (or was just used)
+                    pulse = hardware.pwm_controller.compute_pulse(name, value)
+                    if pulse is not None:
+                        # Only show channels with non-zero commands to reduce clutter
+                        if abs(value) > 0.01:
+                            pulse_info.append(f"{name}={value:+.2f} → {pulse:.1f}μs")
+
+                if pulse_info:
+                    print(debug_str + " | ".join(pulse_info))
 
             # Log data
             if logger.is_logging:
@@ -528,10 +615,10 @@ if server.handshake():
                 # Build compact debug string
                 debug_str = f"[DEBUG] "
 
-                # IMU angles
+                # Joint angles
                 if debug['imu_angles']:
                     angles = debug['imu_angles']
-                    debug_str += f"IMUs: Boom={angles['boom']:+6.1f}° Arm={angles['arm']:+6.1f}° Bucket={angles['bucket']:+6.1f}° | "
+                    debug_str += f"Joints: Lift={angles['lift']:+6.1f}° Tilt={angles['tilt']:+6.1f}° Scoop={angles['scoop']:+6.1f}° | "
 
                 # Loop timing
                 if debug['loop_time_ms']:

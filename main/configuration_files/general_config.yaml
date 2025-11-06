@@ -1,0 +1,33 @@
+# General runtime configuration for excavator system
+
+rates:
+  # Controller (IK) loop frequency in Hz
+  control_hz: 100.0
+
+  # IMU expected sample rate in Hz (requested via handshake)
+  imu_hz: 120.0
+
+  # ADC/encoder read frequency in Hz
+  adc_hz: 120.0
+
+  # Optional PWM update cadence (if applicable in driver)
+  pwm_update_hz: 100.0
+
+perf:
+  # Default enablement for low-level perf tracking (hardware)
+  enabled_default: false
+
+imu:
+  # Optional IMU stream settings forwarded in handshake (device may clamp/ignore)
+  lpf_enabled: 1
+  lpf_alpha: 0.995
+  qmode: FULL
+  # TODO: rest of the filtering settings (currently requires recompile)
+
+
+pwm:
+  # PWM controller options forwarded to PCA9685 driver initialization
+  pump_variable: false
+  toggle_channels: false
+  input_rate_threshold: 0
+

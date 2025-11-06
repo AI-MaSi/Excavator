@@ -14,6 +14,15 @@ Features:
 - Efficient neighbor generation with 26-connectivity in 3D
 - Path smoothing and interpolation capabilities
 - Compatible with Isaac Sim obstacle format
+- Enhanced collision detection:
+  * Corner-cutting prevention for diagonal moves in 2D mode
+  * Edge collision sampling to prevent slewing through thin obstacles
+  * Prevents unwanted "slew" behavior near obstacle edges
+
+Also includes:
+- RRT* (Rapidly-exploring Random Tree Star) pathfinding
+- RRT (basic, non-optimizing variant)
+- PRM (Probabilistic Roadmap) pathfinding
 
 Author: AI Assistant
 Date: 2025
@@ -174,8 +183,15 @@ class ObstacleChecker:
 
 
 class AStar3D:
-    """3D A* pathfinding algorithm with obstacle avoidance."""
-    
+    """3D A* pathfinding algorithm with obstacle avoidance.
+
+    Features:
+    - Full 3D or 2D (X-Z plane) pathfinding
+    - Corner-cutting prevention for diagonal moves in 2D mode
+    - Edge collision sampling to prevent slewing through thin obstacles
+    - Configurable grid resolution and safety margins
+    """
+
     def __init__(self, grid_config: GridConfig, obstacle_checker: ObstacleChecker,
                  use_3d: bool = True):
         """
@@ -233,12 +249,13 @@ class AStar3D:
         """Get valid neighbors of a node with their costs."""
         neighbors = []
         x, y, z = node
-        
+        world_curr = self.grid_to_world(node)  # Track current position for edge sampling
+
         # if self.use_3d:
         #     # 6-connectivity only - orthogonal directions (no diagonals)
         #     directions = [
         #         (1, 0, 0), (-1, 0, 0),    # Forward/backward
-        #         (0, 1, 0), (0, -1, 0),    # Left/right  
+        #         (0, 1, 0), (0, -1, 0),    # Left/right
         #         (0, 0, 1), (0, 0, -1)     # Up/down
         #     ]
         # else:
@@ -247,7 +264,7 @@ class AStar3D:
         #         (1, 0, 0), (-1, 0, 0),    # Forward/backward
         #         (0, 0, 1), (0, 0, -1)     # Up/down
         #     ]
-        
+
         if self.use_3d:
             # 26-connectivity in 3D
             directions = [
@@ -267,29 +284,47 @@ class AStar3D:
                 (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1),  # 4-connectivity
                 (1, 0, 1), (1, 0, -1), (-1, 0, 1), (-1, 0, -1)  # Diagonal
             ]
-        
+
         for dx, dy, dz in directions:
             new_x, new_y, new_z = x + dx, y + dy, z + dz
-            
+
             # Check bounds
             max_x = int((self.grid_config.bounds_max[0] - self.grid_config.bounds_min[0]) / self.grid_config.resolution)
             max_y = int((self.grid_config.bounds_max[1] - self.grid_config.bounds_min[1]) / self.grid_config.resolution)
             max_z = int((self.grid_config.bounds_max[2] - self.grid_config.bounds_min[2]) / self.grid_config.resolution)
-            
+
             if not (0 <= new_x <= max_x and 0 <= new_y <= max_y and 0 <= new_z <= max_z):
                 continue
-            
+
             neighbor = (new_x, new_y, new_z)
             world_pos = self.grid_to_world(neighbor)
-            
-            # Check collision
+
+            # Corner-cutting prevention for 2D (planar) mode
+            if not self.use_3d and dx != 0 and dz != 0:
+                # Both orthogonal steps must be collision-free to prevent diagonal slew through corners
+                n1 = (new_x, y, z)           # step in X only
+                n2 = (x, y, new_z)           # step in Z only
+                w1 = self.grid_to_world(n1)
+                w2 = self.grid_to_world(n2)
+                if (not self.obstacle_checker.is_point_collision_free(w1) or
+                    not self.obstacle_checker.is_point_collision_free(w2)):
+                    continue
+
+            # Check collision at neighbor point
             if not self.obstacle_checker.is_point_collision_free(world_pos):
                 continue
-            
+
+            # Edge collision sampling to prevent skipping through thin geometry
+            seg_len = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_config.resolution
+            # Sample ~every 0.5 * resolution along the edge (minimum 5 samples)
+            num_samples = max(5, int(seg_len / (self.grid_config.resolution * 0.5)))
+            if not self.obstacle_checker.is_line_collision_free(world_curr, world_pos, num_samples=num_samples):
+                continue
+
             # Calculate cost (Euclidean distance)
             cost = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_config.resolution
             neighbors.append((neighbor, cost))
-        
+
         return neighbors
     
     def plan_path(self, start: Tuple[float, float, float], 

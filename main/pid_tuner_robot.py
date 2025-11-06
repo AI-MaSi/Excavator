@@ -6,14 +6,16 @@ Uses:
 - modules.pid.PIDController
 - modules.udp_socket.UDPSocket for UDP comms (normalized floats)
 
-Protocol (UDPSocket, normalized to [-1, 1]):
-- Client -> Robot (num_inputs = 5): [setpoint_norm, kp_norm, ki_norm, kd_norm, joint_norm]
-  - setpoint_norm: setpoint angle in radians scaled by pi (angle_rad/pi)
+Protocol (UDPSocket, angles use 2-byte int16 for better resolution):
+- Client -> Robot (num_inputs = 8): [setpoint_hi, setpoint_lo, kp_norm, ki_norm, kd_norm, joint_norm, reload_flag, pump_toggle_flag]
+  - setpoint_hi, setpoint_lo: setpoint angle as 2-byte int16, range ±90° (±π/2)
   - kp_norm, ki_norm, kd_norm: map to ranges via ranges below
   - joint_norm: maps to joint id {0..3} via round((n+1)/2*3)
+  - reload_flag: 1.0 to trigger config reload, else 0.0
+  - pump_toggle_flag: 1.0 to toggle pump state, else 0.0
 
-- Robot -> Client (num_outputs = 2): [measured_angle_norm, pwm_norm]
-  - measured_angle_norm: measured angle_rad / pi
+- Robot -> Client (num_outputs = 3): [angle_hi, angle_lo, pwm_norm]
+  - angle_hi, angle_lo: measured angle as 2-byte int16, range ±90° (±π/2)
   - pwm_norm: last PWM command in [-1, 1]
 
 Joint mapping:
@@ -37,6 +39,7 @@ from modules.diff_ik import (
     create_excavator_config,
     apply_imu_offsets,
     project_to_rotation_axes,
+    propagate_base_rotation,
     extract_axis_rotation,
 )
 from modules.hardware_interface import HardwareInterface
@@ -67,12 +70,39 @@ def joint_norm_to_id(n: float) -> int:
 
 
 def rad_to_norm(angle_rad: float) -> float:
-    # Map [-pi, pi] (and beyond clamped) to [-1, 1]
-    return max(-1.0, min(1.0, angle_rad / math.pi))
+    # Map [-pi/2, pi/2] (±90°) to [-1, 1] for better resolution
+    return max(-1.0, min(1.0, angle_rad / (math.pi / 2.0)))
 
 
 def norm_to_rad(n: float) -> float:
-    return max(-1.0, min(1.0, n)) * math.pi
+    return max(-1.0, min(1.0, n)) * (math.pi / 2.0)
+
+
+def pack_int16(value: float) -> tuple:
+    """Pack normalized float [-1,1] into 2 signed bytes for int16 resolution."""
+    # Map to int16 range
+    i16 = int(max(-32768, min(32767, round(value * 32767))))
+    # Split into high and low bytes as signed int8
+    hi = (i16 >> 8) & 0xFF
+    lo = i16 & 0xFF
+    # Convert to signed int8 range
+    hi = hi - 256 if hi > 127 else hi
+    lo = lo - 256 if lo > 127 else lo
+    return (hi, lo)
+
+
+def unpack_int16(hi: int, lo: int) -> float:
+    """Unpack 2 signed bytes back to normalized float [-1,1]."""
+    # Convert signed int8 to unsigned
+    hi_u = hi + 256 if hi < 0 else hi
+    lo_u = lo + 256 if lo < 0 else lo
+    # Reconstruct int16
+    i16 = (hi_u << 8) | lo_u
+    # Convert to signed int16
+    if i16 > 32767:
+        i16 -= 65536
+    # Normalize to [-1, 1]
+    return max(-1.0, min(1.0, i16 / 32767.0))
 
 
 class RobotPIDTuner:
@@ -96,10 +126,15 @@ class RobotPIDTuner:
         self._setpoint_initialized = [False for _ in self.joint_names]
         self.last_pwm = 0.0
 
+        # Edge detection for one-shot commands
+        self._reload_flag_prev = 0.0
+        self._pump_toggle_flag_prev = 0.0
+        self._flag_threshold = 0.5
+
         # UDP setup (server)
         self.sock = UDPSocket(local_id=2, max_age_seconds=0.5)
-        # Expect 5 inputs, send 2 outputs
-        self.sock.setup(host=host, port=port, num_inputs=5, num_outputs=2, is_server=True)
+        # Expect 8 inputs (setpoint as 2 bytes + 4 single bytes + 2 flags), send 3 outputs (angle as 2 bytes + pwm)
+        self.sock.setup(host=host, port=port, num_inputs=8, num_outputs=3, is_server=True)
         print("Waiting for client handshake...")
         if not self.sock.handshake(timeout=10.0):
             print("Handshake failed; continuing to wait for data anyway.")
@@ -119,37 +154,32 @@ class RobotPIDTuner:
         self._debug_every = 10  # print every N cycles (at 100Hz -> ~10 Hz)
 
     def _read_joint_angle(self, joint_id: int) -> Optional[float]:
-        # Returns angle in radians if available, else None
-        if joint_id == 0:
-            # Slew from ADC encoder (already calibrated radians)
-            return float(self.hw.read_slew_angle())
+        """Read joint angle in radians using full quaternion processing pipeline.
 
-        # IMU-based angles with mounting offsets and axis projection
+        Args:
+            joint_id: Joint index (0=slew, 1=boom, 2=arm, 3=bucket)
+
+        Returns:
+            Joint angle in radians, or None if sensors not ready
+        """
+        # Read IMU data and slew quaternion
         imu_quats = self.hw.read_imu_data()
         slew_quat = self.hw.read_slew_quaternion()
         if not imu_quats or len(imu_quats) < 3:
             return None
 
         # Combine into 4-joint quaternion array [slew, boom, arm, bucket]
-        all_quats = [slew_quat] + imu_quats[:3]
+        all_quats = np.array([slew_quat] + imu_quats[:3], dtype=np.float32)
 
-        try:
-            corrected = apply_imu_offsets(np.array(all_quats, dtype=np.float32), self.robot_config)
-            # Project to rotation axes to isolate each joint's principal rotation
-            projected = project_to_rotation_axes(corrected, self.robot_config)
+        # Apply full quaternion processing pipeline
+        corrected = apply_imu_offsets(all_quats, self.robot_config)
+        projected = project_to_rotation_axes(corrected, self.robot_config.rotation_axes)
+        propagated = propagate_base_rotation(projected, self.robot_config)
 
-            if joint_id == 0:
-                axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            else:
-                axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-
-            angle = float(extract_axis_rotation(projected[joint_id], axis))
-            return angle
-        except Exception:
-            # Fallback to simple Y extraction if anything fails
-            imu_idx = max(0, min(2, joint_id - 1))
-            y_deg = y_deg_from_quat(imu_quats[imu_idx])
-            return math.radians(y_deg)
+        # Extract angle about this joint's rotation axis
+        axis = self.robot_config.rotation_axes[joint_id]
+        angle = float(extract_axis_rotation(propagated[joint_id], axis))
+        return angle
 
     def _apply_pwm(self, joint_id: int, pwm: float) -> bool:
         name = self.joint_names[joint_id]
@@ -159,13 +189,17 @@ class RobotPIDTuner:
         )
 
     def _update_tuning_from_inputs(self, inputs) -> None:
-        # inputs: [setpoint_norm, kp_norm, ki_norm, kd_norm, joint_norm]
-        if inputs is None or len(inputs) < 5:
+        # inputs: [setpoint_hi, setpoint_lo, kp_norm, ki_norm, kd_norm, joint_norm, reload_flag, pump_toggle_flag]
+        if inputs is None or len(inputs) < 6:
             return
 
-        setpoint_n, kp_n, ki_n, kd_n, joint_n = inputs[:5]
+        setpoint_hi, setpoint_lo, kp_n, ki_n, kd_n, joint_n = inputs[:6]
 
         self.active_joint_id = joint_norm_to_id(joint_n)
+        # Convert floats back to int8 bytes, then unpack 2-byte setpoint angle
+        setpoint_hi_int = int(round(setpoint_hi * 127.0))
+        setpoint_lo_int = int(round(setpoint_lo * 127.0))
+        setpoint_n = unpack_int16(setpoint_hi_int, setpoint_lo_int)
         # Update setpoint for active joint only (explicit from client)
         self.setpoints_rad[self.active_joint_id] = norm_to_rad(setpoint_n)
 
@@ -174,6 +208,36 @@ class RobotPIDTuner:
         pid.kp = norm_to_range(kp_n, *KP_RANGE)
         pid.ki = norm_to_range(ki_n, *KI_RANGE)
         pid.kd = norm_to_range(kd_n, *KD_RANGE)
+
+        # Handle one-shot commands (if provided) with edge detection
+        if len(inputs) >= 8:
+            reload_flag = inputs[6]
+            pump_toggle_flag = inputs[7]
+
+            # Reload config if requested (rising edge only)
+            if reload_flag > self._flag_threshold and self._reload_flag_prev <= self._flag_threshold:
+                try:
+                    print("Reload config requested by client...")
+                    self.hw.reload_config()
+                    print("Config reloaded successfully.")
+                except Exception as e:
+                    print(f"Config reload failed: {e}")
+
+            # Toggle pump if requested (rising edge only)
+            if pump_toggle_flag > self._flag_threshold and self._pump_toggle_flag_prev <= self._flag_threshold:
+                try:
+                    print("Pump toggle requested by client...")
+                    if self.hw.pwm_controller:
+                        self.hw.pwm_controller.set_pump(not self.hw.pwm_controller.pump_enabled)
+                        print(f"Pump {'ON' if self.hw.pwm_controller.pump_enabled else 'OFF'}.")
+                    else:
+                        print("Pump toggle failed: PWM controller not available")
+                except Exception as e:
+                    print(f"Pump toggle failed: {e}")
+
+            # Update previous flag states
+            self._reload_flag_prev = reload_flag
+            self._pump_toggle_flag_prev = pump_toggle_flag
 
     def run(self):
         # 100 Hz control loop
@@ -204,9 +268,12 @@ class RobotPIDTuner:
                     self.last_pwm = pwm
                     send_ok = self._apply_pwm(self.active_joint_id, pwm)
 
-                    # Send feedback to client
+                    # Send feedback to client: pack angle as 2 bytes
+                    angle_norm = rad_to_norm(angle)
+                    angle_hi, angle_lo = pack_int16(angle_norm)
                     self.sock.send_floats([
-                        rad_to_norm(angle),
+                        angle_hi / 127.0,  # Convert back to normalized for UDPSocket
+                        angle_lo / 127.0,
                         float(max(-1.0, min(1.0, pwm)))
                     ])
 

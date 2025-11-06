@@ -7,10 +7,14 @@ Controls:
 - Joint: dropdown [slew, boom, arm, bucket]
 - Setpoint (deg): entry box, accepts floats
 - PID gains: sliders (kp, ki, kd)
+- Reload Config: one-shot request to robot to reload PWM config
+- Toggle Pump: one-shot request to toggle hydraulic pump state
 
 Plots (lightweight): simple Tkinter canvas tracing target vs measured angle over time.
 
-Protocol matches pid_tuner_robot.py.
+Protocol matches pid_tuner_robot.py (2-byte angles for better resolution).
+Client -> Robot (num_outputs = 8): [setpoint_hi, setpoint_lo, kp_n, ki_n, kd_n, joint_n, reload_flag, pump_toggle_flag]
+Robot -> Client (num_inputs = 3): [angle_hi, angle_lo, pwm_norm]
 """
 
 import math
@@ -23,11 +27,39 @@ from modules.udp_socket import UDPSocket
 
 
 def rad_to_norm(angle_rad: float) -> float:
-    return max(-1.0, min(1.0, angle_rad / math.pi))
+    # Map [-pi/2, pi/2] (±90°) to [-1, 1] for better resolution
+    return max(-1.0, min(1.0, angle_rad / (math.pi / 2.0)))
 
 
 def norm_to_rad(n: float) -> float:
-    return max(-1.0, min(1.0, n)) * math.pi
+    return max(-1.0, min(1.0, n)) * (math.pi / 2.0)
+
+
+def pack_int16(value: float) -> tuple:
+    """Pack normalized float [-1,1] into 2 signed bytes for int16 resolution."""
+    # Map to int16 range
+    i16 = int(max(-32768, min(32767, round(value * 32767))))
+    # Split into high and low bytes as signed int8
+    hi = (i16 >> 8) & 0xFF
+    lo = i16 & 0xFF
+    # Convert to signed int8 range
+    hi = hi - 256 if hi > 127 else hi
+    lo = lo - 256 if lo > 127 else lo
+    return (hi, lo)
+
+
+def unpack_int16(hi: int, lo: int) -> float:
+    """Unpack 2 signed bytes back to normalized float [-1,1]."""
+    # Convert signed int8 to unsigned
+    hi_u = hi + 256 if hi < 0 else hi
+    lo_u = lo + 256 if lo < 0 else lo
+    # Reconstruct int16
+    i16 = (hi_u << 8) | lo_u
+    # Convert to signed int16
+    if i16 > 32767:
+        i16 -= 65536
+    # Normalize to [-1, 1]
+    return max(-1.0, min(1.0, i16 / 32767.0))
 
 
 def joint_id_to_norm(jid: int) -> float:
@@ -83,6 +115,10 @@ class PIDTunerClient:
         self.period_ms = 50
         self._schedule_update()
 
+        # One-shot command flags
+        self._reload_requested = False
+        self._pump_toggle_requested = False
+
     def _build_ui(self):
         frm = ttk.Frame(self.root, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
@@ -107,31 +143,31 @@ class PIDTunerClient:
         ttk.Label(frm, text="Setpoint (deg):").grid(row=1, column=2, sticky="w")
         ttk.Scale(frm, from_=-90.0, to=90.0, variable=self.setpoint_deg_var,
                   orient=tk.HORIZONTAL).grid(row=1, column=3, sticky="ew")
-        self.sp_disp = tk.StringVar(self.root, value=f"{self.setpoint_deg_var.get():.1f}")
+        self.sp_disp = tk.StringVar(self.root, value=f"{self.setpoint_deg_var.get():.2f}")
         ttk.Label(frm, textvariable=self.sp_disp, width=8).grid(row=1, column=4, sticky="w")
         # keep display synced
         def _on_sp_change(v=None):
             try:
-                self.sp_disp.set(f"{float(self.setpoint_deg_var.get()):.1f}")
+                self.sp_disp.set(f"{float(self.setpoint_deg_var.get()):.2f}")
             except Exception:
                 pass
         self.setpoint_deg_var.trace_add('write', lambda *args: _on_sp_change())
 
         # PID sliders with numeric display
         ttk.Label(frm, text="kp").grid(row=2, column=0, sticky="w")
-        ttk.Scale(frm, from_=0.0, to=100.0, variable=self.kp_var, orient=tk.HORIZONTAL,
+        ttk.Scale(frm, from_=0.0, to=20.0, variable=self.kp_var, orient=tk.HORIZONTAL,
                   command=lambda v: self.kp_disp.set(f"{float(v):.3f}"))\
             .grid(row=2, column=1, sticky="ew")
         ttk.Label(frm, textvariable=self.kp_disp, width=8).grid(row=2, column=2, sticky="w")
 
         ttk.Label(frm, text="ki").grid(row=3, column=0, sticky="w")
-        ttk.Scale(frm, from_=0.0, to=50.0, variable=self.ki_var, orient=tk.HORIZONTAL,
+        ttk.Scale(frm, from_=0.0, to=5.0, variable=self.ki_var, orient=tk.HORIZONTAL,
                   command=lambda v: self.ki_disp.set(f"{float(v):.3f}"))\
             .grid(row=3, column=1, sticky="ew")
         ttk.Label(frm, textvariable=self.ki_disp, width=8).grid(row=3, column=2, sticky="w")
 
         ttk.Label(frm, text="kd").grid(row=4, column=0, sticky="w")
-        ttk.Scale(frm, from_=0.0, to=50.0, variable=self.kd_var, orient=tk.HORIZONTAL,
+        ttk.Scale(frm, from_=0.0, to=5.0, variable=self.kd_var, orient=tk.HORIZONTAL,
                   command=lambda v: self.kd_disp.set(f"{float(v):.3f}"))\
             .grid(row=4, column=1, sticky="ew")
         ttk.Label(frm, textvariable=self.kd_disp, width=8).grid(row=4, column=2, sticky="w")
@@ -150,6 +186,8 @@ class PIDTunerClient:
         ttk.Button(ctrl_row, text="Send", command=self._on_send_clicked).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(ctrl_row, text="Sync to Measured", command=self._on_sync_clicked).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(ctrl_row, text="Snapshot", command=self._on_save_snapshot).pack(side=tk.LEFT)
+        ttk.Button(ctrl_row, text="Reload Config", command=self._on_reload_clicked).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(ctrl_row, text="Toggle Pump", command=self._on_toggle_pump_clicked).pack(side=tk.LEFT, padx=(8, 0))
 
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(3, weight=1)
@@ -183,15 +221,38 @@ class PIDTunerClient:
         if self.sock is not None:
             latest = self.sock.get_latest_floats()
         measured_deg = None
+        angle_norm = None
         pwm = None
-        if latest and len(latest) >= 2:
-            measured_deg = float(latest[0]) * 180.0
-            pwm = float(latest[1])
+        if latest and len(latest) >= 3:
+            # Unpack 2-byte angle
+            angle_hi = int(round(latest[0] * 127.0))
+            angle_lo = int(round(latest[1] * 127.0))
+            angle_norm = unpack_int16(angle_hi, angle_lo)
+            measured_deg = angle_norm * 90.0  # Convert from normalized [-1,1] to degrees [-90,90]
+            pwm = float(latest[2])
 
-        # Only send once target is latched
-        if self.current_target_norm is not None and self.sock is not None:
+        # Send packet whenever connected. Use latched target if available; otherwise, use measured angle to avoid jumps.
+        if self.sock is not None:
             try:
-                self.sock.send_floats([self.current_target_norm, kp_n, ki_n, kd_n, joint_n])
+                send_target_norm = self.current_target_norm
+                if send_target_norm is None:
+                    # Fallback to measured angle if available; else 0
+                    send_target_norm = angle_norm if angle_norm is not None else 0.0
+                setpoint_hi, setpoint_lo = pack_int16(send_target_norm)
+                # Convert int8 back to normalized floats for UDPSocket
+                reload_flag = 1.0 if self._reload_requested else 0.0
+                pump_toggle_flag = 1.0 if self._pump_toggle_requested else 0.0
+                self.sock.send_floats([
+                    setpoint_hi / 127.0,
+                    setpoint_lo / 127.0,
+                    kp_n, ki_n, kd_n,
+                    joint_n,
+                    reload_flag,
+                    pump_toggle_flag,
+                ])
+                # Clear one-shot flags after sending
+                self._reload_requested = False
+                self._pump_toggle_requested = False
             except Exception:
                 pass
 
@@ -211,8 +272,8 @@ class PIDTunerClient:
         # Status with connection state
         conn_txt = "connected" if self.sock is not None else "disconnected"
         self.status_var.set(
-            f"[{conn_txt}] Joint={self.joint_names[self.selected_joint.get()]}  Setpoint={setpoint_deg:.1f}deg  "
-            + (f"Meas={measured_deg:.1f}deg  PWM={pwm:.2f}" if measured_deg is not None else "Meas=--  PWM=--")
+            f"[{conn_txt}] Joint={self.joint_names[self.selected_joint.get()]}  Setpoint={setpoint_deg:.2f}deg  "
+            + (f"Meas={measured_deg:.2f}deg  PWM={pwm:.2f}" if measured_deg is not None else "Meas=--  PWM=--")
         )
 
         self._schedule_update()
@@ -223,8 +284,8 @@ class PIDTunerClient:
             setpoint_deg = float(self.setpoint_deg_var.get())
         except Exception:
             setpoint_deg = 0.0
-        setpoint_rad = math.radians(setpoint_deg)
-        self.current_target_norm = max(-1.0, min(1.0, setpoint_rad / math.pi))
+        # Normalize to [-1,1] using ±90° range
+        self.current_target_norm = max(-1.0, min(1.0, setpoint_deg / 90.0))
         self.latched_setpoint_deg = setpoint_deg
         # No auto-snapshot on send; use Snapshot button
 
@@ -232,10 +293,14 @@ class PIDTunerClient:
         if self.sock is None:
             return
         latest = self.sock.get_latest_floats()
-        if latest and len(latest) >= 2:
-            measured_deg = float(latest[0]) * 180.0
+        if latest and len(latest) >= 3:
+            # Unpack 2-byte angle
+            angle_hi = int(round(latest[0] * 127.0))
+            angle_lo = int(round(latest[1] * 127.0))
+            angle_norm = unpack_int16(angle_hi, angle_lo)
+            measured_deg = angle_norm * 90.0  # Convert from normalized [-1,1] to degrees [-90,90]
             self.setpoint_deg_var.set(f"{measured_deg:.2f}")
-            self.current_target_norm = max(-1.0, min(1.0, measured_deg / 180.0))
+            self.current_target_norm = angle_norm
             self.latched_setpoint_deg = measured_deg
 
     def _on_joint_changed(self, idx: int):
@@ -251,8 +316,12 @@ class PIDTunerClient:
         # Optionally sync UI to current measured if available
         if self.sock is not None:
             latest = self.sock.get_latest_floats()
-            if latest and len(latest) >= 2:
-                measured_deg = float(latest[0]) * 180.0
+            if latest and len(latest) >= 3:
+                # Unpack 2-byte angle
+                angle_hi = int(round(latest[0] * 127.0))
+                angle_lo = int(round(latest[1] * 127.0))
+                angle_norm = unpack_int16(angle_hi, angle_lo)
+                measured_deg = angle_norm * 90.0
                 self.setpoint_deg_var.set(f"{measured_deg:.2f}")
 
     def _on_connect_clicked(self):
@@ -265,13 +334,24 @@ class PIDTunerClient:
 
         try:
             sock = UDPSocket(local_id=1, max_age_seconds=0.5)
-            sock.setup(host=host, port=port, num_inputs=2, num_outputs=5, is_server=False)
+            # Receive 3 inputs (angle as 2 bytes + pwm), send 8 outputs (setpoint as 2 bytes + 4 singles + 2 flags)
+            sock.setup(host=host, port=port, num_inputs=3, num_outputs=8, is_server=False)
             sock.handshake(timeout=5.0)
             sock.start_receiving()
             self.sock = sock
             self.status_var.set(f"[connected] Host={host} Port={port}")
         except Exception as e:
             self.status_var.set(f"[error] connect failed: {e}")
+
+    def _on_reload_clicked(self):
+        # Request a one-shot config reload on robot
+        self._reload_requested = True
+        self.status_var.set("[action] Reload config requested")
+
+    def _on_toggle_pump_clicked(self):
+        # Request a one-shot pump toggle on robot
+        self._pump_toggle_requested = True
+        self.status_var.set("[action] Pump toggle requested")
 
     def _on_save_snapshot(self):
         # Use full current view buffers
@@ -310,7 +390,7 @@ class PIDTunerClient:
             # Annotate with joint + PID + setpoint
             jname = self.joint_names[self.selected_joint.get()]
             sp = self.latched_setpoint_deg if self.latched_setpoint_deg is not None else float(self.setpoint_deg_var.get())
-            title = f"Joint: {jname} | kp={self.kp_var.get():.3f} ki={self.ki_var.get():.3f} kd={self.kd_var.get():.3f} | setpoint={sp:.1f} deg"
+            title = f"Joint: {jname} | kp={self.kp_var.get():.3f} ki={self.ki_var.get():.3f} kd={self.kd_var.get():.3f} | setpoint={sp:.2f} deg"
             fig.suptitle(title)
 
             timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -355,8 +435,8 @@ class PIDTunerClient:
                 canvas.create_line(*points, fill=color, width=2)
 
         # Show fixed min/max on axis
-        canvas.create_text(42, 10, anchor="nw", text=f"{ymax:.1f}°", fill="#444")
-        canvas.create_text(42, h - 20, anchor="sw", text=f"{ymin:.1f}°", fill="#444")
+        canvas.create_text(42, 10, anchor="nw", text=f"{ymax:.2f}°", fill="#444")
+        canvas.create_text(42, h - 20, anchor="sw", text=f"{ymin:.2f}°", fill="#444")
 
     def run(self):
         self.root.mainloop()

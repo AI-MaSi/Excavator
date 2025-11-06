@@ -14,6 +14,12 @@ import time
 import numpy as np
 from typing import List, Optional, Dict, Any
 import threading
+from pathlib import Path
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
 from .PCA9685_controller import PWMController
 from .usb_serial_reader import USBSerialReader
@@ -106,7 +112,10 @@ class HardwareInterface:
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
                  input_rate_threshold: int = 0,
-                 default_unset_to_zero: bool = True):
+                 default_unset_to_zero: bool = True,
+                 perf_enabled: bool = False,
+                 imu_expected_hz: Optional[float] = None,
+                 general_config_path: str = "configuration_files/general_config.yaml"):
         """
         Initialize real hardware interface.
         
@@ -117,15 +126,17 @@ class HardwareInterface:
             input_rate_threshold: Input rate threshold for PWM controller
         """
         self.config_file = config_file
+        self._general_config_path = general_config_path
+        self._general_config = self._load_general_config(general_config_path)
         
         # Initialize PWM controller
         if PWMController is not None:
             try:
                 self.pwm_controller = PWMController(
                     config_file=config_file,
-                    pump_variable=pump_variable,
-                    toggle_channels=toggle_channels,
-                    input_rate_threshold=input_rate_threshold,
+                    pump_variable=self._g('pwm.pump_variable', pump_variable),
+                    toggle_channels=self._g('pwm.toggle_channels', toggle_channels),
+                    input_rate_threshold=self._g('pwm.input_rate_threshold', input_rate_threshold),
                     default_unset_to_zero=default_unset_to_zero
                 )
                 self.pwm_ready = True
@@ -139,10 +150,47 @@ class HardwareInterface:
             self.pwm_controller = None
             self.pwm_ready = False
         
+        # Perf tracking (opt-in and very low overhead when disabled)
+        # Initialize BEFORE starting any reader threads to avoid races
+        self._perf_enabled = bool(perf_enabled)
+        self._perf_lock = threading.Lock()
+        # IMU perf
+        self._imu_rate_count = 0
+        self._imu_rate_window_start = time.perf_counter()
+        self._imu_hz = 0.0
+        self._imu_n = 0  # wallclock interval samples
+        self._imu_mean = 0.0
+        self._imu_m2 = 0.0
+        self._imu_min = float('inf')
+        self._imu_max = 0.0
+        self._imu_last_wall = None
+        # Device timestamp derived intervals (if available)
+        self._imu_dev_n = 0
+        self._imu_dev_mean = 0.0
+        self._imu_dev_m2 = 0.0
+        self._imu_dev_min = float('inf')
+        self._imu_dev_max = 0.0
+        self._imu_last_dev_ts = None
+        # ADC perf
+        self._adc_rate_count = 0
+        self._adc_rate_window_start = time.perf_counter()
+        self._adc_hz = 0.0
+        self._adc_n = 0
+        self._adc_mean = 0.0
+        self._adc_m2 = 0.0
+        self._adc_min = float('inf')
+        self._adc_max = 0.0
+        self._adc_last_wall = None
+
         # Initialize IMU reader
         self.imu_ready = False
         self.latest_imu_data = None
+        self.latest_imu_pitch = None  # radians, if available from stream
         self._imu_lock = threading.Lock()
+        self._imu_expected_hz = float(imu_expected_hz) if imu_expected_hz and imu_expected_hz > 1.0 else 120.0
+        # IMU target SR from config unless explicitly provided
+        cfg_imu_hz = float(self._g('rates.imu_hz', 120.0))
+        self._imu_expected_hz = float(imu_expected_hz) if imu_expected_hz else cfg_imu_hz
         self._start_imu_reader()
 
         # Initialize ADC and encoder
@@ -150,6 +198,8 @@ class HardwareInterface:
         self.latest_slew_angle = 0.0
         self.latest_slew_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Identity
         self._adc_lock = threading.Lock()
+        # ADC/encoder expected rate from config
+        self._adc_expected_hz = float(self._g('rates.adc_hz', 120.0))
         self._start_adc_reader()
     
     def _check_imu_streaming(self, timeout: float = 2.0) -> bool:
@@ -174,14 +224,26 @@ class HardwareInterface:
         """Initialize IMU reader and start background thread."""
         if USBSerialReader is not None:
             try:
-                self.usb_reader = USBSerialReader()
-                
-                # Check if IMUs are already streaming data
-                already_streaming = self._check_imu_streaming()
+                # Initialize USBSerialReader with basic parameters
+                # Data format: CSV with [w,x,y,z,gx,gy,gz] per IMU
+                self.usb_reader = USBSerialReader(baud_rate=115200, timeout=1.0, simulation_mode=False)
 
-                if not already_streaming:
-                    # Send handshake configuration to start IMU data streaming
-                    self.usb_reader.send_handshake_config()
+                # Send handshake to configure the device
+                # Request expected sample rate explicitly (firmware may clamp/ignore)
+                # Also pass optional LPF and QMODE from config if provided
+                hs_kwargs = {
+                    'sample_rate': int(self._imu_expected_hz)
+                }
+                lpf_enabled = self._g('imu.lpf_enabled', None)
+                lpf_alpha = self._g('imu.lpf_alpha', None)
+                qmode = self._g('imu.qmode', None)
+                if lpf_enabled is not None:
+                    hs_kwargs['lpf_enabled'] = int(bool(lpf_enabled))
+                if lpf_alpha is not None:
+                    hs_kwargs['lpf_alpha'] = float(lpf_alpha)
+                if qmode is not None:
+                    hs_kwargs['qmode'] = str(qmode)
+                self.usb_reader.send_handshake_config(**hs_kwargs)
 
                 # Start background thread for IMU reading
                 self.imu_thread = threading.Thread(
@@ -189,7 +251,7 @@ class HardwareInterface:
                     daemon=True
                 )
                 self.imu_thread.start()
-                
+
             except Exception as e:
                 print(f"IMU initialization failed: {e}")
                 self.usb_reader = None
@@ -199,19 +261,21 @@ class HardwareInterface:
             
     def _imu_reader_thread(self) -> None:
         """Background thread for continuous IMU reading."""
+        # Aim to match the device sample rate to avoid unnecessary polling
         next_run_time = time.perf_counter()
-        read_period = 1.0 / 240.0  # 4.16ms = 240Hz. About twice the serial read rate.
-
+        read_period = 1.0 / max(1.0, self._imu_expected_hz)
         while True:
             try:
-                quaternions = self.usb_reader.read_imus()
-                if quaternions is not None and len(quaternions) >= 3:
-                    # Convert to numpy arrays
-                    quaternion_arrays = [np.array(q, dtype=np.float32) for q in quaternions]
+                # Read IMU data - returns list of [w,x,y,z,gx,gy,gz] arrays
+                imu_packets = self.usb_reader.read_imus()
+                if imu_packets is not None and len(imu_packets) >= 3:
+                    # Extract only the quaternion portion [w,x,y,z] from each IMU packet
+                    # Data format is [w, x, y, z, gx, gy, gz] (7 values per IMU)
+                    quat_only = [np.array(pkt[:4], dtype=np.float32) for pkt in imu_packets]
 
                     # Validate quaternion magnitudes (should be ~1.0 for unit quaternions)
                     valid_data = True
-                    for q in quaternion_arrays[:3]:
+                    for q in quat_only[:3]:
                         mag = np.linalg.norm(q)
                         if mag < 0.95 or mag > 1.05:
                             valid_data = False
@@ -220,12 +284,53 @@ class HardwareInterface:
                     if valid_data:
                         # Atomically update latest data
                         with self._imu_lock:
-                            self.latest_imu_data = quaternion_arrays[:3]  # Take first 3
+                            self.latest_imu_data = quat_only[:3]  # Take first 3 IMUs
+                            # Note: pitch can be computed from quaternion if needed
+                            # pitch = arcsin(2*(w*y - z*x))
                             if not self.imu_ready:
                                 self.imu_ready = True
-                                print("IMU data streaming")
+                                print("IMU data streaming (CSV)")
 
-                # Accurate timing
+                        # Perf: count sample and interval stats (minimal, gated)
+                        if self._perf_enabled:
+                            now = time.perf_counter()
+                            # Wallclock intervals
+                            if self._imu_last_wall is not None:
+                                interval = max(0.0, now - self._imu_last_wall)
+                                with self._perf_lock:
+                                    self._imu_n += 1
+                                    # Welford update
+                                    delta = interval - self._imu_mean
+                                    self._imu_mean += delta / self._imu_n
+                                    self._imu_m2 += delta * (interval - self._imu_mean)
+                                    self._imu_min = interval if interval < self._imu_min else self._imu_min
+                                    self._imu_max = interval if interval > self._imu_max else self._imu_max
+                            self._imu_last_wall = now
+
+                            # Device timestamp derived intervals (if present)
+                            dev_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
+                            if isinstance(dev_ts, (int, float)):
+                                if self._imu_last_dev_ts is not None and dev_ts > self._imu_last_dev_ts:
+                                    dt_ms = (dev_ts - self._imu_last_dev_ts) / 1000.0
+                                    with self._perf_lock:
+                                        self._imu_dev_n += 1
+                                        ddelta = dt_ms - self._imu_dev_mean
+                                        self._imu_dev_mean += ddelta / self._imu_dev_n
+                                        self._imu_dev_m2 += ddelta * (dt_ms - self._imu_dev_mean)
+                                        self._imu_dev_min = dt_ms if dt_ms < self._imu_dev_min else self._imu_dev_min
+                                        self._imu_dev_max = dt_ms if dt_ms > self._imu_dev_max else self._imu_dev_max
+                                self._imu_last_dev_ts = dev_ts
+
+                            # Rate over a short window
+                            with self._perf_lock:
+                                self._imu_rate_count += 1
+                                elapsed = now - self._imu_rate_window_start
+                                if elapsed >= 0.5:
+                                    self._imu_hz = self._imu_rate_count / elapsed
+                                    self._imu_rate_count = 0
+                                    self._imu_rate_window_start = now
+
+                # Accurate timing to match expected device SR
                 next_run_time += read_period
                 sleep_time = next_run_time - time.perf_counter()
                 if sleep_time > 0:
@@ -237,8 +342,7 @@ class HardwareInterface:
                 print(f"IMU reader thread error: {e}")
                 with self._imu_lock:
                     self.imu_ready = False
-                time.sleep(0.1)  # Longer sleep on error
-                next_run_time = time.perf_counter() + 0.1
+                time.sleep(0.1)  # Back off on error
 
     def _start_adc_reader(self) -> None:
         """Initialize ADC reader and start background thread."""
@@ -260,12 +364,12 @@ class HardwareInterface:
     def _adc_reader_thread(self) -> None:
         """Background thread for continuous ADC reading."""
         next_run_time = time.perf_counter()
-        read_period = 1.0 / 120.0  # 8.33ms = 120Hz
+        read_period = 1.0 / max(1.0, self._adc_expected_hz)
 
         while True:
             try:
-                # Read only the slew encoder channel directly
-                slew_voltage = self.adc.read_raw_channel("b1", 8)
+                # Read only the slew encoder channel directly (with EMA filtering)
+                slew_voltage = self.adc.read_channel("b1", 8)
                 slew_data = self.encoder_tracker.update(slew_voltage)
 
                 # Atomically update latest data
@@ -275,6 +379,28 @@ class HardwareInterface:
                     if not self.adc_ready:
                         self.adc_ready = True
                         print("ADC and encoder ready")
+
+                # Perf: intervals and rate (gated)
+                if self._perf_enabled:
+                    now = time.perf_counter()
+                    if self._adc_last_wall is not None:
+                        interval = max(0.0, now - self._adc_last_wall)
+                        with self._perf_lock:
+                            self._adc_n += 1
+                            delta = interval - self._adc_mean
+                            self._adc_mean += delta / self._adc_n
+                            self._adc_m2 += delta * (interval - self._adc_mean)
+                            self._adc_min = interval if interval < self._adc_min else self._adc_min
+                            self._adc_max = interval if interval > self._adc_max else self._adc_max
+                    self._adc_last_wall = now
+
+                    with self._perf_lock:
+                        self._adc_rate_count += 1
+                        elapsed = now - self._adc_rate_window_start
+                        if elapsed >= 0.5:
+                            self._adc_hz = self._adc_rate_count / elapsed
+                            self._adc_rate_count = 0
+                            self._adc_rate_window_start = now
 
                 # Accurate timing
                 next_run_time += read_period
@@ -310,17 +436,28 @@ class HardwareInterface:
             print(f"IMU read error: {e}")
             return None
 
+    def read_imu_pitch(self) -> Optional[List[float]]:
+        """Read latest IMU pitch angles (radians) if provided by the serial stream."""
+        try:
+            with self._imu_lock:
+                if not self.imu_ready or self.latest_imu_pitch is None:
+                    return None
+                return list(self.latest_imu_pitch)
+        except Exception as e:
+            print(f"IMU pitch read error: {e}")
+            return None
+
     def read_slew_voltage(self) -> float:
         """
-        Read slew encoder voltage directly from ADC.
+        Read slew encoder voltage from ADC (with EMA filtering).
 
         Returns:
-            Raw voltage reading from slew encoder, or 0.0 if not ready.
+            Filtered voltage reading from slew encoder, or 0.0 if not ready.
         """
         try:
             if not self.adc_ready or self.adc is None:
                 return 0.0
-            return self.adc.read_raw_channel("b1", 8)
+            return self.adc.read_channel("b1", 8)
         except Exception as e:
             print(f"ADC read error: {e}")
             return 0.0
@@ -419,3 +556,130 @@ class HardwareInterface:
         except Exception as e:
             print(f"Error reloading configuration: {e}")
             return False
+
+    def reload_general_config(self) -> bool:
+        """Reload general YAML configuration and apply rate settings to readers."""
+        try:
+            cfg = self._load_general_config(self._general_config_path)
+            self._general_config = cfg
+            # Apply rates
+            self._imu_expected_hz = float(self._g('rates.imu_hz', self._imu_expected_hz))
+            self._adc_expected_hz = float(self._g('rates.adc_hz', self._adc_expected_hz))
+            # Update handshake for IMU if possible
+            try:
+                if self.usb_reader is not None:
+                    self.usb_reader.send_handshake_config(sample_rate=int(self._imu_expected_hz))
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            print(f"Error reloading general config: {e}")
+            return False
+
+    def _load_general_config(self, path: str) -> Dict[str, Any]:
+        """Load general configuration YAML file if available; return dict."""
+        try:
+            p = Path(path)
+            if not p.exists() or yaml is None:
+                return {}
+            with p.open('r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+                if not isinstance(data, dict):
+                    return {}
+                return data
+        except Exception:
+            return {}
+
+    def _g(self, dotted: str, default=None):
+        """Get nested config value from general config using dotted path."""
+        cur = self._general_config
+        try:
+            for part in dotted.split('.'):
+                if isinstance(cur, dict) and part in cur:
+                    cur = cur[part]
+                else:
+                    return default
+            return cur
+        except Exception:
+            return default
+
+    # ------------------------
+    # Perf helpers (opt-in)
+    # ------------------------
+    def set_perf_enabled(self, enabled: bool) -> None:
+        self._perf_enabled = bool(enabled)
+
+    def reset_perf_stats(self) -> None:
+        with self._perf_lock:
+            # IMU
+            self._imu_rate_count = 0
+            self._imu_rate_window_start = time.perf_counter()
+            self._imu_hz = 0.0
+            self._imu_n = 0
+            self._imu_mean = 0.0
+            self._imu_m2 = 0.0
+            self._imu_min = float('inf')
+            self._imu_max = 0.0
+            self._imu_last_wall = None
+            self._imu_dev_n = 0
+            self._imu_dev_mean = 0.0
+            self._imu_dev_m2 = 0.0
+            self._imu_dev_min = float('inf')
+            self._imu_dev_max = 0.0
+            self._imu_last_dev_ts = None
+            # ADC
+            self._adc_rate_count = 0
+            self._adc_rate_window_start = time.perf_counter()
+            self._adc_hz = 0.0
+            self._adc_n = 0
+            self._adc_mean = 0.0
+            self._adc_m2 = 0.0
+            self._adc_min = float('inf')
+            self._adc_max = 0.0
+            self._adc_last_wall = None
+
+    def get_perf_stats(self) -> Dict[str, Any]:
+        if not self._perf_enabled:
+            return {}
+        with self._perf_lock:
+            def pack_wall(n, mean_s, m2, min_s, max_s):
+                if n > 1:
+                    var = m2 / (n - 1)
+                    std_ms = (var ** 0.5) * 1000.0
+                else:
+                    std_ms = 0.0
+                return {
+                    'avg_interval_ms': float(mean_s * 1000.0),
+                    'std_interval_ms': float(std_ms),
+                    'min_interval_ms': float(min_s * 1000.0 if min_s != float('inf') else 0.0),
+                    'max_interval_ms': float(max_s * 1000.0),
+                }
+
+            imu_wall = pack_wall(self._imu_n, self._imu_mean, self._imu_m2, self._imu_min, self._imu_max)
+            if self._imu_dev_n > 1:
+                dev_var = self._imu_dev_m2 / (self._imu_dev_n - 1)
+                dev_std = dev_var ** 0.5
+            else:
+                dev_std = 0.0
+            imu_dev = {
+                'dev_avg_interval_ms': float(self._imu_dev_mean),
+                'dev_std_interval_ms': float(dev_std),
+                'dev_min_interval_ms': float(self._imu_dev_min if self._imu_dev_min != float('inf') else 0.0),
+                'dev_max_interval_ms': float(self._imu_dev_max),
+            }
+
+            adc_wall = pack_wall(self._adc_n, self._adc_mean, self._adc_m2, self._adc_min, self._adc_max)
+
+            return {
+                'imu': {
+                    'hz': float(self._imu_hz),
+                    **imu_wall,
+                    **imu_dev,
+                    'samples': int(self._imu_n),
+                },
+                'adc': {
+                    'hz': float(self._adc_hz),
+                    **adc_wall,
+                    'samples': int(self._adc_n),
+                }
+            }

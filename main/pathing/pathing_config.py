@@ -33,8 +33,11 @@ class PathExecutionConfig:
     """Unified configuration for path execution in both sim and real systems."""
 
     # Motion parameters
-    speed_mps: float = 0.10  # Speed in meters per second
-    interpolation_factor: int = 1  # Points added between waypoints (higher = smoother)
+    speed_mps: float = 0.020  # Speed in meters per second
+    interpolation_factor: int = 1  # Points added between waypoints (higher = smoother). 1 = no interpolation.
+    # Trapezoidal speed profile (accel/decel)
+    accel_mps2: float = 0.04  # Default linear acceleration (m/s^2)
+    decel_mps2: float = 0.04  # Default linear deceleration (m/s^2)
 
 
     update_frequency: float = 100.0  # Hz - target update frequency.
@@ -61,6 +64,9 @@ class PathExecutionConfig:
     rrt_minimum_iterations: int = 1000
     rrt_cost_improvement_patience: int = 5000
 
+
+
+
     # Final target verification. No new *end* target point will be given until these are met.
     # Note: this does not affect the points between endpoints, these are followed blindly ("trying to keep up")
     final_target_tolerance: float = 0.015  # Final target tolerance in meters (15 mm)
@@ -74,6 +80,8 @@ class PathExecutionConfig:
         """Validate configuration parameters."""
         assert self.speed_mps > 0, "Speed must be positive"
         assert self.interpolation_factor >= 1, "Interpolation factor must be at least 1"
+        assert self.accel_mps2 > 0, "accel_mps2 must be positive"
+        assert self.decel_mps2 > 0, "decel_mps2 must be positive"
         assert 0 < self.final_target_tolerance <= 0.5, "Target tolerance should be 1-50cm" # non used parameter
         assert self.update_frequency > 0, "Update frequency must be positive"
         assert 0.001 <= self.grid_resolution <= 0.1, "Grid resolution should be 1mm-10cm"

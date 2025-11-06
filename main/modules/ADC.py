@@ -216,15 +216,18 @@ class ADCConfig:
 
 
 class SimpleADC:
-    def __init__(self, custom_config: ADCConfig = None):
+    def __init__(self, custom_config: ADCConfig = None, filter_alpha: float = 0.8):
         """
         Initialize ADC with built-in or custom configuration.
 
         :param custom_config: Optional custom ADCConfig instance. If None, uses default excavator config.
+        :param filter_alpha: EMA filter alpha (0-1). Higher = more responsive, lower = smoother. Default 0.8.
         """
         self.config = custom_config if custom_config else ADCConfig()
         self.adcs = {}
         self.initialized = False
+        self.filter_alpha = filter_alpha
+        self.filtered_values = {}  # Store filtered values per board/channel: {(board, channel): value}
         self.initialize_adc()
 
     def _board_needed(self, board_name: str) -> bool:
@@ -261,8 +264,8 @@ class SimpleADC:
 
         self.initialized = True
 
-    def read_raw(self) -> Dict[str, float]:
-        """Read raw voltage from all sensors."""
+    def read_sensors(self) -> Dict[str, float]:
+        """Read filtered voltage from all sensors."""
         if not self.initialized:
             raise RuntimeError("ADC not initialized!")
 
@@ -272,28 +275,23 @@ class SimpleADC:
             board_name = sensor_config['input'][0]
             channel = sensor_config['input'][1]
 
-            adc = self.adcs.get(board_name)
-            if adc:
-                try:
-                    # Use the original library's read_voltage method
-                    voltage = adc.read_voltage(channel)
-                    readings[sensor_name] = round(voltage, 2)
-                except Exception as e:
-                    print(f"Error reading {sensor_name}: {e}")
-                    # Continue with other sensors instead of failing completely
-            else:
-                print(f"ADC board {board_name} not found for sensor {sensor_name}")
+            try:
+                # Use read_channel which applies EMA filtering
+                readings[sensor_name] = self.read_channel(board_name, channel)
+            except Exception as e:
+                print(f"Error reading {sensor_name}: {e}")
+                # Continue with other sensors instead of failing completely
 
         return readings
 
-    def read_raw_channel(self,
-                         board_name: str, channel: int) -> float:
+    def read_channel(self,
+                     board_name: str, channel: int) -> float:
         """
-        Read raw voltage from a specific board and channel.
+        Read filtered voltage from a specific board and channel with EMA filtering.
 
         :param board_name: Name of the ADC board
         :param channel: Channel number (1-8)
-        :return: Voltage reading
+        :return: Filtered voltage reading
         """
         if not self.initialized:
             raise RuntimeError("ADC not initialized!")
@@ -306,8 +304,20 @@ class SimpleADC:
             raise ValueError("Channel must be between 1 and 8")
 
         try:
-            voltage = adc.read_voltage(channel)
-            return round(voltage, 2)
+            # Read raw voltage
+            raw_voltage = adc.read_voltage(channel)
+
+            # Apply EMA filter
+            key = (board_name, channel)
+            if key not in self.filtered_values:
+                # First reading - initialize filter
+                self.filtered_values[key] = raw_voltage
+            else:
+                # EMA: filtered = alpha * new + (1 - alpha) * old
+                self.filtered_values[key] = (self.filter_alpha * raw_voltage +
+                                            (1 - self.filter_alpha) * self.filtered_values[key])
+
+            return round(self.filtered_values[key], 2)
         except Exception as e:
             raise Exception(f"Error reading {board_name} channel {channel}: {e}")
 
@@ -336,6 +346,7 @@ class SimpleADC:
             'bit_rate': self.config.bit_rate,
             'max_sampling_rate': sampling_info['max_samples_per_second'],
             'conversion_mode': sampling_info['conversion_mode'],
+            'filter_alpha': self.filter_alpha,
             'total_sensors': len(self.config.sensors),
             'total_boards': len(self.config.i2c_addresses),
             'initialized_boards': len(self.adcs),
@@ -385,6 +396,7 @@ class SimpleADC:
         print(f"  Bit Rate: {sampling_info['bit_rate']} bit")
         print(f"  Max Sampling Rate: {sampling_info['max_samples_per_second']} SPS")
         print(f"  Conversion Mode: {sampling_info['conversion_mode']}")
+        print(f"  EMA Filter Alpha: {self.filter_alpha} (higher = more responsive)")
 
         # Board configuration
         print(f"\nBoard Configuration:")
@@ -416,12 +428,12 @@ if __name__ == "__main__":
             adc.list_sensors()
 
             print("\nReading all sensors:")
-            readings = adc.read_raw()
+            readings = adc.read_sensors()
             for sensor, voltage in readings.items():
                 print(f"  {sensor}: {voltage:.2f}V")
             time.sleep(5)
             while True:
-                readings = adc.read_raw()
+                readings = adc.read_sensors()
                 print(readings)
                 time.sleep(1)
 

@@ -1,9 +1,5 @@
 import serial
-import json
 import time
-import sys
-import re
-import math
 import serial.tools.list_ports
 
 
@@ -15,52 +11,71 @@ class USBSerialReader:
         self.port = None
         self.simulation_mode = simulation_mode
         self.sim_time = 0.0
-        
+        # Unwrap state per IMU index: {idx: {last: deg, offset: deg}}
+        self._unwrap_state = {}
+        # NOTE (firmware tuning): If unwrapped pitch looks biased during slewing,
+        # adjust AHRS params in firmware and re-flash:
+        #   file: src/imu_reader/Fusion/Fusion/InitFusion.c
+        #   lines: look for FusionAhrsSettings (gain, accelerationRejection, recoveryTriggerPeriod)
+        # Suggested snappier feel: gain=0.4, accelerationRejection=12, recoveryTriggerPeriod=3*SR
+        # Suggested more rejection (less bias): gain=0.3, accelerationRejection=16
         if not simulation_mode:
             self.connect()
         else:
-            print("Running in simulation mode - generating synthetic IMU data")
+            print("Simulation mode: generating synthetic IMU data")
 
     def find_pico_port(self):
         """Try to find the Pico automatically"""
         ports = serial.tools.list_ports.comports()
         for port in ports:
             if 'Pico' in port.description or 'USB Serial' in port.description:
+                print(f"Found Pico on port: {port.device}")
                 return port.device
-        
-        # Different fallbacks for different platforms
-        if sys.platform.startswith('win'):
-            return 'COM3'  # Common Windows COM port
-        else:
-            return '/dev/ttyACM0'  # Linux/Mac fallback
+
+        # Default fallback: pick first available port on this system
+        if ports:
+            print(f"No Pico descriptor match; defaulting to {ports[0].device}")
+            return ports[0].device
+        print("No serial ports found. Please specify manually (e.g., COM3).")
+        return 'COM3'
 
     def connect(self):
         """Connect to the serial port"""
         self.port = self.find_pico_port()
         try:
             self.ser = serial.Serial(self.port, self.baud_rate, timeout=self.timeout)
+            print(f"Connected to {self.port} at {self.baud_rate} baud")
             # Wait a moment for connection to stabilize
             time.sleep(0.1)
         except serial.SerialException as e:
             print(f"Serial connection error: {e}")
             raise
 
-    def send_handshake_config(self, sensor_count=3, lpf_enabled=1, lpf_alpha=0.99, sample_rate=120):
+    def send_handshake_config(self, sensor_count=3, sample_rate=120, qmode="FULL",
+                              lpf_enabled=1, lpf_alpha=0.995):
         """
-        Send configuration handshake to Pico with IMU settings.
+        Send minimal configuration handshake to Pico.
         
         Args:
-            sensor_count: Number of sensors (default: 3)
-            lpf_enabled: Low-pass filter enabled (1/0, default: 1)
-            lpf_alpha: Low-pass filter alpha value (default: 0.95)
-            sample_rate: Sample rate in Hz (default: 120)
+            sensor_count: Number of sensors
+            lpf_enabled: Low-pass filter enabled
+            lpf_alpha: Low-pass filter alpha value
+            sample_rate: Sample rate in Hz
         """
         if not self.ser or not self.ser.is_open:
             print("Serial port not connected - cannot send handshake")
             return False
-            
         try:
-            format_response = f"SC={sensor_count}|LPF_ENABLED={lpf_enabled}|LPF_ALPHA={lpf_alpha}|SR={sample_rate}|\n"
+            # Always CSV stream on-device; minimal fields
+            qm = (qmode or "FULL").upper()
+            if qm not in ("FULL", "PITCH", "0", "1"):
+                qm = "FULL"
+            # NOTE (no flash needed): To change software smoothing, tweak lpf_alpha here.
+            # Current filter is y = (1-alpha)*y_prev + alpha*x. For smoothing, use alpha ~0.05–0.15 at 120–200 Hz.
+            # Example: set lpf_alpha=0.1 to reduce vibration; set 0.0 or disable LPF for maximum responsiveness.
+            format_response = (
+                f"SC={sensor_count}|LPF_ENABLED={lpf_enabled}|LPF_ALPHA={lpf_alpha}|SR={sample_rate}|QMODE={qm}|\n"
+            )
             self.ser.write(format_response.encode("utf-8"))
             print(f"Sent handshake config: {format_response.strip()}")
             return True
@@ -68,78 +83,150 @@ class USBSerialReader:
             print(f"Error sending handshake: {e}")
             return False
 
+    def send_zero(self):
+        """Request re-zero from device (sets current pitch as zero)."""
+        if not self.ser or not self.ser.is_open:
+            print("Serial port not connected - cannot send ZERO")
+            return False
+        try:
+            self.ser.write(b"CMD=ZERO\n")
+            print("Sent ZERO command")
+            return True
+        except serial.SerialException as e:
+            print(f"Error sending ZERO: {e}")
+            return False
+
     def parse_imu_line(self, line):
         """
-        Parse a line like:
-        w0: -0.5033, x0: -0.2855, y0: -0.1870, z0: 0.7940 | w1: -0.3059, x1: 0.1590, y1: 0.0411, z1: 0.9379 | w2: -0.3349, x2: 0.6686, y2: 0.4297, z2: 0.5065 |
-
-        Returns: list of [w, x, y, z] quaternion arrays for each IMU
+        Parse compact CSV line: timestamp_us, then per IMU -> w,x,y,z,gx,gy,gz
+        Backward-compatible: if no leading timestamp, still parses.
+        Returns list of per-IMU arrays and sets self.last_timestamp_us.
         """
         try:
-            # Split by | to get each IMU section
-            imu_sections = line.split('|')[:-1]  # Remove last empty element
-
-            imu_data = []
-            for section in imu_sections:
-                # Extract numbers using regex
-                # Look for pattern: w0: number, x0: number, y0: number, z0: number
-                matches = re.findall(r'[wxyz]\d+:\s*([-+]?\d*\.?\d+)', section.strip())
-
-                if len(matches) == 4:
-                    quaternion = [float(val) for val in matches]  # [w, x, y, z]
-                    imu_data.append(quaternion)
-                else:
-                    # Silently skip malformed sections
+            vals = [v for v in line.strip().split(',') if v]
+            floats = []
+            for v in vals:
+                try:
+                    floats.append(float(v))
+                except Exception:
                     return None
-
-            return imu_data if len(imu_data) == 3 else None
-
-        except Exception as e:
-            print(f"Error parsing line '{line}': {e}")
+            imu_data = []
+            if not floats:
+                return None
+            if (len(floats) % 7) == 0:
+                # No timestamp
+                self.last_timestamp_us = None
+                start = 0
+            elif (len(floats) - 1) % 7 == 0:
+                # Leading timestamp
+                self.last_timestamp_us = int(floats[0])
+                start = 1
+            else:
+                return None
+            for i in range(start, len(floats), 7):
+                chunk = floats[i:i+7]
+                if len(chunk) < 7:
+                    return None
+                imu_data.append([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6]])
+            return imu_data
+        except Exception:
             return None
 
     def generate_simulation_data(self):
         """Generate synthetic IMU data for testing"""
         import math
-        
+
         # Simulate Link0 rotating from 0 to 42 degrees over 10 seconds
         self.sim_time += 0.0167  # ~60Hz
         link0_angle = min(42.0, (self.sim_time / 10.0) * 42.0) * math.pi / 180.0
-        
+
+        # Calculate angular velocity (rad/s) for gyro simulation
+        # Angular velocity = change in angle / time
+        angular_velocity = (42.0 * math.pi / 180.0) / 10.0 if self.sim_time < 10.0 else 0.0
+
         # Generate realistic quaternions for each IMU
         # IMU0: Rotating around Y-axis (Link0)
         w0 = math.cos(link0_angle / 2)
         x0 = 0.0
         y0 = math.sin(link0_angle / 2)
         z0 = 0.0
-        
+        gx0, gy0, gz0 = 0.0, angular_velocity, 0.0  # Rotating around Y-axis
+
         # IMU1: Fixed relative to IMU0 (-58 degrees)
         rel_angle1 = -58.0 * math.pi / 180.0 + link0_angle
         w1 = math.cos(rel_angle1 / 2)
         x1 = 0.0
         y1 = math.sin(rel_angle1 / 2)
         z1 = 0.0
-        
+        gx1, gy1, gz1 = 0.0, angular_velocity, 0.0  # Same angular velocity
+
         # IMU2: Fixed relative to IMU0 (+65 degrees)
         rel_angle2 = 65.0 * math.pi / 180.0 + link0_angle
         w2 = math.cos(rel_angle2 / 2)
         x2 = 0.0
         y2 = math.sin(rel_angle2 / 2)
         z2 = 0.0
-        
-        return [[w0, x0, y0, z0], [w1, x1, y1, z1], [w2, x2, y2, z2]]
+        gx2, gy2, gz2 = 0.0, angular_velocity, 0.0  # Same angular velocity
+
+        if self.include_gyro:
+            return [[w0, x0, y0, z0, gx0, gy0, gz0],
+                    [w1, x1, y1, z1, gx1, gy1, gz1],
+                    [w2, x2, y2, z2, gx2, gy2, gz2]]
+        else:
+            return [[w0, x0, y0, z0],
+                    [w1, x1, y1, z1],
+                    [w2, x2, y2, z2]]
+
+    @staticmethod
+    def quat_to_pitch_deg(w, x, y, z):
+        """
+        Extract twist about the Y-axis from quaternion as a pitch angle in degrees.
+        This returns an angle in [-180, 180] using 2*atan2(y, w), which works for
+        the firmware's PITCH mode (pure Y rotation) and provides a reasonable Y-twist
+        for FULL quaternions. Use _unwrap_angle_deg to make it continuous beyond 180.
+        """
+        import math
+        # Normalize to be safe
+        norm = math.sqrt(w*w + x*x + y*y + z*z)
+        if norm > 0.0:
+            w, x, y, z = w/norm, x/norm, y/norm, z/norm
+        # Y-axis twist angle from quaternion
+        angle = 2.0 * math.degrees(math.atan2(y, w))
+        # Map to (-180, 180]
+        if angle <= -180.0:
+            angle += 360.0
+        elif angle > 180.0:
+            angle -= 360.0
+        return angle
+
+    def _unwrap_angle_deg(self, current_deg, key):
+        """Simple unwrap across +-180 using per-key state (key can be IMU index)."""
+        state = self._unwrap_state.get(key)
+        if state is None:
+            self._unwrap_state[key] = {"last": current_deg, "offset": 0.0}
+            return current_deg
+        last = state["last"]
+        offset = state["offset"]
+        delta = current_deg - last
+        if delta > 180.0:
+            offset -= 360.0
+        elif delta < -180.0:
+            offset += 360.0
+        state["last"] = current_deg
+        state["offset"] = offset
+        return current_deg + offset
 
     def read_imus(self):
         """
         Read IMU data from serial port or simulation.
-        Returns: list of 3 quaternion arrays [[w0,x0,y0,z0], [w1,x1,y1,z1], [w2,x2,y2,z2]]
-        or None if no valid data available
+        Returns: list of N arrays, each containing [w, x, y, z] plus gyro (gx, gy, gz)
+                 and optional pitch (deg) depending on include_gyro/include_pitch settings;
+                 or None if no valid data available
         """
         if self.simulation_mode:
             return self.generate_simulation_data()
-            
+
         if not self.ser or not self.ser.is_open:
-            print("Serial port not connected")
             return None
 
         try:
@@ -148,13 +235,22 @@ class USBSerialReader:
                 if line:
                     return self.parse_imu_line(line)
             return None
-
         except serial.SerialException as e:
             print(f"Serial read error: {e}")
             return None
-        except Exception as e:
-            print(f"Unexpected error reading serial: {e}")
-            return None
+
+
+    def iter_stream(self, sleep_s=0.0):
+        """Generator that yields parsed IMU data as it arrives."""
+        try:
+            while True:
+                data = self.read_imus()
+                if data is not None:
+                    yield data
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+        finally:
+            self.close()
 
     def close(self):
         """Close the serial connection"""
@@ -167,115 +263,35 @@ class USBSerialReader:
         self.close()
 
 
-def quat_to_euler_nwu(w, x, y, z):
-    """
-    Convert quaternion to Euler angles in NWU convention.
-    Returns: (roll, pitch, yaw) in degrees
-    """
-    # Roll (X-axis rotation)
-    sinr_cosp = 2 * (w * x + y * z)
-    cosr_cosp = 1 - 2 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-    
-    # Pitch (Y-axis rotation)
-    sinp = 2 * (w * y - z * x)
-    if abs(sinp) >= 1:
-        pitch = math.copysign(math.pi / 2, sinp)  # Use 90 degrees if out of range
-    else:
-        pitch = math.asin(sinp)
-    
-    # Yaw (Z-axis rotation)
-    siny_cosp = 2 * (w * z + x * y)
-    cosy_cosp = 1 - 2 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-    
-    return (math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
-
-
-def check_yaw_constraint(imu_data):
-    """
-    Check if yaw is properly constrained to ~0° for all IMUs.
-    Prints yaw angles and returns max absolute yaw.
-    """
-    max_yaw = 0.0
-    print("Yaw constraint check:")
-    
-    for i, quat in enumerate(imu_data):
-        w, x, y, z = quat
-        roll, pitch, yaw = quat_to_euler_nwu(w, x, y, z)
-        abs_yaw = abs(yaw)
-        max_yaw = max(max_yaw, abs_yaw)
-        
-        print(f"  IMU{i}: Yaw={yaw:6.2f}°, Pitch={pitch:6.2f}°, Roll={roll:6.2f}°")
-    
-    if max_yaw < 5.0:
-        print(f"✓ Yaw constraint working well (max: {max_yaw:.2f}°)")
-    else:
-        print(f"⚠ Yaw constraint may have issues (max: {max_yaw:.2f}°)")
-    
-    return max_yaw
-
-
-def analyze_quaternion_components(imu_data):
-    """
-    Analyze which quaternion components are changing to understand rotation axes.
-    """
-    print("Quaternion component analysis:")
-    
-    for i, quat in enumerate(imu_data):
-        w, x, y, z = quat
-        magnitude = math.sqrt(w*w + x*x + y*y + z*z)
-        
-        print(f"  IMU{i}: |q|={magnitude:.4f}, w={w:7.4f}, x={x:7.4f}, y={y:7.4f}, z={z:7.4f}")
-        
-        # Dominant component analysis
-        components = {'w': abs(w), 'x': abs(x), 'y': abs(y), 'z': abs(z)}
-        dominant = max(components, key=components.get)
-        print(f"    Dominant component: {dominant} ({components[dominant]:.4f})")
-    print()
-
-
-def receive_pico_data_debug():
-    """Debug function to continuously display incoming data"""
+if __name__ == "__main__":
+    # Minimal interactive example: print SPS and first IMU snippet
     reader = USBSerialReader()
-    counter = 0
-    start_time = time.time()
-
+    reader.send_handshake_config(sensor_count=3, sample_rate=120, qmode="FULL", lpf_enabled=1, lpf_alpha=0.995)
+    t0 = time.time()
+    n = 0
     try:
-        print("Starting debug data reception...")
         while True:
-            imu_data = reader.read_imus()
-            if imu_data is not None:
-                elapsed_time = time.time() - start_time
-                counter += 1
-
-                if elapsed_time >= 1:
-                    print(f"Samples per second: {counter}")
-                    counter = 0
-                    start_time = time.time()
-
-                # Print formatted IMU data with analysis
-                print("IMU Data:")
-                for i, imu in enumerate(imu_data):
-                    print(f"  IMU{i}: w={imu[0]:7.4f}, x={imu[1]:7.4f}, y={imu[2]:7.4f}, z={imu[3]:7.4f}")
-                
-                # Check yaw constraint and analyze components
-                check_yaw_constraint(imu_data)
-                analyze_quaternion_components(imu_data)
-                print("-" * 60)
-
-            time.sleep(0.001)  # 1ms delay for 60Hz real-time control
-
+            data = reader.read_imus()
+            if data is not None:
+                n += 1
+                if time.time() - t0 >= 1.0:
+                    # Compute unwrapped pitch for each IMU from quaternion
+                    pitches = []
+                    for idx, imu in enumerate(data):
+                        if len(imu) >= 4:
+                            w, x, y, z = imu[0:4]
+                            p = reader.quat_to_pitch_deg(w, x, y, z)
+                            p_unwrapped = reader._unwrap_angle_deg(p, key=idx)
+                            pitches.append(round(p_unwrapped, 2))
+                    ts = reader.last_timestamp_us
+                    if ts is not None:
+                        print(f"SPS={n}, ts_us={ts}, unwrapped pitch(deg) per IMU={pitches}")
+                    else:
+                        print(f"SPS={n}, unwrapped pitch(deg) per IMU={pitches}")
+                    n = 0
+                    t0 = time.time()
+            time.sleep(0.001)
     except KeyboardInterrupt:
-        print("Stopping debug reception...")
+        pass
     finally:
         reader.close()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "debug":
-        receive_pico_data_debug()
-    else:
-        print("USB Serial Reader Module")
-        print("Usage: python usb_serial_reader.py [debug]")
-        print("  debug: Run continuous debug output")

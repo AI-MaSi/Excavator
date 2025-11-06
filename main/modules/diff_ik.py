@@ -2,19 +2,18 @@
 Differential IK controller with numpy+numba optimization.
 
 IMPORTANT: Origin and end-effector offset handling:
-- forward_kinematics(): Returns joint positions (includes origin_offset, no ee_offset)
-- forward_kinematics_with_ee_offset(): Returns (joint_positions, ee_position) tuple (both offsets applied)
 - get_joint_positions(): Returns joint positions (includes origin_offset, no ee_offset)
-- get_end_effector_position(): Returns actual end-effector position (both offsets applied)
-- get_end_effector_orientation(): Returns end-effector orientation (same as last joint)
+- get_pose(): Returns (ee_position, ee_orientation) tuple with both offsets applied
 - origin_offset: Applied to all positions - shifts entire robot from world origin
 - ee_offset: Applied in last joint's local coordinate frame - extends end-effector
 
-To avoid confusion:
-- All functions now include origin_offset in their position outputs
-- Use get_end_effector_position() and get_end_effector_orientation() for control
-- The IK controller automatically uses correct positions with both offsets
+Notes:
+- All quaternions are float32 and use [w, x, y, z] convention
+- We assume FULL IMU quaternions on input; we explicitly project to joint axes
+  (e.g., Y for boom/arm/bucket) before kinematics and IK.
+- Base rotation propagation handles slew (Z-axis) from encoder.
 """
+
 
 
 
@@ -29,6 +28,47 @@ from modules.quaternion_math import (
     quat_from_axis_angle, axis_angle_from_quat, wrap_to_pi, compute_pose_error,
     apply_delta_pose
 )
+
+
+# ----------------------------
+# Axis-rotation helpers (FULL input -> axis twist)
+# ----------------------------
+
+def extract_axis_rotation(quat: np.ndarray, axis: np.ndarray) -> float:
+    """
+    Extract twist angle about `axis` from quaternion `quat` using swing–twist.
+
+    Args:
+        quat: [w, x, y, z] unit quaternion (will be normalized)
+        axis: [3] unit axis (will be normalized)
+
+    Returns:
+        angle (radians) in (-pi, pi]
+    """
+    q = quat_normalize(np.asarray(quat, dtype=np.float32))
+    a = np.asarray(axis, dtype=np.float32)
+    a = a / (np.linalg.norm(a) + 1e-12)
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    v = np.array([x, y, z], dtype=np.float32)
+    s = float(np.dot(v, a))  # signed component along axis
+    ang = 2.0 * np.arctan2(s, w)
+    return float(wrap_to_pi(np.float32(ang))[()])
+
+
+def project_to_rotation_axes(quats: np.ndarray, axes: np.ndarray) -> np.ndarray:
+    """
+    Project each quaternion to a pure rotation about its corresponding axis.
+    Input quats are assumed FULL; output quats have only axis twist preserved.
+    """
+    quats = np.asarray(quats, dtype=np.float32)
+    axes = np.asarray(axes, dtype=np.float32)
+    out = np.zeros_like(quats, dtype=np.float32)
+    for i in range(len(quats)):
+        axis = axes[i]
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        theta = extract_axis_rotation(quats[i], axis)
+        out[i] = quat_from_axis_angle(axis, np.float32(theta))
+    return out
 
 
 @dataclass
@@ -322,152 +362,6 @@ class IKController:
         return np.diag(w)
 
 
-class SimpleIKController:
-    """Simple differential IK controller.
-
-    - No direction-based joint weighting
-    - No joint velocity weighting
-    - Minimal configuration (just k_val and method-specific params)
-    """
-
-    def __init__(self, cfg: IKControllerConfig, robot_config: RobotConfig):
-        self.cfg = cfg
-        self.robot_config = robot_config
-
-        # Target pose buffers
-        self.ee_pos_des = np.zeros(3, dtype=np.float32)
-        self.ee_quat_des = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self._command = np.zeros(self.action_dim, dtype=np.float32)
-
-    @property
-    def action_dim(self) -> int:
-        """Command dimension based on configuration."""
-        if self.cfg.command_type == "position":
-            return 3
-        elif self.cfg.command_type == "pose" and self.cfg.use_relative_mode:
-            return 6  # (dx, dy, dz, rx, ry, rz)
-        else:
-            return 7  # (x, y, z, qw, qx, qy, qz)
-
-    def reset(self):
-        """Reset controller state."""
-        self.ee_pos_des.fill(0.0)
-        self.ee_quat_des = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self._command.fill(0.0)
-
-    def set_command(self, command: np.ndarray, ee_pos: np.ndarray = None, ee_quat: np.ndarray = None):
-        """Set target end-effector command."""
-        self._command = np.asarray(command, dtype=np.float32)
-
-        if self.cfg.command_type == "position":
-            if ee_quat is None:
-                raise ValueError("ee_quat required for position command type")
-
-            if self.cfg.use_relative_mode:
-                if ee_pos is None:
-                    raise ValueError("ee_pos required for relative mode")
-                self.ee_pos_des = np.asarray(ee_pos, dtype=np.float32) + self._command
-                self.ee_quat_des = np.asarray(ee_quat, dtype=np.float32)
-            else:
-                self.ee_pos_des = self._command.copy()
-                self.ee_quat_des = np.asarray(ee_quat, dtype=np.float32)
-        else:  # pose command
-            if self.cfg.use_relative_mode:
-                if ee_pos is None or ee_quat is None:
-                    raise ValueError("ee_pos and ee_quat required for relative pose mode")
-                self.ee_pos_des, self.ee_quat_des = apply_delta_pose(
-                    np.asarray(ee_pos, dtype=np.float32), np.asarray(ee_quat, dtype=np.float32), self._command
-                )
-            else:
-                self.ee_pos_des = self._command[0:3].copy()
-                self.ee_quat_des = self._command[3:7].copy()
-
-    def compute(self, ee_pos: np.ndarray, ee_quat: np.ndarray, joint_angles: np.ndarray, joint_quats: np.ndarray) -> np.ndarray:
-        """Compute target joint angles for desired end-effector pose.
-
-        Args:
-            ee_pos: Current end-effector position [x, y, z]
-            ee_quat: Current end-effector quaternion [w, x, y, z]
-            joint_angles: Current joint angles in radians
-            joint_quats: Current joint quaternions from IMUs
-
-        Returns:
-            Target joint angles
-        """
-        ee_pos = np.asarray(ee_pos, dtype=np.float32)
-        ee_quat = np.asarray(ee_quat, dtype=np.float32)
-        joint_angles = np.asarray(joint_angles, dtype=np.float32)
-
-        # Handle quaternions: use IMU data if available
-        if joint_quats is not None:
-            joint_quats = np.asarray(joint_quats, dtype=np.float32)
-        else:
-            # Create quaternions from joint angles
-            joint_quats = np.zeros((self.robot_config.num_joints, 4), dtype=np.float32)
-            for i in range(self.robot_config.num_joints):
-                axis = self.robot_config.rotation_axes[i]
-                angle = joint_angles[i] if i < len(joint_angles) else 0.0
-                joint_quats[i] = quat_from_axis_angle(axis, angle)
-
-        # Compute Jacobian (no weighting)
-        jacobian = compute_jacobian(joint_quats, self.robot_config)
-
-        # Compute pose error and solve IK
-        if self.cfg.command_type == "position":
-            position_error = self.ee_pos_des - ee_pos
-            jacobian_pos = jacobian[0:3, :]
-            delta_joint_angles = self._compute_delta_joint_angles(position_error, jacobian_pos)
-        else:
-            position_error, axis_angle_error = compute_pose_error(
-                ee_pos, ee_quat, self.ee_pos_des, self.ee_quat_des
-            )
-
-            # PROJECT orientation error to Y-axis only (excavator boom control)
-            # We only control Y-rotation (pitch/tilt) at the end-effector
-            # Z-rotation (yaw) comes from slew for XY positioning, not a control objective
-            # X-rotation (roll) is not achievable with this robot configuration
-            y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            y_component = np.dot(axis_angle_error, y_axis)
-            axis_angle_error_y_only = y_component * y_axis
-
-            # Apply position/rotation weighting
-            pos_weight = self.cfg.ik_params.get("position_weight", 1.0)
-            rot_weight = self.cfg.ik_params.get("rotation_weight", 1.0)
-
-            pose_error = np.concatenate([
-                np.float32(pos_weight) * position_error,
-                np.float32(rot_weight) * axis_angle_error_y_only
-            ])
-
-            delta_joint_angles = self._compute_delta_joint_angles(pose_error, jacobian)
-
-        return joint_angles + delta_joint_angles
-
-    def _compute_delta_joint_angles(self, delta_pose: np.ndarray, jacobian: np.ndarray) -> np.ndarray:
-        """Compute joint angle changes using specified IK method (no joint weighting)."""
-        delta_pose = np.asarray(delta_pose, dtype=np.float32)
-        jacobian = np.asarray(jacobian, dtype=np.float32)
-
-        # Identity weight matrix (no joint weighting)
-        w_inv = np.eye(jacobian.shape[1], dtype=np.float32)
-
-        if self.cfg.ik_method == "pinv":
-            return ik_method_pinv(jacobian, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
-        elif self.cfg.ik_method == "svd":
-            return ik_method_svd(
-                jacobian, delta_pose,
-                np.float32(self.cfg.ik_params["k_val"]),
-                np.float32(self.cfg.ik_params["min_singular_value"]),
-                w_inv
-            )
-        elif self.cfg.ik_method == "trans":
-            return ik_method_transpose(jacobian, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
-        elif self.cfg.ik_method == "dls":
-            return ik_method_damped_least_squares(jacobian, delta_pose, np.float32(self.cfg.ik_params["lambda_val"]), w_inv)
-        else:
-            raise ValueError(f"Unknown IK method: {self.cfg.ik_method}")
-
-
 # Numba-optimized kinematics functions
 
 
@@ -672,141 +566,7 @@ def apply_imu_offsets(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.nd
 
 
 
-class AngleUnwrapper:
-    """
-    Angle unwrapping filter for continuous joint angle tracking.
-    Handles quaternion -> angle wrap-around issues at ±π boundaries.
-    Provides encoder-like continuous angle streams for PID controllers.
-    """
-    
-    def __init__(self, num_joints: int = 3):
-        self.num_joints = num_joints
-        self.prev_unwrapped_angles = None
-        self.is_initialized = False
-        
-    def unwrap_angles(self, raw_wrapped_angles: np.ndarray) -> np.ndarray:
-        """
-        Apply angle unwrapping to maintain continuity.
-        
-        Args:
-            raw_wrapped_angles: Array of angles in [-π, π] from quaternion extraction
-            
-        Returns:
-            Continuous unwrapped angles that can exceed ±π for smooth PID control
-        """
-        raw_wrapped_angles = np.asarray(raw_wrapped_angles, dtype=np.float32)
-        
-        if not self.is_initialized:
-            # First reading: use as-is, no unwrapping needed
-            self.prev_unwrapped_angles = raw_wrapped_angles.copy()
-            self.is_initialized = True
-            return raw_wrapped_angles
-            
-        unwrapped_angles = np.zeros_like(raw_wrapped_angles)
-        
-        for i in range(len(raw_wrapped_angles)):
-            raw_angle = raw_wrapped_angles[i]
-            prev_unwrapped = self.prev_unwrapped_angles[i]
-            
-            # Calculate what the previous angle would be if wrapped to [-π, π]
-            prev_wrapped = np.arctan2(np.sin(prev_unwrapped), np.cos(prev_unwrapped))
-            
-            # Calculate the wrapped difference
-            diff = raw_angle - prev_wrapped
-            
-            # Detect wrap-around jumps and correct them
-            if diff > np.pi:
-                # Jumped from +π to -π (e.g., +179° -> -179°)
-                unwrapped_angle = prev_unwrapped + diff - 2*np.pi
-            elif diff < -np.pi:
-                # Jumped from -π to +π (e.g., -179° -> +179°)
-                unwrapped_angle = prev_unwrapped + diff + 2*np.pi
-            else:
-                # Normal case: no wrap-around
-                unwrapped_angle = prev_unwrapped + diff
-                
-            unwrapped_angles[i] = unwrapped_angle
-        
-        # Update state for next iteration
-        self.prev_unwrapped_angles = unwrapped_angles.copy()
-        return unwrapped_angles
-        
-    def reset(self):
-        """Reset unwrapper state (e.g., on system restart)."""
-        self.prev_unwrapped_angles = None
-        self.is_initialized = False
-
-
-@numba.njit(fastmath=False)
-def extract_axis_rotation(quat, axis):
-    """Extract rotation angle around specified axis from quaternion.
-    
-    Note: Assumes quat is already normalized
-    For Y-axis rotations, handles quaternion sign ambiguity for >90° rotations.
-    Optimized for excavator use (limited rotation ranges, no fast motion).
-    """
-    quat = np.asarray(quat, dtype=np.float32)
-    axis = np.asarray(axis, dtype=np.float32)
-
-    # Check if this is Y-axis extraction (excavator joints are Y-axis)
-    if np.allclose(axis, np.array([0.0, 1.0, 0.0], dtype=np.float32)):
-        # Robust Y-axis extraction with quaternion sign ambiguity handling
-        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-        # Method 1: Direct extraction with original quaternion
-        angle_1 = np.float32(2.0) * np.arctan2(y, w)
-        
-        # Method 2: Try negated quaternion (handles sign ambiguity)
-        # For quaternion sign ambiguity, try -quat which represents same rotation
-        neg_quat = -quat
-        neg_w, neg_x, neg_y, neg_z = neg_quat[0], neg_quat[1], neg_quat[2], neg_quat[3]
-        angle_2 = np.float32(2.0) * np.arctan2(neg_y, neg_w)
-        
-        # Try both original and negated quaternion and choose more reasonable result
-        wrapped_angle1 = wrap_to_pi(angle_1)[()]
-        wrapped_angle2 = wrap_to_pi(angle_2)[()]
-        
-        # Since axis projection works correctly (x,z = 0), use a simpler hemisphere check
-        # For Y-axis rotations, both +q and -q represent the same rotation
-        # Choose the quaternion that gives the smaller magnitude angle (closer to 0)
-        if abs(wrapped_angle2) < abs(wrapped_angle1):
-            return wrapped_angle2
-        
-        # Default: return the wrapped angle from original quaternion
-        return wrapped_angle1
-    else:
-        # For other axes, use the general axis-angle projection method
-        axis_angle = axis_angle_from_quat(quat)
-        projected_magnitude = np.dot(np.asarray(axis_angle, dtype=np.float32), np.asarray(axis, dtype=np.float32))
-        return wrap_to_pi(projected_magnitude)[()]  # Extract scalar from 0-d array
-
-
-
-
 # Wrapper functions for Numba usage
-def project_to_rotation_axes(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """
-    Project quaternions to only their configured rotation axes (removes yaw for Y-axis joints).
-    This is the universal yaw projection function for debugging.
-
-    Args:
-        quats: Input quaternions [n x 4]
-        robot_config: Robot configuration with rotation axes
-
-    Returns:
-        Projected quaternions with only rotation around specified axes
-    """
-    quats = np.asarray(quats, dtype=np.float32)
-
-    # Create axis-constrained quaternions (removes unwanted rotations like yaw)
-    constrained_quats = np.zeros_like(quats, dtype=np.float32)
-    for i in range(len(quats)):
-        # Extract rotation angle around the specified axis only
-        axis = robot_config.rotation_axes[i]
-        angle = extract_axis_rotation(quats[i], axis)
-        # Create pure single-axis quaternion (eliminates unwanted rotations)
-        constrained_quats[i] = quat_from_axis_angle(axis, angle)
-
-    return constrained_quats
 
 
 def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
@@ -845,12 +605,17 @@ def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.
 
 
 
-
-
 def compute_jacobian(quats: np.ndarray, robot_config: RobotConfig):
-    """Jacobian computation wrapper using RobotConfig."""
+    """Jacobian computation wrapper using RobotConfig.
+
+    Pipeline (FULL input):
+      1) Apply IMU mounting offsets
+      2) Project to joint rotation axes (e.g., Y for boom/arm/bucket)
+      3) Propagate base (slew) rotation to downstream joints
+    """
     quats = np.asarray(quats, dtype=np.float32)
-    constrained_quats = project_to_rotation_axes(quats, robot_config)
+    corrected_quats = apply_imu_offsets(quats, robot_config)
+    constrained_quats = project_to_rotation_axes(corrected_quats, robot_config.rotation_axes)
     propagated_quats = propagate_base_rotation(constrained_quats, robot_config)
     return compute_jacobian_core(
         propagated_quats,
@@ -862,31 +627,15 @@ def compute_jacobian(quats: np.ndarray, robot_config: RobotConfig):
     )
 
 
-def get_end_effector_position(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """Get end-effector position with offset applied.
-
-    Returns:
-        np.ndarray: End-effector position [x, y, z] including ee_offset
-    """
-    constrained_quats = project_to_rotation_axes(quats, robot_config)
-    propagated_quats = propagate_base_rotation(constrained_quats, robot_config)
-    _, ee_position = forward_kinematics_with_ee_offset_core(
-        propagated_quats,
-        robot_config.link_lengths,
-        robot_config.link_directions,
-        robot_config.origin_offset,
-        robot_config.ee_offset
-    )
-    return ee_position
-
-
 def get_joint_positions(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
     """Get joint positions with origin_offset applied (no ee_offset).
 
     Returns:
         np.ndarray: Joint positions [n x 3] including origin_offset, without end-effector offset
     """
-    constrained_quats = project_to_rotation_axes(quats, robot_config)
+    quats = np.asarray(quats, dtype=np.float32)
+    corrected_quats = apply_imu_offsets(quats, robot_config)
+    constrained_quats = project_to_rotation_axes(corrected_quats, robot_config.rotation_axes)
     propagated_quats = propagate_base_rotation(constrained_quats, robot_config)
     return forward_kinematics_core(
         propagated_quats,
@@ -896,24 +645,60 @@ def get_joint_positions(quats: np.ndarray, robot_config: RobotConfig) -> np.ndar
     )
 
 
-def get_end_effector_orientation(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """Get end-effector orientation quaternion.
+def get_all_poses(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Get all joint poses (positions + orientations) and end-effector pose.
 
-    For a serial manipulator, the end-effector orientation is the orientation
-    of the last joint (bucket joint in the excavator case).
+    This is the most comprehensive FK function - returns everything computed.
+    Zero overhead compared to get_pose() since all values are computed anyway.
 
     Args:
         quats: Joint quaternions from IMUs
         robot_config: Robot configuration
 
     Returns:
-        np.ndarray: End-effector orientation quaternion [w, x, y, z]
+        Tuple of:
+        - joint_positions [n x 3]: Position of each joint (with origin_offset)
+        - joint_orientations [n x 4]: Orientation of each joint [w, x, y, z]
+        - ee_position [3]: End-effector position (with origin_offset + ee_offset)
+        - ee_orientation [4]: End-effector orientation [w, x, y, z]
     """
-    constrained_quats = project_to_rotation_axes(quats, robot_config)
+    quats = np.asarray(quats, dtype=np.float32)
+    corrected_quats = apply_imu_offsets(quats, robot_config)
+    constrained_quats = project_to_rotation_axes(corrected_quats, robot_config.rotation_axes)
     propagated_quats = propagate_base_rotation(constrained_quats, robot_config)
 
+    # Get joint positions and ee_position with offsets
+    joint_positions, ee_position = forward_kinematics_with_ee_offset_core(
+        propagated_quats,
+        robot_config.link_lengths,
+        robot_config.link_directions,
+        robot_config.origin_offset,
+        robot_config.ee_offset
+    )
+
+    # Joint orientations are the propagated quaternions
+    joint_orientations = propagated_quats.copy()
+
     # End-effector orientation is the last joint's orientation
-    return propagated_quats[-1].copy()
+    ee_orientation = propagated_quats[-1].copy()
+
+    return joint_positions, joint_orientations, ee_position, ee_orientation
+
+
+def get_pose(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndarray, np.ndarray]:
+    """Get end-effector pose (position and orientation) only.
+
+    Convenience wrapper around get_all_poses() for when you only need EE pose.
+
+    Args:
+        quats: Joint quaternions from IMUs
+        robot_config: Robot configuration
+
+    Returns:
+        Tuple of (ee_position [x, y, z], ee_orientation [w, x, y, z])
+    """
+    _, _, ee_position, ee_orientation = get_all_poses(quats, robot_config)
+    return ee_position, ee_orientation
 
 
 def warmup_numba_functions():

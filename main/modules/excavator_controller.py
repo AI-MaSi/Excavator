@@ -27,37 +27,22 @@ from .quaternion_math import quat_from_axis_angle
 @dataclass
 class ControllerConfig:
     """Configuration for the excavator controller."""
-    kp0: float = 5.0   # 5.0 # Slew
-    ki0: float = 0.20    # 0.2
-    kd0: float = 0.00   # 0.0
+    kp0: float = 0.9 # slew
+    ki0: float = 0.0
+    kd0: float = 0.0
 
-    # 29.10.2025 pwm control update!
+    kp1: float = 6.0 # lift
+    ki1: float = 0.5
+    kd1: float = 0.0
 
-    #kp1: float = 15.0 # 15.0 # lift
-    #ki1: float = 4.0  # 2.0
-    #kd1: float = 1.0  # 1.0
+    kp2: float = 5.0 # tilt
+    ki2: float = 0.25
+    kd2: float = 0.0
 
-    #kp2: float = 10.0 # 10.0  # tilt
-    #ki2: float = 4.0  # 2.0
-    #kd2: float = 0.2  # 0.2
-
-    #kp3: float = 10.0  # 10.0  # scoop
-    #ki3: float = 2.0  # 2.0
-    #kd3: float = 0.2  # 0.2
-
-    # 01.11.2025 pwm control update!
-
-    kp1: float = 15.0 # 15.0 # lift
-    ki1: float = 4.0  # 2.0
-    kd1: float = 1.0  # 1.0
-
-    kp2: float = 10.0 # 10.0  # tilt
-    ki2: float = 4.0  # 2.0
-    kd2: float = 0.2  # 0.2
-
-    kp3: float = 10.0  # 10.0  # scoop
-    ki3: float = 2.0  # 2.0
-    kd3: float = 0.2  # 0.2
+    # pretty bad still
+    kp3: float = 8.0 # scoop
+    ki3: float = 1.0
+    kd3: float = 0.0
 
     output_limits: Tuple[float, float] = (-1.0, 1.0)
     control_frequency: float = 100.0  # Hz
@@ -71,6 +56,24 @@ class ExcavatorController:
         self.hardware = hardware_interface
         self.config = config or ControllerConfig()
         self._enable_perf_tracking = enable_perf_tracking
+        # Cascade perf flag to hardware if supported (no-op otherwise)
+        try:
+            if hasattr(self.hardware, 'set_perf_enabled'):
+                self.hardware.set_perf_enabled(bool(enable_perf_tracking))
+        except Exception:
+            pass
+
+        # Adopt control loop rate from general config when no explicit config is provided
+        try:
+            if config is None and hasattr(self.hardware, 'get_status'):
+                # Try to fetch general config if hardware exposes it
+                gc = getattr(self.hardware, '_general_config', None)
+                if isinstance(gc, dict):
+                    control_hz = gc.get('rates', {}).get('control_hz')
+                    if isinstance(control_hz, (int, float)) and control_hz > 0:
+                        self.config.control_frequency = float(control_hz)
+        except Exception:
+            pass
 
         # Robot configuration
         self.robot_config = diff_ik.create_excavator_config()
@@ -88,17 +91,15 @@ class ExcavatorController:
                 "lambda_val": 0.08,
                 "position_weight": 1.0,
                 "rotation_weight": 1.0,
-                # Direction-based joint prioritization
-                # Note: not used with SimpleIKController!
-                "joint_weights": [1.0, 1.0, 1.0, 1.0], #None,
-                # "direction_strengths_X": [1.0, 1.0, 0.1, 1.0],  # Deprecated: removed in IK; using joint_weights only
-                # "direction_strengths_Y": [1.0, 1.0, 1.0, 1.0],  # Deprecated
-                # "direction_strengths_Z": [1.0, 1.0, 1.0, 1.0],  # Deprecated
-                # "direction_scale_range": [0.5, 1.5]  # Deprecated
+                "joint_weights": [1.0, 1.0, 1.0, 1.0],
+
             }
         )
         self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config)  # Advanced with weighting
-        #self.ik_controller = diff_ik.SimpleIKController(self.ik_config, self.robot_config)  # Simple baseline
+
+        # Relative IK control parameters (pulling toward target)
+        self._relative_pos_gain = 0.2   # fraction of position error per control step
+        self._relative_rot_gain = 0.4   # fraction of orientation error (axis-angle) per step
 
         # PID controllers for joints
         joint_configs = [
@@ -217,6 +218,25 @@ class ExcavatorController:
         # We're about to actively command again
         self._outputs_zeroed = False
 
+    def set_relative_control(self, enabled: bool, pos_gain: Optional[float] = None, rot_gain: Optional[float] = None) -> None:
+        """Enable/disable relative IK mode and optionally set gains.
+
+        Args:
+            enabled: Whether to use relative mode (delta pose commands)
+            pos_gain: Fraction of position error to apply each step (optional)
+            rot_gain: Fraction of orientation error (axis-angle) to apply each step (optional)
+        """
+        self.ik_config.use_relative_mode = bool(enabled)
+        # Reset IK internal buffers when toggling modes
+        try:
+            self.ik_controller.reset()
+        except Exception:
+            pass
+        if pos_gain is not None:
+            self._relative_pos_gain = float(pos_gain)
+        if rot_gain is not None:
+            self._relative_rot_gain = float(rot_gain)
+
     def clear_target(self) -> None:
         """Clear the current IK target and reset controller state.
 
@@ -284,7 +304,7 @@ class ExcavatorController:
             # Calculate CPU usage percentage (compute time / total time)
             cpu_usage_pct = (np.mean(compute_times_ms) / target_period_ms) * 100.0
 
-            return {
+            stats = {
                 'avg_loop_time_ms': float(np.mean(loop_times_ms)),
                 'min_loop_time_ms': float(np.min(loop_times_ms)),
                 'max_loop_time_ms': float(np.max(loop_times_ms)),
@@ -300,6 +320,23 @@ class ExcavatorController:
                 'sample_count': self._loop_count
             }
 
+        # Optionally merge hardware perf stats (kept outside perf_lock to avoid long holds)
+        try:
+            if self._enable_perf_tracking and hasattr(self.hardware, 'get_perf_stats'):
+                hw = self.hardware.get_perf_stats() or {}
+                # Provide convenient top-level Hz if available
+                imu_hz = hw.get('imu', {}).get('hz')
+                adc_hz = hw.get('adc', {}).get('hz')
+                if imu_hz is not None:
+                    stats['imu_hz'] = float(imu_hz)
+                if adc_hz is not None:
+                    stats['adc_hz'] = float(adc_hz)
+                stats['hardware_stats'] = hw
+        except Exception:
+            pass
+
+        return stats
+
     def reset_performance_stats(self) -> None:
         """Reset performance statistics."""
         with self._perf_lock:
@@ -307,13 +344,18 @@ class ExcavatorController:
             self._compute_times = []
             self._timing_violations = 0
             self._loop_count = 0
+        try:
+            if self._enable_perf_tracking and hasattr(self.hardware, 'reset_perf_stats'):
+                self.hardware.reset_perf_stats()
+        except Exception:
+            pass
 
-    def _get_processed_quaternions(self) -> Optional[np.ndarray]:
+    def _get_raw_quaternions(self) -> Optional[np.ndarray]:
         """
-        Read and process all sensor data into projected quaternions.
+        Read raw sensor data and combine into quaternion array.
 
         Returns:
-            Processed quaternions [slew, boom, arm, bucket] or None if hardware not ready
+            Raw quaternions [slew, boom, arm, bucket] or None if hardware not ready
         """
         try:
             # Read IMU data (3 IMUs: boom, arm, bucket)
@@ -325,18 +367,12 @@ class ExcavatorController:
             slew_quat = self.hardware.read_slew_quaternion()
 
             # Combine: [slew] + [boom, arm, bucket]
-            all_quaternions = [slew_quat] + quaternions
+            all_quaternions = np.array([slew_quat] + quaternions, dtype=np.float32)
 
-            # Apply IMU mounting offset corrections
-            corrected_quats = diff_ik.apply_imu_offsets(all_quaternions, self.robot_config)
-
-            # Project to rotation axes (remove unwanted rotations like yaw)
-            projected_quats = diff_ik.project_to_rotation_axes(corrected_quats, self.robot_config)
-
-            return projected_quats
+            return all_quaternions
 
         except Exception as e:
-            print(f"Error processing quaternions: {e}")
+            print(f"Error reading quaternions: {e}")
             return None
 
     def _control_loop(self) -> None:
@@ -409,14 +445,18 @@ class ExcavatorController:
     def _update_current_state(self) -> None:
         """Update current robot state from sensors."""
         try:
-            # Get processed quaternions from sensors
-            projected_quats = self._get_processed_quaternions()
-            if projected_quats is None:
+            # Get raw quaternions from sensors
+            raw_quats = self._get_raw_quaternions()
+            if raw_quats is None:
                 return
 
-            # Compute forward kinematics
-            ee_pos = diff_ik.get_end_effector_position(projected_quats, self.robot_config)
-            ee_quat = diff_ik.get_end_effector_orientation(projected_quats, self.robot_config)
+            # Compute forward kinematics - get_pose() handles full pipeline
+            ee_pos, ee_quat = diff_ik.get_pose(raw_quats, self.robot_config)
+
+            # Also compute processed quaternions for joint angle extraction in control commands
+            corrected_quats = diff_ik.apply_imu_offsets(raw_quats, self.robot_config)
+            projected_quats = diff_ik.project_to_rotation_axes(corrected_quats, self.robot_config.rotation_axes)
+            propagated_quats = diff_ik.propagate_base_rotation(projected_quats, self.robot_config)
 
             # Extract Y-axis rotation for end-effector orientation
             y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -427,7 +467,7 @@ class ExcavatorController:
             with self._lock:
                 self._current_position = ee_pos
                 self._current_orientation_y_deg = ee_y_angle_deg
-                self._current_projected_quats = projected_quats
+                self._current_projected_quats = propagated_quats  # Cache processed quats for control
 
         except Exception as e:
             print(f"Error in state update: {e}")
@@ -450,7 +490,9 @@ class ExcavatorController:
                 diff_ik.extract_axis_rotation(q, axis)
                 for q, axis in zip(projected_quats, self.robot_config.rotation_axes)
             ])
-            current_ee_quat_full = diff_ik.get_end_effector_orientation(projected_quats, self.robot_config)
+
+            # End-effector orientation is the last joint's orientation (already propagated)
+            current_ee_quat_full = projected_quats[-1].copy()
 
             # Use full orientation (including Z-rotation from slew)
             # The Jacobian's structure naturally constrains which rotations each joint can achieve
@@ -458,14 +500,32 @@ class ExcavatorController:
             current_ee_quat = current_ee_quat_full
 
             # Outer Loop: Task-space IK control
-            if self.ik_config.command_type == "position":
-                # Position-only mode: command is just [x, y, z]
-                position_command = target_pos
-                self.ik_controller.set_command(position_command, ee_quat=current_ee_quat)
+            if self.ik_config.use_relative_mode:
+                # Compute error w.r.t target
+                if self.ik_config.command_type == "position":
+                    pos_err = (target_pos - current_pos)
+                    delta_pos = self._relative_pos_gain * pos_err
+                    self.ik_controller.set_command(delta_pos, ee_pos=current_pos, ee_quat=current_ee_quat)
+                else:
+                    # Pose: 6D delta [dx, dy, dz, rx, ry, rz]
+                    # Compute pose error once; project orientation to Y-axis only to match controller behavior
+                    pos_err, axis_angle_err = diff_ik.compute_pose_error(current_pos, current_ee_quat, target_pos, target_quat)
+                    y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    ry = float(np.dot(axis_angle_err, y_axis))
+                    axis_angle_err_y_only = ry * y_axis
+                    delta_pos = self._relative_pos_gain * pos_err
+                    delta_rot = self._relative_rot_gain * axis_angle_err_y_only
+                    delta_pose = np.concatenate([delta_pos, delta_rot])
+                    self.ik_controller.set_command(delta_pose, ee_pos=current_pos, ee_quat=current_ee_quat)
             else:
-                # Pose mode: command is [x, y, z, qw, qx, qy, qz]
-                pose_command = np.concatenate([target_pos, target_quat])
-                self.ik_controller.set_command(pose_command)
+                if self.ik_config.command_type == "position":
+                    # Position-only mode: command is just [x, y, z]
+                    position_command = target_pos
+                    self.ik_controller.set_command(position_command, ee_quat=current_ee_quat)
+                else:
+                    # Pose mode: command is [x, y, z, qw, qx, qy, qz]
+                    pose_command = np.concatenate([target_pos, target_quat])
+                    self.ik_controller.set_command(pose_command)
 
             target_joint_angles = self.ik_controller.compute(
                 current_pos,

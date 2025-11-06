@@ -36,8 +36,10 @@ class ChannelConfig:
     affects_pump: bool = False
     toggleable: bool = False
 
-    # Simple deadband - jumps over dead zone by compressing command range
-    deadband_us: float = 0.0  # offset from center (us) - working range starts here
+    # Simple deadband (separate per sign) - jumps over dead zone by compressing command range
+    # Offsets from center (us) where the working range starts for positive/negative inputs
+    deadband_us_pos: float = 0.0
+    deadband_us_neg: float = 0.0
 
     # Dither settings to prevent valve stiction - DISABLED by default
     dither_enable: bool = False
@@ -165,8 +167,9 @@ class PWMController:
                     deadzone=cfg.get('deadzone', 0.0),
                     affects_pump=cfg.get('affects_pump', False),
                     toggleable=cfg.get('toggleable', False),
-                    # Simple deadband - jumps over dead zone
-                    deadband_us=cfg.get('deadband_us', 0.0),
+                    # Simple deadband (separate per sign)
+                    deadband_us_pos=float(cfg['deadband_us_pos']),
+                    deadband_us_neg=float(cfg['deadband_us_neg']),
                     # Dither settings - opt-in only
                     dither_enable=cfg.get('dither_enable', False),
                     dither_amp_us=cfg.get('dither_amp_us', 8.0),
@@ -208,9 +211,11 @@ class PWMController:
 
             # Deadband and dither bounds
             rng = config.pulse_max - config.pulse_min
-            # deadband_us should not exceed half of span and must be >=0
-            if float(config.deadband_us) < 0.0 or float(config.deadband_us) > (rng * 0.5):
-                errors.append(f"Channel '{name}': deadband_us is unrealistic (0 .. {rng*0.5:.1f}us)")
+            # deadband_us_pos/neg should not exceed half of span and must be >=0
+            if float(config.deadband_us_pos) < 0.0 or float(config.deadband_us_pos) > (rng * 0.5):
+                errors.append(f"Channel '{name}': deadband_us_pos is unrealistic (0 .. {rng*0.5:.1f}us)")
+            if float(config.deadband_us_neg) < 0.0 or float(config.deadband_us_neg) > (rng * 0.5):
+                errors.append(f"Channel '{name}': deadband_us_neg is unrealistic (0 .. {rng*0.5:.1f}us)")
             # dither amplitude reasonable vs span
             if float(config.dither_amp_us) < 0.0 or float(config.dither_amp_us) > (rng * 0.25):
                 errors.append(f"Channel '{name}': dither_amp_us is unrealistic (0 .. {rng*0.25:.1f}us)")
@@ -340,18 +345,22 @@ class PWMController:
             pulse = config.center
         elif config.direction == 1:
             if value > 0:
-                working_range = config.pulse_max - (config.center + config.deadband_us)
-                pulse = (config.center + config.deadband_us) + value * working_range
+                base = config.center + config.deadband_us_pos
+                working_range = config.pulse_max - base
+                pulse = base + value * working_range
             else:  # value < 0
-                working_range = (config.center - config.deadband_us) - config.pulse_min
-                pulse = (config.center - config.deadband_us) + value * working_range
+                base = config.center - config.deadband_us_neg
+                working_range = base - config.pulse_min
+                pulse = base + value * working_range
         else:  # direction == -1
             if value > 0:
-                working_range = (config.center - config.deadband_us) - config.pulse_min
-                pulse = (config.center - config.deadband_us) - value * working_range
+                base = config.center - config.deadband_us_pos
+                working_range = base - config.pulse_min
+                pulse = base - value * working_range
             else:  # value < 0
-                working_range = config.pulse_max - (config.center + config.deadband_us)
-                pulse = (config.center + config.deadband_us) - value * working_range
+                base = config.center + config.deadband_us_neg
+                working_range = config.pulse_max - base
+                pulse = base - value * working_range
 
         # Dither to prevent valve stiction (only when actively commanding)
         if config.dither_enable and abs(value) >= config.deadzone_threshold:
