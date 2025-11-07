@@ -23,6 +23,8 @@ void initialize_sensors_values(Sensor* sensors) {
         sensors[i].unwrapOffsetDeg = 0.0f;
         sensors[i].zeroOffsetDeg = 0.0f;
         sensors[i].pitchDeg = 0.0f;
+        // Initialize previous quaternion to identity for continuity tracking
+        sensors[i].previousQuaternion = FUSION_IDENTITY_QUATERNION;
     }
 }
 

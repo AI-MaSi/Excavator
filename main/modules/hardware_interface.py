@@ -27,6 +27,26 @@ from .ADC import SimpleADC
 from .quaternion_math import quat_from_axis_angle, wrap_to_pi
 
 
+def _safe_hardware_operation(func):
+    """Decorator that ensures hardware is safely reset (pump stopped, PWM zeroed) on any exception.
+
+    Critical for safety: If any hardware read fails, we must stop the machine before crashing.
+    """
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as e:
+            # CRITICAL SAFETY: Stop pump and reset all PWM channels before propagating error
+            print(f"[SAFETY] Error in {func.__name__}: {e}")
+            print(f"[SAFETY] Stopping pump and resetting all PWM channels...")
+            try:
+                self.reset(reset_pump=True)
+            except Exception as reset_error:
+                print(f"[SAFETY] Warning: Reset failed: {reset_error}")
+            raise
+    return wrapper
+
+
 class EncoderTracker:
     def __init__(self, gear_ratio, min_voltage=0.5, max_voltage=4.5):
         """
@@ -417,72 +437,75 @@ class HardwareInterface:
                 time.sleep(0.1)  # Longer sleep on error
                 next_run_time = time.perf_counter() + 0.1
 
+    @_safe_hardware_operation
     def read_imu_data(self) -> Optional[List[np.ndarray]]:
-        """Read latest IMU data with yaw calibration applied."""
+        """Read latest IMU data with yaw calibration applied.
+
+        Raises on error instead of returning None (SAFETY: PWM reset + pump stopped before raising)
+        """
         # Get latest data atomically - check ready flag inside lock
-        try:
-            with self._imu_lock:
-                if not self.imu_ready:
-                    return None
+        with self._imu_lock:
+            if not self.imu_ready:
+                raise RuntimeError("IMU not ready - cannot read IMU data")
 
-                if self.latest_imu_data is not None:
-                    # Return copy to avoid race conditions
-                    raw_data = [q.copy() for q in self.latest_imu_data]
-                    return raw_data
-                else:
-                    return None
+            if self.latest_imu_data is not None:
+                # Return copy to avoid race conditions
+                raw_data = [q.copy() for q in self.latest_imu_data]
+                return raw_data
+            else:
+                raise RuntimeError("IMU data is None despite ready flag being set")
 
-        except Exception as e:
-            print(f"IMU read error: {e}")
-            return None
-
+    @_safe_hardware_operation
     def read_imu_pitch(self) -> Optional[List[float]]:
-        """Read latest IMU pitch angles (radians) if provided by the serial stream."""
-        try:
-            with self._imu_lock:
-                if not self.imu_ready or self.latest_imu_pitch is None:
-                    return None
-                return list(self.latest_imu_pitch)
-        except Exception as e:
-            print(f"IMU pitch read error: {e}")
-            return None
+        """Read latest IMU pitch angles (radians) if provided by the serial stream.
 
+        Raises on error instead of returning None (SAFETY: PWM reset + pump stopped before raising)
+        """
+        with self._imu_lock:
+            if not self.imu_ready:
+                raise RuntimeError("IMU not ready - cannot read pitch data")
+            if self.latest_imu_pitch is None:
+                raise RuntimeError("IMU pitch data is None (may not be streamed by device)")
+            return list(self.latest_imu_pitch)
+
+    @_safe_hardware_operation
     def read_slew_voltage(self) -> float:
         """
         Read slew encoder voltage from ADC (with EMA filtering).
 
         Returns:
-            Filtered voltage reading from slew encoder, or 0.0 if not ready.
+            Filtered voltage reading from slew encoder
+
+        Raises:
+            RuntimeError: If ADC is not ready or read fails (SAFETY: PWM reset + pump stopped before raising)
         """
-        try:
-            if not self.adc_ready or self.adc is None:
-                return 0.0
-            return self.adc.read_channel("b1", 8)
-        except Exception as e:
-            print(f"ADC read error: {e}")
-            return 0.0
+        if not self.adc_ready or self.adc is None:
+            raise RuntimeError("ADC not ready - cannot read slew voltage")
+        return self.adc.read_channel("b1", 8)
 
+    @_safe_hardware_operation
     def read_slew_angle(self) -> float:
-        """Read latest slew angle in radians."""
-        try:
-            with self._adc_lock:
-                if not self.adc_ready:
-                    return 0.0
-                return self.latest_slew_angle
-        except Exception as e:
-            print(f"Slew angle read error: {e}")
-            return 0.0
+        """Read latest slew angle in radians.
 
+        Raises:
+            RuntimeError: If ADC is not ready (SAFETY: PWM reset + pump stopped before raising)
+        """
+        with self._adc_lock:
+            if not self.adc_ready:
+                raise RuntimeError("ADC not ready - cannot read slew angle")
+            return self.latest_slew_angle
+
+    @_safe_hardware_operation
     def read_slew_quaternion(self) -> np.ndarray:
-        """Read latest slew quaternion [w, x, y, z]."""
-        try:
-            with self._adc_lock:
-                if not self.adc_ready:
-                    return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                return self.latest_slew_quat.copy()
-        except Exception as e:
-            print(f"Slew quaternion read error: {e}")
-            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        """Read latest slew quaternion [w, x, y, z].
+
+        Raises:
+            RuntimeError: If ADC is not ready (SAFETY: PWM reset + pump stopped before raising)
+        """
+        with self._adc_lock:
+            if not self.adc_ready:
+                raise RuntimeError("ADC not ready - cannot read slew quaternion")
+            return self.latest_slew_quat.copy()
 
     def send_pwm_commands(self, commands: Dict[str, float]) -> bool:
         """Send PWM commands by name (compat wrapper)."""

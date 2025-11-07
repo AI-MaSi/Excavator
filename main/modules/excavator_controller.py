@@ -17,11 +17,27 @@ import threading
 import numpy as np
 from typing import Optional, Tuple
 from dataclasses import dataclass
+import sys
+import os
 
 # Import project modules
 from . import diff_ik
 from .pid import PIDController
-from .quaternion_math import quat_from_axis_angle
+from .quaternion_math import (
+    quat_from_axis_angle,
+    euler_xyz_from_quat,
+    quat_from_euler_xyz,
+)
+
+# Load IRL settings exclusively from configuration_files/pathing_config.py (fail hard if missing)
+_here = os.path.dirname(os.path.abspath(__file__))
+_cfg_dir = os.path.abspath(os.path.join(_here, os.pardir, 'configuration_files'))
+_cfg_file = os.path.join(_cfg_dir, 'pathing_config.py')
+if _cfg_dir not in sys.path:
+    sys.path.append(_cfg_dir)
+if not os.path.isfile(_cfg_file):
+    raise ImportError("configuration_files/pathing_config.py not found (copy required for IRL)")
+from pathing_config import DEFAULT_CONFIG as _DEFAULT_CONFIG  # type: ignore
 
 
 @dataclass
@@ -79,27 +95,50 @@ class ExcavatorController:
         self.robot_config = diff_ik.create_excavator_config()
         diff_ik.warmup_numba_functions()
 
-        # IK controller setup
-        self.ik_config = diff_ik.IKControllerConfig(
-            command_type="pose",  # Full 6DOF control (position + orientation)
-            #command_type="position",  # Position-only control (no orientation)
-            ik_method="svd",
-            use_relative_mode=False,
-            ik_params={
-                "k_val": 1.0,
-                "min_singular_value": 1e-4,
-                "lambda_val": 0.08,
-                "position_weight": 1.0,
-                "rotation_weight": 1.0,
-                "joint_weights": [1.0, 1.0, 1.0, 1.0],
+        # IK controller setup (pull settings from shared config when available)
+        if _DEFAULT_CONFIG is not None:
+            _ik_cmd_type = getattr(_DEFAULT_CONFIG, 'ik_command_type', 'pose')
+            _ik_method = getattr(_DEFAULT_CONFIG, 'ik_method', 'svd')
+            _ik_rel = bool(getattr(_DEFAULT_CONFIG, 'ik_use_relative_mode', False))
+            _ik_params = getattr(_DEFAULT_CONFIG, 'ik_params', None)
+        else:
+            raise RuntimeError("ExcavatorController requires configuration_files/pathing_config.py")
 
-            }
+        self.ik_config = diff_ik.IKControllerConfig(
+            command_type=_ik_cmd_type,
+            ik_method=_ik_method,
+            use_relative_mode=_ik_rel,
+            ik_params=_ik_params,
         )
         self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config)  # Advanced with weighting
 
         # Relative IK control parameters (pulling toward target)
-        self._relative_pos_gain = 0.2   # fraction of position error per control step
-        self._relative_rot_gain = 0.4   # fraction of orientation error (axis-angle) per step
+        if _DEFAULT_CONFIG is not None:
+            self._relative_pos_gain = float(getattr(_DEFAULT_CONFIG, 'relative_pos_gain', 0.2))
+            self._relative_rot_gain = float(getattr(_DEFAULT_CONFIG, 'relative_rot_gain', 0.4))
+        else:
+            self._relative_pos_gain = 0.2   # fraction of position error per control step
+            self._relative_rot_gain = 0.4   # fraction of orientation error (axis-angle) per step
+
+        # Orientation locks (hardware capability mapping) from shared config if available
+        if _DEFAULT_CONFIG is not None:
+            self._lock_roll = bool(getattr(_DEFAULT_CONFIG, 'lock_roll', True))
+            self._lock_pitch = bool(getattr(_DEFAULT_CONFIG, 'lock_pitch', False))
+            self._lock_yaw = bool(getattr(_DEFAULT_CONFIG, 'lock_yaw', True))
+        else:
+            # Safe defaults for excavator: lock roll & yaw, allow pitch
+            self._lock_roll = True
+            self._lock_pitch = False
+            self._lock_yaw = True
+
+        # Optionally adopt control loop rate from shared config when not explicitly provided
+        try:
+            if config is None and _DEFAULT_CONFIG is not None:
+                hz = float(getattr(_DEFAULT_CONFIG, 'update_frequency', self.config.control_frequency))
+                if hz > 0:
+                    self.config.control_frequency = hz
+        except Exception:
+            pass
 
         # PID controllers for joints
         joint_configs = [
@@ -217,6 +256,31 @@ class ExcavatorController:
             self._target_orientation = quat_from_axis_angle(y_axis, y_rotation_rad)
         # We're about to actively command again
         self._outputs_zeroed = False
+
+    def _apply_orientation_locks(self, current_ee_quat: np.ndarray, desired_quat: np.ndarray) -> np.ndarray:
+        """Copy locked axes (roll=x, pitch=y, yaw=z) from current EE to desired.
+
+        Uses Euler XYZ convention in base frame. Slew yaw propagation is preserved
+        because current_ee_quat includes the high-accuracy slew yaw.
+        """
+        if not (self._lock_roll or self._lock_pitch or self._lock_yaw):
+            return desired_quat
+
+        # Convert to Euler
+        r_cur, p_cur, y_cur = euler_xyz_from_quat(current_ee_quat)
+        r_des, p_des, y_des = euler_xyz_from_quat(desired_quat)
+
+        r = r_des
+        p = p_des
+        y = y_des
+        if self._lock_roll:
+            r = r_cur
+        if self._lock_pitch:
+            p = p_cur
+        if self._lock_yaw:
+            y = y_cur
+
+        return quat_from_euler_xyz(r, p, y)
 
     def set_relative_control(self, enabled: bool, pos_gain: Optional[float] = None, rot_gain: Optional[float] = None) -> None:
         """Enable/disable relative IK mode and optionally set gains.
@@ -508,13 +572,13 @@ class ExcavatorController:
                     self.ik_controller.set_command(delta_pos, ee_pos=current_pos, ee_quat=current_ee_quat)
                 else:
                     # Pose: 6D delta [dx, dy, dz, rx, ry, rz]
-                    # Compute pose error once; project orientation to Y-axis only to match controller behavior
-                    pos_err, axis_angle_err = diff_ik.compute_pose_error(current_pos, current_ee_quat, target_pos, target_quat)
-                    y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                    ry = float(np.dot(axis_angle_err, y_axis))
-                    axis_angle_err_y_only = ry * y_axis
+                    # Apply axis locks to target orientation (preserve slew yaw, lock roll by default)
+                    locked_target_quat = self._apply_orientation_locks(current_ee_quat, target_quat)
+                    pos_err, axis_angle_err = diff_ik.compute_pose_error(
+                        current_pos, current_ee_quat, target_pos, locked_target_quat
+                    )
                     delta_pos = self._relative_pos_gain * pos_err
-                    delta_rot = self._relative_rot_gain * axis_angle_err_y_only
+                    delta_rot = self._relative_rot_gain * axis_angle_err
                     delta_pose = np.concatenate([delta_pos, delta_rot])
                     self.ik_controller.set_command(delta_pose, ee_pos=current_pos, ee_quat=current_ee_quat)
             else:
@@ -524,12 +588,13 @@ class ExcavatorController:
                     self.ik_controller.set_command(position_command, ee_quat=current_ee_quat)
                 else:
                     # Pose mode: command is [x, y, z, qw, qx, qy, qz]
-                    pose_command = np.concatenate([target_pos, target_quat])
+                    locked_target_quat = self._apply_orientation_locks(current_ee_quat, target_quat)
+                    pose_command = np.concatenate([target_pos, locked_target_quat])
                     self.ik_controller.set_command(pose_command)
 
             target_joint_angles = self.ik_controller.compute(
                 current_pos,
-                current_ee_quat,  # Y-only orientation (no Z-rotation error)
+                current_ee_quat,  # Full orientation incl. slew yaw
                 current_joint_angles,
                 joint_quats=projected_quats  # Pass actual quaternions for accurate Jacobian
             )

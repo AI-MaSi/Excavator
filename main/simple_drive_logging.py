@@ -63,6 +63,13 @@ while not hardware.is_hardware_ready():
     time.sleep(0.1)
 print("Hardware ready!")
 
+try:
+    # Enable low-overhead perf metrics so IMU/ADC Hz report correctly
+    hardware.set_perf_enabled(True)
+    hardware.reset_perf_stats()
+except Exception:
+    pass
+
 if DEBUG_PULSE_WIDTHS:
     print("\n" + "="*60)
     print("  DEBUG MODE ENABLED")
@@ -586,7 +593,7 @@ if server.handshake():
             hardware.send_named_pwm_commands(named, unset_to_zero=True) # unset_to_zero is True by default, but here for clarity
 
             # Debug: Print pulse widths for all commanded channels
-            if DEBUG_PULSE_WIDTHS and hardware.pwm_controller:
+            if False and DEBUG_PULSE_WIDTHS and hardware.pwm_controller:
                 debug_str = "[PULSE DEBUG] "
                 pulse_info = []
                 for name, value in named.items():
@@ -600,6 +607,17 @@ if server.handshake():
                 if pulse_info:
                     print(debug_str + " | ".join(pulse_info))
 
+            # New: Always print all channel commands and computed pulses (no deadzone), each iteration when --debug
+            if DEBUG_PULSE_WIDTHS and hardware.pwm_controller:
+                dbg = "[PULSE DEBUG] "
+                parts = []
+                for ch in ['rotate', 'lift_boom', 'tilt_boom', 'scoop']:
+                    val = named.get(ch, 0.0)
+                    pu = hardware.pwm_controller.compute_pulse(ch, val)
+                    pu_txt = f"{pu:.1f}us" if pu is not None else "n/a"
+                    parts.append(f"{ch}={val:+.2f} -> {pu_txt}")
+                print(dbg + " | ".join(parts))
+
             # Log data
             if logger.is_logging:
                 # Keep original list for logging shape/compatibility
@@ -608,7 +626,7 @@ if server.handshake():
 
             # Lightweight debug output (every 2 seconds)
             current_time = time.time()
-            if logger.is_logging and (current_time - last_debug_time >= DEBUG_INTERVAL):
+            if (current_time - last_debug_time >= DEBUG_INTERVAL):
                 last_debug_time = current_time
                 debug = logger.get_debug_info(hardware)
 
@@ -620,8 +638,8 @@ if server.handshake():
                     angles = debug['imu_angles']
                     debug_str += f"Joints: Lift={angles['lift']:+6.1f}° Tilt={angles['tilt']:+6.1f}° Scoop={angles['scoop']:+6.1f}° | "
 
-                # Loop timing
-                if debug['loop_time_ms']:
+                # Loop timing (only when collecting logger timings)
+                if logger.is_logging and debug['loop_time_ms']:
                     timing = debug['loop_time_ms']
                     status_icon = "✓" if debug['keeping_up'] else "⚠"
                     debug_str += f"Loop: {timing['actual_hz']:.1f}Hz | "
@@ -632,8 +650,19 @@ if server.handshake():
                         debug_str += f" [violations: {timing['violation_pct']:.1f}%]"
                     debug_str += " | "
 
+                # Hardware perf (IMU/ADC) — independent of logging and controller
+                try:
+                    perf = hardware.get_perf_stats() or {}
+                    imu_hz = perf.get('imu', {}).get('hz')
+                    adc_hz = perf.get('adc', {}).get('hz')
+                    if imu_hz is not None or adc_hz is not None:
+                        debug_str += f"IMU: {float(imu_hz or 0.0):.1f}Hz | ADC: {float(adc_hz or 0.0):.1f}Hz | "
+                except Exception:
+                    pass
+
                 # Data stats
-                debug_str += f"Samples: {debug['samples_collected']}"
+                if logger.is_logging:
+                    debug_str += f"Samples: {debug['samples_collected']}"
 
                 print(debug_str)
 

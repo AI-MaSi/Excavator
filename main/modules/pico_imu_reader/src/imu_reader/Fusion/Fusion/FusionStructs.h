@@ -32,6 +32,8 @@ typedef struct Sensor {
     float unwrapOffsetDeg;
     float zeroOffsetDeg;
     float pitchDeg;
+    // Previous quaternion for continuity tracking (prevents hemisphere flips)
+    FusionQuaternion previousQuaternion;
 } Sensor;
 
 #endif // FUSIONSTRUCTS_H

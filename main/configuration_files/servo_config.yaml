@@ -17,16 +17,16 @@ CHANNEL_CONFIGS:
         output_channel: 3  # output pin on the servo board
         affects_pump: True # whether moving this servo affects the pump speed
         toggleable: False  # whether this servo can be toggled on/off via call
-        center: 1570       # 1572 center pulse width in microseconds
+        center: 1566       # 1572 center pulse width in microseconds
         direction: 1       # pretty self-explanatory, -1 or 1
-        pulse_min: 1350    # extend. This sets max velocity
+        pulse_min: 1340    # extend. This sets max velocity
         pulse_max: 1785    # retract. Max velocity in other direction
-        deadzone: 0.5      # % of total range to ignore around center (=cuts out values)
+        deadzone: 1.5      # % of total range to ignore around center (=cuts out values)
         # Simple deadband - separate pos/neg offsets from center (us)
-        deadband_us_pos: 150.0
-        deadband_us_neg: 145.0
+        deadband_us_pos: 145.0 #150.0 Try to match tese!
+        deadband_us_neg: 145.0 #145.0
         # Dither - prevent valve stiction
-        dither_enable: True # enable/disable dither
+        dither_enable: true # enable/disable dither
         dither_amp_us: 12.0 # amplitude in microseconds
         dither_hz: 25.0     # frequency in Hz
 
@@ -34,16 +34,16 @@ CHANNEL_CONFIGS:
         output_channel: 4
         affects_pump: True
         toggleable: False
-        center: 1475 # 1487
+        center: 1487 # 1487
         direction: 1
         pulse_min: 1220     # ret
         pulse_max: 1690     # ext
-        deadzone: 0.5
+        deadzone: 1.5
         # Simple deadband - separate pos/neg
-        deadband_us_pos: 140.0
-        deadband_us_neg: 145.0
+        deadband_us_pos: 140.0 #140.0
+        deadband_us_neg: 140.0 #145.0
         # Dither settings
-        dither_enable: True
+        dither_enable: true
         dither_amp_us: 12.0
         dither_hz: 25.0
 
@@ -51,14 +51,14 @@ CHANNEL_CONFIGS:
         output_channel: 2
         affects_pump: True  # we can leave this true but use toggle_pump_variable(False) in the controller for static speed
         toggleable: False
-        center: 1365        # 1413
+        center: 1398        # 1413
         direction: -1
-        pulse_min: 1190     # direction -1, so extend
-        pulse_max: 1600     # retract
-        deadzone: 0.5
+        pulse_min: 1175     # direction -1, so extend
+        pulse_max: 1620     # retract
+        deadzone: 1.5
         # Simple deadband - separate pos/neg
-        deadband_us_pos: 150.0
-        deadband_us_neg: 105.0
+        deadband_us_pos: 131.0 #150.0
+        deadband_us_neg: 131.0 #105.0
         dither_enable: true
         dither_amp_us: 12.0
         dither_hz: 25.0
@@ -69,9 +69,11 @@ CHANNEL_CONFIGS:
         toggleable: False
         center: 1555
         direction: 1
-        pulse_min: 1555 #1500
+        pulse_min: 1500 #1500
         pulse_max: 1617
-        deadzone: 0.5
-        deadband_us_pos: 49.0
-        deadband_us_neg: 45.0
-        dither_enable: false     # direct servo control, no need to dither
+        deadzone: 1.5
+        deadband_us_pos: 40.0 #49.0
+        deadband_us_neg: 40.0 #45.0
+        dither_enable: true
+        dither_amp_us: 12.0
+        dither_hz: 20.0

@@ -15,8 +15,17 @@
 
 #define LOOP_DURATION_MS 6.252f
 
-static inline FusionQuaternion enforce_quaternion_continuity(FusionQuaternion q) {
-    if (q.element.w < 0.0f) {
+static inline FusionQuaternion enforce_quaternion_continuity(FusionQuaternion q, FusionQuaternion q_ref) {
+    // Choose hemisphere (q or -q) closest to reference quaternion
+    // Compute dot product to measure distance between quaternions
+    float dot = q.element.w * q_ref.element.w +
+                q.element.x * q_ref.element.x +
+                q.element.y * q_ref.element.y +
+                q.element.z * q_ref.element.z;
+
+    // If dot product is negative, quaternions are in opposite hemispheres
+    // Flip to the closer hemisphere
+    if (dot < 0.0f) {
         q.element.w = -q.element.w;
         q.element.x = -q.element.x;
         q.element.y = -q.element.y;
@@ -76,7 +85,8 @@ void update_loop_with_lpf(float sleep_time, float sensors_data[][11], Sensor* se
         sensors[i].previousTimestamp = sensors[i].timestamp;
         FusionAhrsUpdateExternalHeading(&sensors[i].ahrs, sensors[i].gyroscope, sensors[i].accelerometer, 0.0f, deltaTime);
         FusionQuaternion quat = FusionAhrsGetQuaternion(&sensors[i].ahrs);
-        quat = enforce_quaternion_continuity(quat);
+        quat = enforce_quaternion_continuity(quat, sensors[i].previousQuaternion);
+        sensors[i].previousQuaternion = quat;  // Store for next iteration
         quat = apply_mounting(sensors[i].mountingQuaternion, quat);
         // Track pitch and optionally enforce pitch-only quaternion when requested
         float pitchDeg = quaternion_y_twist_deg(quat);
@@ -149,7 +159,8 @@ void update_loop_no_lpf(float sleep_time, float sensors_data[][11], Sensor* sens
 
         FusionAhrsUpdateExternalHeading(&sensors[i].ahrs, sensors[i].gyroscope, sensors[i].accelerometer, 0.0f, deltaTime);
         FusionQuaternion quat = FusionAhrsGetQuaternion(&sensors[i].ahrs);
-        quat = enforce_quaternion_continuity(quat);
+        quat = enforce_quaternion_continuity(quat, sensors[i].previousQuaternion);
+        sensors[i].previousQuaternion = quat;  // Store for next iteration
         quat = apply_mounting(sensors[i].mountingQuaternion, quat);
         // Track pitch and optionally enforce pitch-only quaternion when requested
         float pitchDeg = quaternion_y_twist_deg(quat);
@@ -219,7 +230,8 @@ static void startup_zero_alignment(Sensor* sensors) {
             sensors[i].previousTimestamp = sensors[i].timestamp;
             FusionAhrsUpdateExternalHeading(&sensors[i].ahrs, sensors[i].gyroscope, sensors[i].accelerometer, 0.0f, deltaTime);
             FusionQuaternion q = FusionAhrsGetQuaternion(&sensors[i].ahrs);
-            q = enforce_quaternion_continuity(q);
+            q = enforce_quaternion_continuity(q, sensors[i].previousQuaternion);
+            sensors[i].previousQuaternion = q;  // Update for continuity during startup
             q = apply_mounting(sensors[i].mountingQuaternion, q);
             float pitch = quaternion_y_twist_deg(q);
             accumPitch[i] += pitch;

@@ -340,30 +340,28 @@ class PWMController:
         if now is None:
             now = time.time()
 
-        # Simple deadband: compress commands into working range, skipping dead zone
-        if value == 0.0:
-            pulse = config.center
-        elif config.direction == 1:
-            if value > 0:
-                base = config.center + config.deadband_us_pos
-                working_range = config.pulse_max - base
-                pulse = base + value * working_range
-            else:  # value < 0
-                base = config.center - config.deadband_us_neg
-                working_range = base - config.pulse_min
-                pulse = base + value * working_range
-        else:  # direction == -1
-            if value > 0:
-                base = config.center - config.deadband_us_pos
-                working_range = base - config.pulse_min
-                pulse = base - value * working_range
-            else:  # value < 0
-                base = config.center + config.deadband_us_neg
-                working_range = config.pulse_max - base
-                pulse = base - value * working_range
+        # Enforce input deadzone locally so preview/compute_pulse() honors it too
+        if abs(value) < float(getattr(config, 'deadzone_threshold', 0.0)):
+            value = 0.0
+
+        # Simple deadband by physical sign (value * direction):
+        # - s > 0 => physical positive: jump to center + deadband_us_pos, then scale to pulse_max
+        # - s < 0 => physical negative: jump to center - deadband_us_neg, then scale to pulse_min
+        # - s == 0 => center
+        s = float(value) * float(config.direction)
+        if s == 0.0:
+            pulse = float(config.center)
+        elif s > 0.0:
+            base = float(config.center) + float(config.deadband_us_pos)
+            working_range = float(config.pulse_max) - base
+            pulse = base + abs(float(value)) * working_range
+        else:  # s < 0.0
+            base = float(config.center) - float(config.deadband_us_neg)
+            working_range = base - float(config.pulse_min)
+            pulse = base - abs(float(value)) * working_range
 
         # Dither to prevent valve stiction (only when actively commanding)
-        if config.dither_enable and abs(value) >= config.deadzone_threshold:
+        if config.dither_enable and abs(value) >= float(getattr(config, 'deadzone_threshold', 0.0)):
             # Per-channel phase offset using output_channel index to avoid perfect sync
             phase = 2.0 * 3.141592653589793 * config.dither_hz * now + (config.output_channel * 1.0471975512)
             dither = config.dither_amp_us * __import__('math').sin(phase)

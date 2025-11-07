@@ -265,7 +265,12 @@ class SimpleADC:
         self.initialized = True
 
     def read_sensors(self) -> Dict[str, float]:
-        """Read filtered voltage from all sensors."""
+        """Read filtered voltage from all sensors.
+
+        Raises:
+            RuntimeError: If ADC not initialized
+            Exception: If any sensor read fails (no fallbacks - fail fast for debugging)
+        """
         if not self.initialized:
             raise RuntimeError("ADC not initialized!")
 
@@ -275,12 +280,9 @@ class SimpleADC:
             board_name = sensor_config['input'][0]
             channel = sensor_config['input'][1]
 
-            try:
-                # Use read_channel which applies EMA filtering
-                readings[sensor_name] = self.read_channel(board_name, channel)
-            except Exception as e:
-                print(f"Error reading {sensor_name}: {e}")
-                # Continue with other sensors instead of failing completely
+            # Use read_channel which applies EMA filtering
+            # Don't catch exceptions - let them propagate for better debugging
+            readings[sensor_name] = self.read_channel(board_name, channel)
 
         return readings
 

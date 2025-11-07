@@ -287,22 +287,13 @@ class IKController:
                 ee_pos, ee_quat, self.ee_pos_des, self.ee_quat_des
             )
 
-            # PROJECT orientation error to Y-axis only (excavator boom control)
-            # We only control Y-rotation (pitch/tilt) at the end-effector
-            # Z-rotation (yaw) comes from slew for XY positioning, not a control objective
-            # X-rotation (roll) is not achievable with this robot configuration
-            y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            y_component = np.dot(axis_angle_error, y_axis)
-            axis_angle_error_y_only = y_component * y_axis
-
-            # Apply weighting to position and rotation errors
+            # Apply weighting to position and rotation errors (full axis-angle)
             pos_weight = self.cfg.ik_params.get("position_weight")
             rot_weight = self.cfg.ik_params.get("rotation_weight")
 
-            # Combine weighted errors for IK solving
             pose_error = np.concatenate([
                 np.float32(pos_weight) * position_error,
-                np.float32(rot_weight) * axis_angle_error_y_only
+                np.float32(rot_weight) * axis_angle_error
             ])
 
             delta_joint_angles = self._compute_delta_joint_angles(pose_error, J_weighted)
