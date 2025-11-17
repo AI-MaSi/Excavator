@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Excavator Controller - Clean API with Background Control Loop
+Excavator Controller API with Background Control Loop
 
 This provides a simple interface:
 - give_pose(position, rotation_y_deg): Set target pose
@@ -21,15 +21,11 @@ import sys
 import os
 
 # Import project modules
-from . import diff_ik
+from . import diff_ik_V2 as diff_ik
 from .pid import PIDController
-from .quaternion_math import (
-    quat_from_axis_angle,
-    euler_xyz_from_quat,
-    quat_from_euler_xyz,
-)
+from .quaternion_math import quat_from_axis_angle
 
-# Load IRL settings exclusively from configuration_files/pathing_config.py (fail hard if missing)
+# Load settings
 _here = os.path.dirname(os.path.abspath(__file__))
 _cfg_dir = os.path.abspath(os.path.join(_here, os.pardir, 'configuration_files'))
 _cfg_file = os.path.join(_cfg_dir, 'pathing_config.py')
@@ -42,36 +38,22 @@ from pathing_config import DEFAULT_CONFIG as _DEFAULT_CONFIG  # type: ignore
 
 @dataclass
 class ControllerConfig:
-    """Configuration for the excavator controller."""
-    kp0: float = 0.9 # slew
-    ki0: float = 0.0
-    kd0: float = 0.0
+    """Configuration for the excavator controller.
 
-    kp1: float = 6.0 # lift
-    ki1: float = 0.5
-    kd1: float = 0.0
-
-    kp2: float = 5.0 # tilt
-    ki2: float = 0.25
-    kd2: float = 0.0
-
-    # pretty bad still
-    kp3: float = 8.0 # scoop
-    ki3: float = 1.0
-    kd3: float = 0.0
-
-    output_limits: Tuple[float, float] = (-1.0, 1.0)
-    control_frequency: float = 100.0  # Hz
-    enable_velocity_limiting: bool = True
-    max_joint_velocity: float = 0.00090 #0.00070  # rad/iter when velocity limiting enabled
+    Note: All parameters are now loaded from configuration_files/general_config.yaml
+    This class is populated dynamically at runtime.
+    """
+    output_limits: Tuple[float, float]
+    control_frequency: float  # Hz
 
 
 class ExcavatorController:
     def __init__(self, hardware_interface, config: Optional[ControllerConfig] = None,
-                 enable_perf_tracking: bool = False):
+                 enable_perf_tracking: bool = False, verbose: bool = True):
         self.hardware = hardware_interface
-        self.config = config or ControllerConfig()
         self._enable_perf_tracking = enable_perf_tracking
+        self._verbose = verbose
+
         # Cascade perf flag to hardware if supported (no-op otherwise)
         try:
             if hasattr(self.hardware, 'set_perf_enabled'):
@@ -79,74 +61,117 @@ class ExcavatorController:
         except Exception:
             pass
 
-        # Adopt control loop rate from general config when no explicit config is provided
-        try:
-            if config is None and hasattr(self.hardware, 'get_status'):
-                # Try to fetch general config if hardware exposes it
-                gc = getattr(self.hardware, '_general_config', None)
-                if isinstance(gc, dict):
-                    control_hz = gc.get('rates', {}).get('control_hz')
-                    if isinstance(control_hz, (int, float)) and control_hz > 0:
-                        self.config.control_frequency = float(control_hz)
-        except Exception:
-            pass
+        # Load controller configuration from general_config.yaml if not provided
+        if config is None:
+            gc = getattr(self.hardware, '_general_config', None)
+            if not isinstance(gc, dict):
+                raise RuntimeError("Controller configuration requires general_config.yaml")
+
+            # Load control frequency from rates section
+            control_hz = gc.get('rates', {}).get('control_hz')
+            if not isinstance(control_hz, (int, float)) or control_hz <= 0:
+                raise RuntimeError("Missing or invalid 'rates.control_hz' in general_config.yaml")
+
+            # Load controller parameters
+            ctrl_cfg = gc.get('controller', {})
+            if not ctrl_cfg:
+                raise RuntimeError("Missing 'controller' section in general_config.yaml")
+
+            try:
+                self.config = ControllerConfig(
+                    output_limits=(
+                        float(ctrl_cfg['output_limits_min']),
+                        float(ctrl_cfg['output_limits_max'])
+                    ),
+                    control_frequency=float(control_hz)
+                )
+            except KeyError as e:
+                raise RuntimeError(f"Missing required controller parameter in general_config.yaml: {e}")
+        else:
+            self.config = config
 
         # Robot configuration
         self.robot_config = diff_ik.create_excavator_config()
         diff_ik.warmup_numba_functions()
 
-        # IK controller setup (pull settings from shared config when available)
-        if _DEFAULT_CONFIG is not None:
-            _ik_cmd_type = getattr(_DEFAULT_CONFIG, 'ik_command_type', 'pose')
-            _ik_method = getattr(_DEFAULT_CONFIG, 'ik_method', 'svd')
-            _ik_rel = bool(getattr(_DEFAULT_CONFIG, 'ik_use_relative_mode', False))
-            _ik_params = getattr(_DEFAULT_CONFIG, 'ik_params', None)
-        else:
+        # IK controller setup (pull settings from shared config - fail hard if missing)
+        if _DEFAULT_CONFIG is None:
             raise RuntimeError("ExcavatorController requires configuration_files/pathing_config.py")
+
+        try:
+            _ik_cmd_type = _DEFAULT_CONFIG.ik_command_type
+            _ik_method = _DEFAULT_CONFIG.ik_method
+            _ik_rel = bool(_DEFAULT_CONFIG.ik_use_relative_mode)
+            _ik_params = _DEFAULT_CONFIG.ik_params
+            _ignore_axes = _DEFAULT_CONFIG.ignore_axes
+            # New settings for diff_ik_V2
+            _use_reduced = getattr(_DEFAULT_CONFIG, 'use_reduced_jacobian', True)
+            _joint_limits_rel = getattr(_DEFAULT_CONFIG, 'joint_limits_relative', None)
+        except AttributeError as e:
+            raise RuntimeError(f"Missing required IK configuration in pathing_config.py: {e}")
+
+        # IK config uses ignore_axes for orientation filtering
+        # Prepare optional IK V2 extras from general_config
+        gc = getattr(self.hardware, '_general_config', {}) or {}
+        ctrl_cfg = gc.get('controller', {}) if isinstance(gc, dict) else {}
+
+        # Velocity limiting settings
+        enable_vel_limit = bool(ctrl_cfg.get('enable_velocity_limiting', True))
+        per_joint_max = ctrl_cfg.get('per_joint_max_velocity', None)
+        max_joint_velocities = None
+        if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == 4:
+            max_joint_velocities = [float(v) for v in per_joint_max]
+
+        # Joint limits
+        joint_limits = None
+        if isinstance(_joint_limits_rel, (list, tuple)) and len(_joint_limits_rel) == 4:
+            # Accept degrees or radians; assume degrees if magnitudes > pi
+            def _to_rad_pair(p):
+                a, b = float(p[0]), float(p[1])
+                if max(abs(a), abs(b)) > np.pi + 1e-6:
+                    return (np.radians(a), np.radians(b))
+                return (a, b)
+            joint_limits = [_to_rad_pair(p) for p in _joint_limits_rel]
 
         self.ik_config = diff_ik.IKControllerConfig(
             command_type=_ik_cmd_type,
             ik_method=_ik_method,
             use_relative_mode=_ik_rel,
             ik_params=_ik_params,
+            ignore_axes=_ignore_axes,
+            # IK V2 extensions
+            use_reduced_jacobian=bool(_use_reduced),
+            enable_velocity_limiting=enable_vel_limit,
+            max_joint_velocities=max_joint_velocities,
+            joint_limits=joint_limits
         )
-        self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config)  # Advanced with weighting
+        self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config, verbose=self._verbose)  # Advanced with weighting
 
         # Relative IK control parameters (pulling toward target)
-        if _DEFAULT_CONFIG is not None:
-            self._relative_pos_gain = float(getattr(_DEFAULT_CONFIG, 'relative_pos_gain', 0.2))
-            self._relative_rot_gain = float(getattr(_DEFAULT_CONFIG, 'relative_rot_gain', 0.4))
-        else:
-            self._relative_pos_gain = 0.2   # fraction of position error per control step
-            self._relative_rot_gain = 0.4   # fraction of orientation error (axis-angle) per step
-
-        # Orientation locks (hardware capability mapping) from shared config if available
-        if _DEFAULT_CONFIG is not None:
-            self._lock_roll = bool(getattr(_DEFAULT_CONFIG, 'lock_roll', True))
-            self._lock_pitch = bool(getattr(_DEFAULT_CONFIG, 'lock_pitch', False))
-            self._lock_yaw = bool(getattr(_DEFAULT_CONFIG, 'lock_yaw', True))
-        else:
-            # Safe defaults for excavator: lock roll & yaw, allow pitch
-            self._lock_roll = True
-            self._lock_pitch = False
-            self._lock_yaw = True
-
-        # Optionally adopt control loop rate from shared config when not explicitly provided
         try:
-            if config is None and _DEFAULT_CONFIG is not None:
-                hz = float(getattr(_DEFAULT_CONFIG, 'update_frequency', self.config.control_frequency))
-                if hz > 0:
-                    self.config.control_frequency = hz
-        except Exception:
-            pass
+            self._relative_pos_gain = float(_DEFAULT_CONFIG.relative_pos_gain)
+            self._relative_rot_gain = float(_DEFAULT_CONFIG.relative_rot_gain)
+        except AttributeError as e:
+            raise RuntimeError(f"Missing required relative control gains in pathing_config.py: {e}")
 
-        # PID controllers for joints
-        joint_configs = [
-            {"name": "Slew", "kp": self.config.kp0, "ki": self.config.ki0, "kd": self.config.kd0},
-            {"name": "Boom", "kp": self.config.kp1, "ki": self.config.ki1, "kd": self.config.kd1},
-            {"name": "Arm", "kp": self.config.kp2, "ki": self.config.ki2, "kd": self.config.kd2},
-            {"name": "Bucket", "kp": self.config.kp3, "ki": self.config.ki3, "kd": self.config.kd3},
-        ]
+        # Load PID gains from general_config.yaml
+        gc = getattr(self.hardware, '_general_config', None)
+        if not isinstance(gc, dict) or 'pid' not in gc:
+            raise RuntimeError("PID configuration missing from general_config.yaml")
+
+        pid_cfg = gc['pid']
+        joint_configs = []
+        for i, name in enumerate(["Slew", "Boom", "Arm", "Bucket"]):
+            joint_key = f'joint{i}'
+            if joint_key not in pid_cfg:
+                raise RuntimeError(f"Missing PID config for {joint_key} in general_config.yaml")
+            j = pid_cfg[joint_key]
+            joint_configs.append({
+                "name": name,
+                "kp": float(j['kp']),
+                "ki": float(j['ki']),
+                "kd": float(j['kd'])
+            })
 
         self.joint_pids = []
         for cfg in joint_configs:
@@ -171,8 +196,14 @@ class ExcavatorController:
         self._current_position = np.zeros(3, dtype=np.float32)
         self._current_orientation_y_deg = 0.0
         self._current_projected_quats = None  # Cache processed quaternions
-        self._prev_target_angles = None  # For velocity limiting
         self._outputs_zeroed = False  # Track whether we've already sent a zero/neutral command
+        # Gated debug telemetry (disabled by default to avoid overhead)
+        self._debug_telemetry_enabled = False
+        self._last_pi_outputs = None
+        self._last_named_commands = None
+        self._prev_joint_angles = None
+        self._prev_joint_time = None
+        self._last_joint_vel_radps = None
 
         # Performance tracking
         self._loop_times = []
@@ -180,6 +211,11 @@ class ExcavatorController:
         self._timing_violations = 0
         self._loop_count = 0
         self._perf_lock = threading.Lock()
+
+        # Detailed stage timing (sensors, IK/FK, PWM control)
+        self._sensor_times = []
+        self._ik_fk_times = []
+        self._pwm_times = []
 
         print("Controller initialized")
 
@@ -201,7 +237,13 @@ class ExcavatorController:
         self._stop_event.set()
         self._control_thread.join(timeout=2.0)
         self._control_thread = None
+        # Safe actuator state
         self.hardware.reset(reset_pump=True)
+        # Ensure background hardware threads and serial are closed
+        try:
+            self.hardware.shutdown()
+        except Exception:
+            pass
 
     def pause(self) -> None:
         """Pause the control loop and clear any pending IK target."""
@@ -233,9 +275,6 @@ class ExcavatorController:
         for pid in self.joint_pids:
             pid.reset()
 
-        # Reset velocity limiter to prevent jumps from stale data
-        self._prev_target_angles = None
-
         # Reset IK internal command buffers to avoid stale desired pose
         try:
             self.ik_controller.reset()
@@ -256,31 +295,6 @@ class ExcavatorController:
             self._target_orientation = quat_from_axis_angle(y_axis, y_rotation_rad)
         # We're about to actively command again
         self._outputs_zeroed = False
-
-    def _apply_orientation_locks(self, current_ee_quat: np.ndarray, desired_quat: np.ndarray) -> np.ndarray:
-        """Copy locked axes (roll=x, pitch=y, yaw=z) from current EE to desired.
-
-        Uses Euler XYZ convention in base frame. Slew yaw propagation is preserved
-        because current_ee_quat includes the high-accuracy slew yaw.
-        """
-        if not (self._lock_roll or self._lock_pitch or self._lock_yaw):
-            return desired_quat
-
-        # Convert to Euler
-        r_cur, p_cur, y_cur = euler_xyz_from_quat(current_ee_quat)
-        r_des, p_des, y_des = euler_xyz_from_quat(desired_quat)
-
-        r = r_des
-        p = p_des
-        y = y_des
-        if self._lock_roll:
-            r = r_cur
-        if self._lock_pitch:
-            p = p_cur
-        if self._lock_yaw:
-            y = y_cur
-
-        return quat_from_euler_xyz(r, p, y)
 
     def set_relative_control(self, enabled: bool, pos_gain: Optional[float] = None, rot_gain: Optional[float] = None) -> None:
         """Enable/disable relative IK mode and optionally set gains.
@@ -311,10 +325,9 @@ class ExcavatorController:
             self._target_position = None
             self._target_orientation = None
 
-        # Reset PIDs and velocity limiter to avoid residual terms
+        # Reset PIDs to avoid residual terms
         for pid in self.joint_pids:
             pid.reset()
-        self._prev_target_angles = None
 
     def get_pose(self) -> Tuple[np.ndarray, float]:
         with self._lock:
@@ -353,11 +366,29 @@ class ExcavatorController:
                     'cpu_usage_pct': 0.0,
                     'actual_hz': 0.0,
                     'violation_pct': 0.0,
-                    'sample_count': 0
+                    'sample_count': 0,
+                    # Stage timings
+                    'avg_sensor_ms': 0.0,
+                    'min_sensor_ms': 0.0,
+                    'max_sensor_ms': 0.0,
+                    'avg_ik_fk_ms': 0.0,
+                    'min_ik_fk_ms': 0.0,
+                    'max_ik_fk_ms': 0.0,
+                    'avg_pwm_ms': 0.0,
+                    'min_pwm_ms': 0.0,
+                    'max_pwm_ms': 0.0,
+                    # Additional IK-related telemetry
+                    'ik_vel_lim_enabled': bool(getattr(self.ik_config, 'enable_velocity_limiting', False)),
+                    'last_joint_vel_degps': [] if self._last_joint_vel_radps is None else list(np.degrees(self._last_joint_vel_radps)),
+                    'effective_vel_cap_degps': [],
                 }
 
             loop_times_ms = np.array(self._loop_times) * 1000.0
             compute_times_ms = np.array(self._compute_times) * 1000.0
+            sensor_times_ms = np.array(self._sensor_times) * 1000.0
+            ik_fk_times_ms = np.array(self._ik_fk_times) * 1000.0
+            pwm_times_ms = np.array(self._pwm_times) * 1000.0
+
             actual_hz = 1.0 / np.mean(self._loop_times)
             violation_pct = (self._timing_violations / self._loop_count * 100) if self._loop_count > 0 else 0.0
 
@@ -381,8 +412,34 @@ class ExcavatorController:
                 'cpu_usage_pct': float(cpu_usage_pct),
                 'actual_hz': float(actual_hz),
                 'violation_pct': float(violation_pct),
-                'sample_count': self._loop_count
+                'sample_count': self._loop_count,
+                # Stage timings
+                'avg_sensor_ms': float(np.mean(sensor_times_ms)),
+                'min_sensor_ms': float(np.min(sensor_times_ms)),
+                'max_sensor_ms': float(np.max(sensor_times_ms)),
+                'avg_ik_fk_ms': float(np.mean(ik_fk_times_ms)),
+                'min_ik_fk_ms': float(np.min(ik_fk_times_ms)),
+                'max_ik_fk_ms': float(np.max(ik_fk_times_ms)),
+                'avg_pwm_ms': float(np.mean(pwm_times_ms)),
+                'min_pwm_ms': float(np.min(pwm_times_ms)),
+                'max_pwm_ms': float(np.max(pwm_times_ms)),
             }
+
+            # Add IK limiter telemetry in deg/s for easier interpretation
+            ik_vel_lim_enabled = bool(getattr(self.ik_config, 'enable_velocity_limiting', False))
+            stats['ik_vel_lim_enabled'] = ik_vel_lim_enabled
+            # Last measured joint velocities (deg/s)
+            if self._last_joint_vel_radps is not None:
+                stats['last_joint_vel_degps'] = list(np.degrees(self._last_joint_vel_radps))
+            else:
+                stats['last_joint_vel_degps'] = []
+            # Effective cap in deg/s, inferred from rad/iter caps and actual loop Hz
+            if ik_vel_lim_enabled and hasattr(self.ik_controller, 'max_joint_velocities') and actual_hz > 0.0:
+                # rad/iter * Hz -> rad/s, then convert to deg/s
+                cap_degps = np.degrees(self.ik_controller.max_joint_velocities) * actual_hz
+                stats['effective_vel_cap_degps'] = list(cap_degps)
+            else:
+                stats['effective_vel_cap_degps'] = []
 
         # Optionally merge hardware perf stats (kept outside perf_lock to avoid long holds)
         try:
@@ -401,11 +458,45 @@ class ExcavatorController:
 
         return stats
 
+    def set_debug_telemetry(self, enabled: bool) -> None:
+        """Enable/disable capturing of extra telemetry for logging.
+
+        When enabled, caches last PID outputs, PWM commands, and joint velocities.
+        Also cascades to hardware to enable IMU gyro capture.
+        """
+        self._debug_telemetry_enabled = bool(enabled)
+        if hasattr(self.hardware, 'set_debug_telemetry_enabled'):
+            self.hardware.set_debug_telemetry_enabled(bool(enabled))
+
+    def get_last_pid_outputs(self):
+        """Return last per-joint PID outputs [slew, boom, arm, bucket] or None if not captured."""
+        return None if self._last_pi_outputs is None else list(self._last_pi_outputs)
+
+    def get_last_pwm_commands(self):
+        """Return last named PWM command dict or empty dict if none."""
+        return {} if self._last_named_commands is None else dict(self._last_named_commands)
+
+    def get_ik_debug_info(self) -> dict:
+        """Return IK telemetry such as adaptive damping and condition number."""
+        return {
+            'adaptive_lambda': float(self.ik_controller.last_adaptive_lambda),
+            'condition_number': float(self.ik_controller.last_condition_number),
+        }
+
+    def get_joint_velocities_degps(self):
+        """Return last estimated joint velocities (deg/s) or None if not captured."""
+        if self._last_joint_vel_radps is None:
+            return None
+        return list(np.degrees(self._last_joint_vel_radps))
+
     def reset_performance_stats(self) -> None:
         """Reset performance statistics."""
         with self._perf_lock:
             self._loop_times = []
             self._compute_times = []
+            self._sensor_times = []
+            self._ik_fk_times = []
+            self._pwm_times = []
             self._timing_violations = 0
             self._loop_count = 0
         try:
@@ -457,9 +548,15 @@ class ExcavatorController:
             # === Performance tracking (only if enabled) ===
             if self._enable_perf_tracking:
                 compute_start_time = time.perf_counter()
+                t_sensor_start = compute_start_time
 
             try:
                 self._update_current_state()
+
+                if self._enable_perf_tracking:
+                    t_sensor_end = time.perf_counter()
+                    t_ik_fk_start = t_sensor_end
+
                 with self._lock:
                     has_target = self._target_position is not None
                 if has_target:
@@ -469,6 +566,10 @@ class ExcavatorController:
                     if not self._outputs_zeroed:
                         self.hardware.reset(reset_pump=False)
                         self._outputs_zeroed = True
+
+                if self._enable_perf_tracking:
+                    t_ik_fk_end = time.perf_counter()
+
             except Exception as e:
                 print(f"Control loop error: {e}")
                 self.hardware.reset(reset_pump=True)
@@ -480,10 +581,18 @@ class ExcavatorController:
                 actual_compute_time = compute_end_time - compute_start_time
                 actual_loop_period = loop_start_time - last_loop_start
 
+                # Collect stage timings
+                sensor_time = t_sensor_end - t_sensor_start
+                ik_time = getattr(self, '_last_ik_time', 0.0)
+                pwm_time = getattr(self, '_last_pwm_time', 0.0)
+
                 if actual_loop_period > 0.001:  # Ignore first loop
                     with self._perf_lock:
                         self._loop_times.append(actual_loop_period)
                         self._compute_times.append(actual_compute_time)
+                        self._sensor_times.append(sensor_time)
+                        self._ik_fk_times.append(ik_time)
+                        self._pwm_times.append(pwm_time)
                         self._loop_count += 1
 
                         # Check for timing violations
@@ -494,6 +603,9 @@ class ExcavatorController:
                         if len(self._loop_times) > 1000:
                             self._loop_times.pop(0)
                             self._compute_times.pop(0)
+                            self._sensor_times.pop(0)
+                            self._ik_fk_times.pop(0)
+                            self._pwm_times.pop(0)
 
             last_loop_start = loop_start_time
 
@@ -532,12 +644,18 @@ class ExcavatorController:
                 self._current_position = ee_pos
                 self._current_orientation_y_deg = ee_y_angle_deg
                 self._current_projected_quats = propagated_quats  # Cache processed quats for control
+                self._current_raw_quats = raw_quats
+                self._current_ee_quat_full = ee_quat
 
         except Exception as e:
             print(f"Error in state update: {e}")
 
     def _compute_control_commands(self) -> None:
         """Compute and send control commands based on current state and target."""
+        # Track IK/FK timing
+        if self._enable_perf_tracking:
+            t_ik_start = time.perf_counter()
+
         try:
             # Get cached state from _update_current_state()
             with self._lock:
@@ -548,16 +666,15 @@ class ExcavatorController:
                 target_quat = self._target_orientation.copy()
                 current_pos = self._current_position.copy()
                 projected_quats = self._current_projected_quats  # Use cached quaternions
+                raw_quats = self._current_raw_quats
+                current_ee_quat_full = self._current_ee_quat_full
 
-            # Extract current joint angles and end-effector orientation
-            current_joint_angles = np.array([
-                diff_ik.extract_axis_rotation(q, axis)
-                for q, axis in zip(projected_quats, self.robot_config.rotation_axes)
-            ])
+            # Extract current joint angles using V2 helper (relative angles)
+            if raw_quats is None:
+                return
+            current_joint_angles = diff_ik.compute_relative_joint_angles(raw_quats, self.robot_config)
 
-            # End-effector orientation is the last joint's orientation (already propagated)
-            current_ee_quat_full = projected_quats[-1].copy()
-
+            # End-effector orientation quaternion to use in IK
             # Use full orientation (including Z-rotation from slew)
             # The Jacobian's structure naturally constrains which rotations each joint can achieve
             # based on rotation_axes config (slew=Z, boom/arm/bucket=Y)
@@ -569,54 +686,61 @@ class ExcavatorController:
                 if self.ik_config.command_type == "position":
                     pos_err = (target_pos - current_pos)
                     delta_pos = self._relative_pos_gain * pos_err
-                    self.ik_controller.set_command(delta_pos, ee_pos=current_pos, ee_quat=current_ee_quat)
+                    self.ik_controller.set_command(delta_pos, ee_pos=current_pos, ee_quat=current_ee_quat_full)
                 else:
                     # Pose: 6D delta [dx, dy, dz, rx, ry, rz]
-                    # Apply axis locks to target orientation (preserve slew yaw, lock roll by default)
-                    locked_target_quat = self._apply_orientation_locks(current_ee_quat, target_quat)
+                    # Orientation locks are now applied internally by IK controller
                     pos_err, axis_angle_err = diff_ik.compute_pose_error(
-                        current_pos, current_ee_quat, target_pos, locked_target_quat
+                        current_pos, current_ee_quat_full, target_pos, target_quat
                     )
                     delta_pos = self._relative_pos_gain * pos_err
                     delta_rot = self._relative_rot_gain * axis_angle_err
                     delta_pose = np.concatenate([delta_pos, delta_rot])
-                    self.ik_controller.set_command(delta_pose, ee_pos=current_pos, ee_quat=current_ee_quat)
+                    self.ik_controller.set_command(delta_pose, ee_pos=current_pos, ee_quat=current_ee_quat_full)
             else:
                 if self.ik_config.command_type == "position":
                     # Position-only mode: command is just [x, y, z]
                     position_command = target_pos
-                    self.ik_controller.set_command(position_command, ee_quat=current_ee_quat)
+                    self.ik_controller.set_command(position_command, ee_quat=current_ee_quat_full)
                 else:
                     # Pose mode: command is [x, y, z, qw, qx, qy, qz]
-                    locked_target_quat = self._apply_orientation_locks(current_ee_quat, target_quat)
-                    pose_command = np.concatenate([target_pos, locked_target_quat])
+                    # Orientation locks are now applied internally by IK controller
+                    pose_command = np.concatenate([target_pos, target_quat])
                     self.ik_controller.set_command(pose_command)
 
             target_joint_angles = self.ik_controller.compute(
-                current_pos,
-                current_ee_quat,  # Full orientation incl. slew yaw
-                current_joint_angles,
-                joint_quats=projected_quats  # Pass actual quaternions for accurate Jacobian
+                ee_pos=current_pos,
+                ee_quat=current_ee_quat_full,  # Full orientation incl. slew yaw
+                joint_angles=current_joint_angles,
+                joint_quats=raw_quats  # Pass raw IMU quats; V2 handles offsets/propagation
             )
 
-            # Velocity limiting - prevent huge joint jumps when extended
-            if target_joint_angles is not None and self.config.enable_velocity_limiting:
-                if self._prev_target_angles is None:
-                    self._prev_target_angles = current_joint_angles.copy()
+            # DEBUG: Check if IK produced output
+            if hasattr(self, '_ik_debug_counter'):
+                self._ik_debug_counter += 1
+            else:
+                self._ik_debug_counter = 0
 
-                max_angle_change = self.config.max_joint_velocity
-                delta = target_joint_angles - self._prev_target_angles
-                delta = np.clip(delta, -max_angle_change, max_angle_change)
-                target_joint_angles = self._prev_target_angles + delta
-                self._prev_target_angles = target_joint_angles.copy()
+            if self._verbose and self._ik_debug_counter % 50 == 0:
+                if target_joint_angles is not None:
+                    delta_angles = target_joint_angles - current_joint_angles
+                    delta_deg = np.degrees(delta_angles)
+                    max_delta = np.max(np.abs(delta_deg))
+                    if max_delta > 0.1:
+                        print(f"[IK] Delta: {delta_deg} deg (max={max_delta:.2f})")
+                else:
+                    print("[IK] WARNING: IK returned None!")
 
         except Exception as e:
             print(f"Error in control computation: {e}")
+            import traceback
+            traceback.print_exc()
             return
 
         if target_joint_angles is None:
             # If IK failed, command neutral once (avoid constant zeroing)
             if not self._outputs_zeroed:
+                print("WARNING: IK returned None, sending neutral command")
                 self.hardware.reset(reset_pump=False)
                 self._outputs_zeroed = True
             return
@@ -641,11 +765,50 @@ class ExcavatorController:
             'tilt_boom': pi_outputs[2],  # arm
         }
 
-        # DEBUG center rot
-        #print(f"Slew command: {pi_outputs[0]:.3f}")
+        # Always update joint velocity estimate (rad/s)
+        now_t = time.perf_counter()
+        if self._prev_joint_angles is not None and self._prev_joint_time is not None:
+            dtj = max(1e-6, now_t - self._prev_joint_time)
+            self._last_joint_vel_radps = (current_joint_angles - self._prev_joint_angles) / dtj
+        self._prev_joint_angles = current_joint_angles.copy()
+        self._prev_joint_time = now_t
+
+        # Gated debug telemetry capture (minimal overhead when disabled)
+        if self._debug_telemetry_enabled:
+            self._last_pi_outputs = list(pi_outputs)
+            self._last_named_commands = dict(named_commands)
+
+        # DEBUG: Print commands periodically (every ~50 loops = ~1 sec at 50Hz)
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 0
+
+        if self._verbose and self._debug_counter % 50 == 0:
+            max_cmd = max(abs(x) for x in pi_outputs)
+            if max_cmd > 0.01:  # Only print if non-trivial commands
+                print(f"[CTRL] Commands: slew={pi_outputs[0]:+.3f} boom={pi_outputs[1]:+.3f} arm={pi_outputs[2]:+.3f} bucket={pi_outputs[3]:+.3f}")
+
+        # Track IK/FK completion time before PWM
+        if self._enable_perf_tracking:
+            t_ik_end = time.perf_counter()
+            t_pwm_start = t_ik_end
+
         self.hardware.send_named_pwm_commands(named_commands)
         # Mark that we are actively commanding
         self._outputs_zeroed = False
 
+        # Track PWM completion time
+        if self._enable_perf_tracking:
+            t_pwm_end = time.perf_counter()
+            # Store stage timings in instance variables for collection in main loop
+            self._last_ik_time = t_ik_end - t_ik_start
+            self._last_pwm_time = t_pwm_end - t_pwm_start
+
     def __del__(self):
-        self.stop()
+        # Be defensive: __init__ can fail before thread fields exist
+        try:
+            if getattr(self, "_control_thread", None) is not None:
+                self.stop()
+        except Exception:
+            pass

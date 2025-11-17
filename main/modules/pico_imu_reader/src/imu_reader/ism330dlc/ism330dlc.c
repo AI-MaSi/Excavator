@@ -1,6 +1,7 @@
 #include "ism330dlc.h"
 #include "i2c_helpers.h"
 #include "FusionMath.h"
+#include "pico/time.h"
 
 // Function to write to ISM330DHCX register
 bool ism330dhcx_write_reg(i2c_inst_t *i2c_port, uint8_t device_addr, uint8_t reg, uint8_t value) {
@@ -130,6 +131,26 @@ int initialize_sensors(void) {
           }
     }
     printf("Sensor initialized successfully!\n");
+}
+
+// Wait for new data to be ready from the sensor
+// Bit 0: XLDA (accelerometer data available)
+// Bit 1: GDA (gyroscope data available)
+bool ism330dhcx_wait_for_data(i2c_inst_t* i2c_port, uint8_t device_addr, uint32_t timeout_us) {
+    uint64_t start = time_us_64();
+    uint8_t status;
+
+    while ((time_us_64() - start) < timeout_us) {
+        if (ism330dhcx_read_reg(i2c_port, device_addr, STATUS_REG, &status, 1)) {
+            // Check if both accelerometer (bit 0) and gyroscope (bit 1) data are ready
+            if ((status & 0x03) == 0x03) {
+                return true;
+            }
+        }
+        // Small delay to avoid hammering the I2C bus
+        sleep_us(10);
+    }
+    return false; // Timeout
 }
 
 bool ism330dhcx_read_accelerometer(i2c_inst_t* i2c_port, uint8_t device_addr, FusionVector* fusion_vector) {

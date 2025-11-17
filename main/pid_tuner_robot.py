@@ -2,7 +2,7 @@
 Robot-side PID tuner (100 Hz) for real-time PID gain and setpoint tuning.
 
 Uses:
-- modules.PCA9685_controller.PWMController via modules.hardware_interface.HardwareInterface
+- modules.hardware_interface.HardwareInterface (with background IMU/ADC threads)
 - modules.pid.PIDController
 - modules.udp_socket.UDPSocket for UDP comms (normalized floats)
 
@@ -11,7 +11,7 @@ Protocol (UDPSocket, angles use 2-byte int16 for better resolution):
   - setpoint_hi, setpoint_lo: setpoint angle as 2-byte int16, range ±90° (±π/2)
   - kp_norm, ki_norm, kd_norm: map to ranges via ranges below
   - joint_norm: maps to joint id {0..3} via round((n+1)/2*3)
-  - reload_flag: 1.0 to trigger config reload, else 0.0
+  - reload_flag: 1.0 to trigger config reload (both servo & general), else 0.0
   - pump_toggle_flag: 1.0 to toggle pump state, else 0.0
 
 - Robot -> Client (num_outputs = 3): [angle_hi, angle_lo, pwm_norm]
@@ -19,12 +19,12 @@ Protocol (UDPSocket, angles use 2-byte int16 for better resolution):
   - pwm_norm: last PWM command in [-1, 1]
 
 Joint mapping:
-  0: 'slew'   (measured from ADC encoder)
-  1: 'boom'   (measured from IMU[0] Y-axis angle)
-  2: 'arm'    (measured from IMU[1] Y-axis angle)
-  3: 'bucket' (measured from IMU[2] Y-axis angle)
+  0: 'rotate'     (slew, measured from ADC encoder)
+  1: 'lift_boom'  (boom, measured from IMU[0] Y-axis angle)
+  2: 'tilt_boom'  (arm, measured from IMU[1] Y-axis angle)
+  3: 'scoop'      (bucket, measured from IMU[2] Y-axis angle)
 
-Note: IMU-based angles assume primary rotation about the Y axis.
+Note: Hardware interface uses exception-based error handling with automatic safety reset.
 """
 
 import math
@@ -35,7 +35,7 @@ from typing import Optional, Tuple
 from modules.pid import PIDController
 from modules.udp_socket import UDPSocket
 from modules.quaternion_math import y_deg_from_quat
-from modules.diff_ik import (
+from modules.diff_ik_V2 import (
     create_excavator_config,
     apply_imu_offsets,
     project_to_rotation_axes,
@@ -162,24 +162,31 @@ class RobotPIDTuner:
         Returns:
             Joint angle in radians, or None if sensors not ready
         """
-        # Read IMU data and slew quaternion
-        imu_quats = self.hw.read_imu_data()
-        slew_quat = self.hw.read_slew_quaternion()
-        if not imu_quats or len(imu_quats) < 3:
+        try:
+            # Read IMU data and slew quaternion (may raise on error)
+            imu_quats = self.hw.read_imu_data()
+            slew_quat = self.hw.read_slew_quaternion()
+            if not imu_quats or len(imu_quats) < 3:
+                return None
+
+            # Combine into 4-joint quaternion array [slew, boom, arm, bucket]
+            all_quats = np.array([slew_quat] + imu_quats[:3], dtype=np.float32)
+
+            # Apply full quaternion processing pipeline
+            corrected = apply_imu_offsets(all_quats, self.robot_config)
+            projected = project_to_rotation_axes(corrected, self.robot_config.rotation_axes)
+            propagated = propagate_base_rotation(projected, self.robot_config)
+
+            # Extract angle about this joint's rotation axis
+            axis = self.robot_config.rotation_axes[joint_id]
+            angle = float(extract_axis_rotation(propagated[joint_id], axis))
+            return angle
+        except Exception as e:
+            # Hardware errors (sensors not ready, etc.) are caught and logged
+            # Safety decorator has already reset hardware if needed
+            if self._loop_count % 100 == 0:  # Log occasionally to avoid spam
+                print(f"Sensor read error: {e}")
             return None
-
-        # Combine into 4-joint quaternion array [slew, boom, arm, bucket]
-        all_quats = np.array([slew_quat] + imu_quats[:3], dtype=np.float32)
-
-        # Apply full quaternion processing pipeline
-        corrected = apply_imu_offsets(all_quats, self.robot_config)
-        projected = project_to_rotation_axes(corrected, self.robot_config.rotation_axes)
-        propagated = propagate_base_rotation(projected, self.robot_config)
-
-        # Extract angle about this joint's rotation axis
-        axis = self.robot_config.rotation_axes[joint_id]
-        angle = float(extract_axis_rotation(propagated[joint_id], axis))
-        return angle
 
     def _apply_pwm(self, joint_id: int, pwm: float) -> bool:
         name = self.joint_names[joint_id]
@@ -218,8 +225,13 @@ class RobotPIDTuner:
             if reload_flag > self._flag_threshold and self._reload_flag_prev <= self._flag_threshold:
                 try:
                     print("Reload config requested by client...")
-                    self.hw.reload_config()
-                    print("Config reloaded successfully.")
+                    # Try both servo and general config
+                    servo_ok = self.hw.reload_config()
+                    general_ok = self.hw.reload_general_config()
+                    if servo_ok or general_ok:
+                        print(f"Config reloaded (servo={servo_ok}, general={general_ok})")
+                    else:
+                        print("Config reload: no changes")
                 except Exception as e:
                     print(f"Config reload failed: {e}")
 
@@ -290,7 +302,7 @@ class RobotPIDTuner:
                 else:
                     # No measurement; drive all channels to zero for safety
                     try:
-                        self.hw.send_named_pwm_commands({}, unset_to_zero=True)
+                        self.hw.reset(reset_pump=False)
                     except Exception:
                         pass
 
@@ -304,12 +316,18 @@ class RobotPIDTuner:
                     next_t = time.perf_counter()
 
         except KeyboardInterrupt:
-            print("Stopping PID tuner...")
+            print("\nStopping PID tuner...")
         finally:
+            # Clean shutdown: reset PWM, stop background threads, close serial
             try:
-                self.hw.reset(reset_pump=False)
-            except Exception:
-                pass
+                print("Resetting hardware...")
+                self.hw.reset(reset_pump=True)
+                time.sleep(0.1)  # Allow reset command to complete
+                print("Shutting down background threads...")
+                self.hw.shutdown()
+            except Exception as e:
+                print(f"Shutdown error: {e}")
+            print("PID tuner stopped.")
 
 
 if __name__ == "__main__":

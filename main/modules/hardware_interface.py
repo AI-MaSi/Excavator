@@ -16,10 +16,8 @@ from typing import List, Optional, Dict, Any
 import threading
 from pathlib import Path
 
-try:
-    import yaml  # type: ignore
-except Exception:
-    yaml = None
+
+import yaml
 
 from .PCA9685_controller import PWMController
 from .usb_serial_reader import USBSerialReader
@@ -48,18 +46,20 @@ def _safe_hardware_operation(func):
 
 
 class EncoderTracker:
-    def __init__(self, gear_ratio, min_voltage=0.5, max_voltage=4.5):
+    def __init__(self, gear_ratio, min_voltage=0.5, max_voltage=4.5, flip_direction=False):
         """
         Initialize encoder tracker with simple continuous angle tracking.
 
         :param gear_ratio: Gear ratio (encoder_rotations / actual_rotations)
         :param min_voltage: Minimum voltage of encoder range
         :param max_voltage: Maximum voltage of encoder range
+        :param flip_direction: If True, flip encoder direction (needed when gearing causes mechanical inversion)
         """
         self.min_voltage = min_voltage
         self.max_voltage = max_voltage
         self.voltage_range = max_voltage - min_voltage
         self.gear_ratio = gear_ratio
+        self.flip_direction = flip_direction
         self.z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)  # Z-axis for rotation
 
         # Simple wrapping tracking
@@ -105,8 +105,12 @@ class EncoderTracker:
         # Apply zero offset (subtract to make first reading = 0)
         zero_referenced_angle = continuous_angle - self.zero_offset
 
-        # Adjust for gear ratio
+        # Adjust for gear ratio and flip direction if needed
+        # Flip is required when encoder gearing causes mechanical inversion:
+        # physical slew rotates CW → gears cause encoder to rotate CCW
         actual_angle = zero_referenced_angle / self.gear_ratio
+        if self.flip_direction:
+            actual_angle = -actual_angle
 
         # Store for next iteration
         self.last_wrapped_angle = wrapped_angle
@@ -170,6 +174,9 @@ class HardwareInterface:
             self.pwm_controller = None
             self.pwm_ready = False
         
+        # Stop/coordination event for background threads (IMU/ADC)
+        self._stop_event = threading.Event()
+
         # Perf tracking (opt-in and very low overhead when disabled)
         # Initialize BEFORE starting any reader threads to avoid races
         self._perf_enabled = bool(perf_enabled)
@@ -207,10 +214,16 @@ class HardwareInterface:
         self.latest_imu_data = None
         self.latest_imu_pitch = None  # radians, if available from stream
         self._imu_lock = threading.Lock()
-        self._imu_expected_hz = float(imu_expected_hz) if imu_expected_hz and imu_expected_hz > 1.0 else 120.0
         # IMU target SR from config unless explicitly provided
-        cfg_imu_hz = float(self._g('rates.imu_hz', 120.0))
-        self._imu_expected_hz = float(imu_expected_hz) if imu_expected_hz else cfg_imu_hz
+        cfg_imu_hz = self._g('rates.imu_hz')
+        if cfg_imu_hz is None:
+            raise ValueError("rates.imu_hz must be specified in general config file")
+        self._imu_expected_hz = float(imu_expected_hz) if imu_expected_hz else float(cfg_imu_hz)
+        # Debug telemetry (gated): when enabled, keep latest IMU gyro data for logging
+        self._debug_telemetry_enabled = False
+        self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
+        self._imu_last_device_ts = None
+        self.imu_thread = None
         self._start_imu_reader()
 
         # Initialize ADC and encoder
@@ -219,7 +232,11 @@ class HardwareInterface:
         self.latest_slew_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Identity
         self._adc_lock = threading.Lock()
         # ADC/encoder expected rate from config
-        self._adc_expected_hz = float(self._g('rates.adc_hz', 120.0))
+        cfg_adc_hz = self._g('rates.adc_hz')
+        if cfg_adc_hz is None:
+            raise ValueError("rates.adc_hz must be specified in general config file")
+        self._adc_expected_hz = float(cfg_adc_hz)
+        self.adc_thread = None
         self._start_adc_reader()
     
     def _check_imu_streaming(self, timeout: float = 2.0) -> bool:
@@ -284,7 +301,7 @@ class HardwareInterface:
         # Aim to match the device sample rate to avoid unnecessary polling
         next_run_time = time.perf_counter()
         read_period = 1.0 / max(1.0, self._imu_expected_hz)
-        while True:
+        while not self._stop_event.is_set():
             try:
                 # Read IMU data - returns list of [w,x,y,z,gx,gy,gz] arrays
                 imu_packets = self.usb_reader.read_imus()
@@ -292,6 +309,11 @@ class HardwareInterface:
                     # Extract only the quaternion portion [w,x,y,z] from each IMU packet
                     # Data format is [w, x, y, z, gx, gy, gz] (7 values per IMU)
                     quat_only = [np.array(pkt[:4], dtype=np.float32) for pkt in imu_packets]
+                    if self._debug_telemetry_enabled:
+                        gyro_only = [np.array(pkt[4:7], dtype=np.float32) for pkt in imu_packets]
+                        with self._imu_lock:
+                            self.latest_imu_gyro = [g.copy() for g in gyro_only]
+                            self._imu_last_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
 
                     # Validate quaternion magnitudes (should be ~1.0 for unit quaternions)
                     valid_data = True
@@ -368,7 +390,8 @@ class HardwareInterface:
         """Initialize ADC reader and start background thread."""
         try:
             self.adc = SimpleADC()
-            self.encoder_tracker = EncoderTracker(gear_ratio=2.60, min_voltage=0.5, max_voltage=4.5)
+            # flip_direction=True because slew encoder gearing inverts rotation direction
+            self.encoder_tracker = EncoderTracker(gear_ratio=2.60, min_voltage=0.5, max_voltage=4.5, flip_direction=True)
 
             # Start background thread for ADC reading
             self.adc_thread = threading.Thread(
@@ -386,7 +409,7 @@ class HardwareInterface:
         next_run_time = time.perf_counter()
         read_period = 1.0 / max(1.0, self._adc_expected_hz)
 
-        while True:
+        while not self._stop_event.is_set():
             try:
                 # Read only the slew encoder channel directly (with EMA filtering)
                 slew_voltage = self.adc.read_channel("b1", 8)
@@ -456,6 +479,21 @@ class HardwareInterface:
                 raise RuntimeError("IMU data is None despite ready flag being set")
 
     @_safe_hardware_operation
+    def read_imu_gyro(self) -> Optional[List[np.ndarray]]:
+        """Read latest IMU gyro data [gx, gy, gz] per IMU (deg/s).
+
+        Requires debug telemetry to be enabled.
+        """
+        with self._imu_lock:
+            if not self.imu_ready:
+                raise RuntimeError("IMU not ready - cannot read gyro data")
+            if not self._debug_telemetry_enabled:
+                raise RuntimeError("Debug telemetry disabled - gyro data not captured")
+            if self.latest_imu_gyro is None:
+                raise RuntimeError("IMU gyro data is None")
+            return [g.copy() for g in self.latest_imu_gyro]
+
+    @_safe_hardware_operation
     def read_imu_pitch(self) -> Optional[List[float]]:
         """Read latest IMU pitch angles (radians) if provided by the serial stream.
 
@@ -519,6 +557,44 @@ class HardwareInterface:
             except Exception as e:
                 print(f"Hardware reset error: {e}")
 
+    def shutdown(self) -> None:
+        """Gracefully stop background threads and close I/O resources."""
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
+
+        # Join IMU/ADC threads if they were started
+        try:
+            if getattr(self, 'imu_thread', None) is not None:
+                self.imu_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'adc_thread', None) is not None:
+                self.adc_thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+        # Close serial connection if present
+        try:
+            if hasattr(self, 'usb_reader') and self.usb_reader:
+                self.usb_reader.close()
+        except Exception:
+            pass
+
+        # Mark sensors not ready
+        with self._imu_lock:
+            self.imu_ready = False
+        with self._adc_lock:
+            self.adc_ready = False
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
     def send_named_pwm_commands(self, commands: Dict[str, float], *,
                                 unset_to_zero: Optional[bool] = None,
                                 one_shot_pump_override: bool = True) -> bool:
@@ -549,6 +625,10 @@ class HardwareInterface:
         except Exception:
             return []
     
+    def set_debug_telemetry_enabled(self, enabled: bool) -> None:
+        """Enable or disable debug telemetry capture (e.g., IMU gyro)."""
+        self._debug_telemetry_enabled = bool(enabled)
+
     def is_hardware_ready(self) -> bool:
         """Check if hardware is ready."""
         return self.pwm_ready and self.imu_ready and self.adc_ready
@@ -603,7 +683,7 @@ class HardwareInterface:
         """Load general configuration YAML file if available; return dict."""
         try:
             p = Path(path)
-            if not p.exists() or yaml is None:
+            if not p.exists():
                 return {}
             with p.open('r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}

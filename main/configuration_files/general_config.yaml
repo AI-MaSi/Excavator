@@ -31,3 +31,45 @@ pwm:
   toggle_channels: false
   input_rate_threshold: 0
 
+pid:
+  # PID controller gains for each joint
+  # Joint 0: Slew (base rotation)
+  joint0:
+    kp: 8.0 #10.0
+    ki: 0.250
+    kd: 0.0
+
+  # Joint 1: Boom (lift arm)
+  joint1:
+    kp: 15.0
+    ki: 1.0
+    kd: 0.0
+
+  # Joint 2: Arm (tilt)
+  joint2:
+    kp: 8.0
+    ki: 0.30
+    kd: 0.15
+
+  # Joint 3: Bucket (scoop)
+  joint3:
+    kp: 11.0
+    ki: 0.50
+    kd: 0.2
+
+controller:
+  # PID output limits (normalized -1.0 to 1.0)
+  output_limits_min: -1.0
+  output_limits_max: 1.0
+
+  # Joint velocity limiting (applied at IK level for cleaner architecture)
+  # Set to False to disable velocity limiting entirely
+  enable_velocity_limiting: True
+
+  # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
+  # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
+  # Examples at 100Hz:
+  #   0.1 rad/iter = 5.73°/iter = 573°/s
+
+  per_joint_max_velocity: [0.15, 0.15, 0.15, 0.15]
+

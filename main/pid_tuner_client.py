@@ -5,9 +5,12 @@ Uses modules.udp_socket.UDPSocket to communicate with robot-side tuner.
 
 Controls:
 - Joint: dropdown [slew, boom, arm, bucket]
-- Setpoint (deg): entry box, accepts floats
+- Setpoint (deg): slider, range ±90°
 - PID gains: sliders (kp, ki, kd)
-- Reload Config: one-shot request to robot to reload PWM config
+- Send: latch current setpoint as target (prevents accidental jumps)
+- Sync to Measured: set slider to current measured angle
+- Snapshot: save current plot to PNG (requires matplotlib)
+- Reload Config: one-shot request to robot to reload both servo & general config
 - Toggle Pump: one-shot request to toggle hydraulic pump state
 
 Plots (lightweight): simple Tkinter canvas tracing target vs measured angle over time.
@@ -344,12 +347,18 @@ class PIDTunerClient:
             self.status_var.set(f"[error] connect failed: {e}")
 
     def _on_reload_clicked(self):
-        # Request a one-shot config reload on robot
+        # Request a one-shot config reload on robot (servo + general)
+        if self.sock is None:
+            self.status_var.set("[error] Not connected - cannot reload config")
+            return
         self._reload_requested = True
-        self.status_var.set("[action] Reload config requested")
+        self.status_var.set("[action] Config reload requested (servo + general)")
 
     def _on_toggle_pump_clicked(self):
         # Request a one-shot pump toggle on robot
+        if self.sock is None:
+            self.status_var.set("[error] Not connected - cannot toggle pump")
+            return
         self._pump_toggle_requested = True
         self.status_var.set("[action] Pump toggle requested")
 

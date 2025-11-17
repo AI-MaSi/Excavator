@@ -1,4 +1,5 @@
 #include "InitFusion.h"
+#include "pico/time.h"
 
 extern imu_reader_settings_t imu_reader_settings; 
 
@@ -23,6 +24,9 @@ void initialize_sensors_values(Sensor* sensors) {
         sensors[i].unwrapOffsetDeg = 0.0f;
         sensors[i].zeroOffsetDeg = 0.0f;
         sensors[i].pitchDeg = 0.0f;
+        // Initialize timestamps to current time to avoid huge deltaTime on first iteration
+        sensors[i].timestamp = time_us_64();
+        sensors[i].previousTimestamp = sensors[i].timestamp;
         // Initialize previous quaternion to identity for continuity tracking
         sensors[i].previousQuaternion = FUSION_IDENTITY_QUATERNION;
     }

@@ -1,5 +1,13 @@
 from modules.udp_socket import UDPSocket
 from modules.hardware_interface import HardwareInterface
+from modules.diff_ik_V2 import (
+    create_excavator_config,
+    apply_imu_offsets,
+    project_to_rotation_axes,
+    propagate_base_rotation,
+    extract_axis_rotation,
+    compute_relative_joint_angles,
+)
 import time
 import random
 import numpy as np
@@ -39,11 +47,17 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # COMMAND LINE ARGUMENTS
 # ============================================================
 parser = argparse.ArgumentParser(description='Simple drive controller with optional data logging')
-parser.add_argument('--debug', action='store_true',
-                    help='Enable debug mode: prints pulse widths (us) for all commanded channels')
+parser.add_argument(
+    '--debug',
+    choices=['pwm', 'joint'],
+    action='append',
+    default=[],
+    help='Enable debug outputs. Use multiple times: --debug pwm --debug joint'
+)
 args = parser.parse_args()
 
-DEBUG_PULSE_WIDTHS = args.debug
+DEBUG_PULSE_WIDTHS = ('pwm' in args.debug)
+DEBUG_JOINTS = ('joint' in args.debug)
 
 # ============================================================
 # INITIALIZE HARDWARE & NETWORK
@@ -63,6 +77,9 @@ while not hardware.is_hardware_ready():
     time.sleep(0.1)
 print("Hardware ready!")
 
+# Kinematic configuration for mounting-corrected angles/FK
+robot_config = create_excavator_config()
+
 try:
     # Enable low-overhead perf metrics so IMU/ADC Hz report correctly
     hardware.set_perf_enabled(True)
@@ -72,9 +89,14 @@ except Exception:
 
 if DEBUG_PULSE_WIDTHS:
     print("\n" + "="*60)
-    print("  DEBUG MODE ENABLED")
-    print("  Pulse widths (μs) will be printed for all active channels")
+    print("  DEBUG PWM ENABLED")
+    print("  Pulse widths (us) will be printed for commanded channels")
     print("  Use this to find where valve movement actually starts")
+    print("="*60 + "\n")
+if DEBUG_JOINTS:
+    print("\n" + "="*60)
+    print("  DEBUG JOINTS ENABLED")
+    print("  Will print RAW (IMU), corrected (offset+projection+propagation), and RELATIVE joint angles")
     print("="*60 + "\n")
 
 # ============================================================
@@ -89,9 +111,10 @@ class DataLogger:
     - Saves as CSV for easy post-processing
     """
 
-    def __init__(self):
+    def __init__(self, robot_config=None):
         self.start_time = None
         self.is_logging = False
+        self.robot_config = robot_config
 
         # Data storage (100Hz) - all lists of same length
         self.timestamps = []
@@ -156,8 +179,8 @@ class DataLogger:
         current_time = time.time() - self.start_time
 
         # ========== 100Hz Data (every sample) ==========
-        # Read IMU pitch angles directly (CSV stream provides pitch)
-        imu_pitches = hardware_interface.read_imu_pitch()  # List of 3 pitches [rad]
+        # Read IMU quaternions and compute pitch angles (radians)
+        imu_quats = hardware_interface.read_imu_data()  # List of 3 quats [w,x,y,z]
 
         # Extract valve commands: [lift, tilt, scoop] (reordered to match IMU order)
         # Original: commands[0]=scoop, commands[1]=lift, commands[4]=tilt
@@ -167,9 +190,13 @@ class DataLogger:
             commands[0],  # scoop (bucket IMU)
         ]
 
-        # Use streamed pitch directly (radians)
-        if imu_pitches and len(imu_pitches) == 3:
-            joint_pos = [float(imu_pitches[0]), float(imu_pitches[1]), float(imu_pitches[2])]
+        # Convert quaternions to pitch angles (radians)
+        if imu_quats and len(imu_quats) >= 3:
+            joint_pos = [
+                float(self.quaternion_to_pitch(imu_quats[0])),
+                float(self.quaternion_to_pitch(imu_quats[1])),
+                float(self.quaternion_to_pitch(imu_quats[2])),
+            ]
         else:
             joint_pos = [0.0, 0.0, 0.0]  # Fallback if IMU read fails
 
@@ -283,23 +310,68 @@ class DataLogger:
         """Get current debug information for live monitoring.
 
         Returns:
-            Dict with current joint angles (deg), loop timing, and data stats
+            Dict with current joint angles (deg), slew rotation, loop timing, and data stats
         """
         debug_info = {}
 
-        # Get current joint angles in degrees (from streamed pitch)
-        imu_pitches = hardware_interface.read_imu_pitch()
-        if imu_pitches and len(imu_pitches) == 3:
-            lift_pitch = np.degrees(imu_pitches[0])
-            tilt_pitch = np.degrees(imu_pitches[1])
-            scoop_pitch = np.degrees(imu_pitches[2])
-            debug_info['imu_angles'] = {
-                'lift': lift_pitch,
-                'tilt': tilt_pitch,
-                'scoop': scoop_pitch
-            }
+        # Slew angle
+        try:
+            slew_quat = hardware_interface.read_slew_quaternion()
+            if slew_quat is not None:
+                # Extract rotation about Z axis (yaw)
+                w, x, y, z = slew_quat[0], slew_quat[1], slew_quat[2], slew_quat[3]
+                slew_yaw = np.arctan2(2.0 * (w*z + x*y), 1.0 - 2.0 * (y*y + z*z))
+                debug_info['slew_angle'] = float(np.degrees(slew_yaw))
+            else:
+                debug_info['slew_angle'] = None
+        except Exception:
+            debug_info['slew_angle'] = None
+
+        # RAW, mounting-corrected, and relative joint angles (deg)
+        try:
+            raw_imu_quats = hardware_interface.read_imu_data()
+        except Exception:
+            raw_imu_quats = None
+
+        if raw_imu_quats and len(raw_imu_quats) >= 3:
+            # RAW
+            lift_raw = float(np.degrees(self.quaternion_to_pitch(raw_imu_quats[0])))
+            tilt_raw = float(np.degrees(self.quaternion_to_pitch(raw_imu_quats[1])))
+            scoop_raw = float(np.degrees(self.quaternion_to_pitch(raw_imu_quats[2])))
+            debug_info['imu_angles_raw'] = {'lift': lift_raw, 'tilt': tilt_raw, 'scoop': scoop_raw}
+
+            # Corrected via diff_ik pipeline
+            if self.robot_config is not None:
+                try:
+                    slew_quat = hardware_interface.read_slew_quaternion()
+                    full_quats = [slew_quat] + list(raw_imu_quats)
+                    full_quats = np.array(full_quats, dtype=np.float32)
+                    corrected = apply_imu_offsets(full_quats, self.robot_config)
+                    constrained = project_to_rotation_axes(corrected, self.robot_config.rotation_axes)
+                    propagated = propagate_base_rotation(constrained, self.robot_config)
+                    lift_corr = float(np.degrees(extract_axis_rotation(propagated[1], self.robot_config.rotation_axes[1])))
+                    tilt_corr = float(np.degrees(extract_axis_rotation(propagated[2], self.robot_config.rotation_axes[2])))
+                    scoop_corr = float(np.degrees(extract_axis_rotation(propagated[3], self.robot_config.rotation_axes[3])))
+                    debug_info['imu_angles_corrected'] = {'lift': lift_corr, 'tilt': tilt_corr, 'scoop': scoop_corr}
+
+                    # Relative joint angles for all 4 joints [slew, lift, tilt, scoop]
+                    try:
+                        rel_angles_rad = compute_relative_joint_angles(full_quats, self.robot_config)
+                        rel_deg = list(np.degrees(rel_angles_rad).astype(float))
+                        debug_info['joint_angles_relative'] = {
+                            'slew': rel_deg[0],
+                            'lift': rel_deg[1],
+                            'tilt': rel_deg[2],
+                            'scoop': rel_deg[3],
+                        }
+                    except Exception:
+                        debug_info['joint_angles_relative'] = None
+                except Exception:
+                    debug_info['imu_angles_corrected'] = None
         else:
-            debug_info['imu_angles'] = None
+            debug_info['imu_angles_raw'] = None
+            debug_info['imu_angles_corrected'] = None
+            debug_info['joint_angles_relative'] = None
 
         # Loop performance
         if self.loop_times and self.compute_times:
@@ -504,12 +576,12 @@ class DataLogger:
 
 
 # Initialize data logger
-logger = DataLogger()
+logger = DataLogger(robot_config=robot_config)
 
 # ============================================================
 # MAIN CONTROL LOOP
 # ============================================================
-if server.handshake():
+if server.handshake(timeout=30.0):
     server.start_receiving()
     print("UDP connection established, starting control loop...")
 
@@ -537,11 +609,10 @@ if server.handshake():
         loop_start = time.perf_counter()
         compute_time = 0.0  # Initialize here for all loop paths
 
-        data = server.get_latest()
+        # Get latest controller data as floats in [-1, 1]
+        float_data = server.get_latest_floats()
 
-        if data:
-            # Convert to float [-1.0 to 1.0]
-            float_data = [round((value / 127.0), 2) for value in data]
+        if float_data:
 
             # Map controller inputs
             right_rl = float_data[8]        # scoop
@@ -632,11 +703,26 @@ if server.handshake():
 
                 # Build compact debug string
                 debug_str = f"[DEBUG] "
+                # Show slew rotation
+                if 'slew_angle' in debug and debug['slew_angle'] is not None:
+                    debug_str += f"Slew={debug['slew_angle']:+6.1f}° | "
+                # Show RAW and corrected joint angles if requested
+                if DEBUG_JOINTS and 'imu_angles_raw' in debug and debug['imu_angles_raw']:
+                    a = debug['imu_angles_raw']
+                    debug_str += f"RAW: Lift={a['lift']:+6.1f}° Tilt={a['tilt']:+6.1f}° Scoop={a['scoop']:+6.1f}° | "
+                if DEBUG_JOINTS and 'imu_angles_corrected' in debug and debug['imu_angles_corrected']:
+                    c = debug['imu_angles_corrected']
+                    debug_str += f"CORR: Lift={c['lift']:+6.1f}° Tilt={c['tilt']:+6.1f}° Scoop={c['scoop']:+6.1f}° | "
 
-                # Joint angles
-                if debug['imu_angles']:
-                    angles = debug['imu_angles']
-                    debug_str += f"Joints: Lift={angles['lift']:+6.1f}° Tilt={angles['tilt']:+6.1f}° Scoop={angles['scoop']:+6.1f}° | "
+                # Relative angles (all 4 joints)
+                if DEBUG_JOINTS and 'joint_angles_relative' in debug and debug['joint_angles_relative']:
+                    r = debug['joint_angles_relative']
+                    debug_str += (
+                        f"REL: Slew={r['slew']:+6.1f}° "
+                        f"Lift={r['lift']:+6.1f}° "
+                        f"Tilt={r['tilt']:+6.1f}° "
+                        f"Scoop={r['scoop']:+6.1f}° | "
+                    )
 
                 # Loop timing (only when collecting logger timings)
                 if logger.is_logging and debug['loop_time_ms']:
@@ -722,6 +808,10 @@ if server.handshake():
 else:
     print("UDP handshake failed!")
     hardware.reset()
+    try:
+        hardware.shutdown()
+    except Exception:
+        pass
 
 # Cleanup on exit
 print("\nShutting down...")
@@ -730,4 +820,8 @@ if logger.get_sample_count() > 0:
     logger.is_logging = False  # Stop logging
     hardware.reset(reset_pump=False)  # Pause hardware
     logger.save()  # Save synchronously
+try:
+    hardware.shutdown()
+except Exception:
+    pass
 hardware.reset(reset_pump=True)  # Final cleanup with pump off

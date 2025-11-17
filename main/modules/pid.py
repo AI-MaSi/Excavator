@@ -100,7 +100,7 @@ class PIDController:
         kd=0.05,
         min_output=-1.0,
         max_output=1.0,
-        deriv_filter_tau=0.05,   # ↑ if measurement is noisy; ↓ if you need faster D
+        deriv_filter_tau=0.10,   # 0.05 ↑ if measurement is noisy; ↓ if you need faster D
         Imin=None,               # default computed from outputs & ki
         Imax=None,
     ):

@@ -11,14 +11,7 @@ class USBSerialReader:
         self.port = None
         self.simulation_mode = simulation_mode
         self.sim_time = 0.0
-        # Unwrap state per IMU index: {idx: {last: deg, offset: deg}}
-        self._unwrap_state = {}
-        # NOTE (firmware tuning): If unwrapped pitch looks biased during slewing,
-        # adjust AHRS params in firmware and re-flash:
-        #   file: src/imu_reader/Fusion/Fusion/InitFusion.c
-        #   lines: look for FusionAhrsSettings (gain, accelerationRejection, recoveryTriggerPeriod)
-        # Suggested snappier feel: gain=0.4, accelerationRejection=12, recoveryTriggerPeriod=3*SR
-        # Suggested more rejection (less bias): gain=0.3, accelerationRejection=16
+        self.last_timestamp_us = None
         if not simulation_mode:
             self.connect()
         else:
@@ -141,7 +134,6 @@ class USBSerialReader:
         link0_angle = min(42.0, (self.sim_time / 10.0) * 42.0) * math.pi / 180.0
 
         # Calculate angular velocity (rad/s) for gyro simulation
-        # Angular velocity = change in angle / time
         angular_velocity = (42.0 * math.pi / 180.0) / 10.0 if self.sim_time < 10.0 else 0.0
 
         # Generate realistic quaternions for each IMU
@@ -168,60 +160,18 @@ class USBSerialReader:
         z2 = 0.0
         gx2, gy2, gz2 = 0.0, angular_velocity, 0.0  # Same angular velocity
 
-        if self.include_gyro:
-            return [[w0, x0, y0, z0, gx0, gy0, gz0],
-                    [w1, x1, y1, z1, gx1, gy1, gz1],
-                    [w2, x2, y2, z2, gx2, gy2, gz2]]
-        else:
-            return [[w0, x0, y0, z0],
-                    [w1, x1, y1, z1],
-                    [w2, x2, y2, z2]]
-
-    @staticmethod
-    def quat_to_pitch_deg(w, x, y, z):
-        """
-        Extract twist about the Y-axis from quaternion as a pitch angle in degrees.
-        This returns an angle in [-180, 180] using 2*atan2(y, w), which works for
-        the firmware's PITCH mode (pure Y rotation) and provides a reasonable Y-twist
-        for FULL quaternions. Use _unwrap_angle_deg to make it continuous beyond 180.
-        """
-        import math
-        # Normalize to be safe
-        norm = math.sqrt(w*w + x*x + y*y + z*z)
-        if norm > 0.0:
-            w, x, y, z = w/norm, x/norm, y/norm, z/norm
-        # Y-axis twist angle from quaternion
-        angle = 2.0 * math.degrees(math.atan2(y, w))
-        # Map to (-180, 180]
-        if angle <= -180.0:
-            angle += 360.0
-        elif angle > 180.0:
-            angle -= 360.0
-        return angle
-
-    def _unwrap_angle_deg(self, current_deg, key):
-        """Simple unwrap across +-180 using per-key state (key can be IMU index)."""
-        state = self._unwrap_state.get(key)
-        if state is None:
-            self._unwrap_state[key] = {"last": current_deg, "offset": 0.0}
-            return current_deg
-        last = state["last"]
-        offset = state["offset"]
-        delta = current_deg - last
-        if delta > 180.0:
-            offset -= 360.0
-        elif delta < -180.0:
-            offset += 360.0
-        state["last"] = current_deg
-        state["offset"] = offset
-        return current_deg + offset
+        # Always include gyro in simulation
+        return [[w0, x0, y0, z0, gx0, gy0, gz0],
+                [w1, x1, y1, z1, gx1, gy1, gz1],
+                [w2, x2, y2, z2, gx2, gy2, gz2]]
 
     def read_imus(self):
         """
-        Read IMU data from serial port or simulation.
-        Returns: list of N arrays, each containing [w, x, y, z] plus gyro (gx, gy, gz)
-                 and optional pitch (deg) depending on include_gyro/include_pitch settings;
-                 or None if no valid data available
+        Read raw IMU data from serial port or simulation.
+
+        Returns:
+            list of N arrays, each containing [w, x, y, z, gx, gy, gz] (quaternion + gyro)
+            or None if no valid data available
         """
         if self.simulation_mode:
             return self.generate_simulation_data()
@@ -264,7 +214,7 @@ class USBSerialReader:
 
 
 if __name__ == "__main__":
-    # Minimal interactive example: print SPS and first IMU snippet
+    # Minimal interactive example: print SPS and raw quaternions
     reader = USBSerialReader()
     reader.send_handshake_config(sensor_count=3, sample_rate=120, qmode="FULL", lpf_enabled=1, lpf_alpha=0.995)
     t0 = time.time()
@@ -275,19 +225,17 @@ if __name__ == "__main__":
             if data is not None:
                 n += 1
                 if time.time() - t0 >= 1.0:
-                    # Compute unwrapped pitch for each IMU from quaternion
-                    pitches = []
+                    # Print raw quaternions
+                    quats = []
                     for idx, imu in enumerate(data):
                         if len(imu) >= 4:
                             w, x, y, z = imu[0:4]
-                            p = reader.quat_to_pitch_deg(w, x, y, z)
-                            p_unwrapped = reader._unwrap_angle_deg(p, key=idx)
-                            pitches.append(round(p_unwrapped, 2))
+                            quats.append(f"[{w:.3f},{x:.3f},{y:.3f},{z:.3f}]")
                     ts = reader.last_timestamp_us
                     if ts is not None:
-                        print(f"SPS={n}, ts_us={ts}, unwrapped pitch(deg) per IMU={pitches}")
+                        print(f"SPS={n}, ts_us={ts}, raw quats={quats}")
                     else:
-                        print(f"SPS={n}, unwrapped pitch(deg) per IMU={pitches}")
+                        print(f"SPS={n}, raw quats={quats}")
                     n = 0
                     t0 = time.time()
             time.sleep(0.001)

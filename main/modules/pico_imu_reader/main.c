@@ -87,32 +87,11 @@ void update_loop_with_lpf(float sleep_time, float sensors_data[][11], Sensor* se
         FusionQuaternion quat = FusionAhrsGetQuaternion(&sensors[i].ahrs);
         quat = enforce_quaternion_continuity(quat, sensors[i].previousQuaternion);
         sensors[i].previousQuaternion = quat;  // Store for next iteration
-        quat = apply_mounting(sensors[i].mountingQuaternion, quat);
-        // Track pitch and optionally enforce pitch-only quaternion when requested
+        // Track pitch for telemetry only; do not modify quaternion on device
         float pitchDeg = quaternion_y_twist_deg(quat);
         float unwrapped = unwrap_angle_deg(pitchDeg, sensors[i].lastPitchDeg, &sensors[i].unwrapOffsetDeg);
         sensors[i].lastPitchDeg = pitchDeg;
-        sensors[i].pitchDeg = unwrapped - sensors[i].zeroOffsetDeg;
-        if (imu_reader_settings.pitchOnly) {
-            const float rad = sensors[i].pitchDeg * ((float)M_PI / 180.0f);
-            const float half = 0.5f * rad;
-            const float c = cosf(half);
-            const float s = sinf(half);
-            quat.element.w = c;
-            quat.element.x = 0.0f;
-            quat.element.y = s;
-            quat.element.z = 0.0f;
-        } else if (sensors[i].zeroOffsetDeg != 0.0f) {
-            // In FULL mode, apply a Y-axis correction to shift pitch center by -zeroOffsetDeg
-            const float rad_off = (-sensors[i].zeroOffsetDeg) * ((float)M_PI / 180.0f);
-            const float half_off = 0.5f * rad_off;
-            FusionQuaternion qcorr;
-            qcorr.element.w = cosf(half_off);
-            qcorr.element.x = 0.0f;
-            qcorr.element.y = sinf(half_off);
-            qcorr.element.z = 0.0f;
-            quat = FusionQuaternionMultiply(qcorr, quat);
-        }
+        sensors[i].pitchDeg = unwrapped;
         sensors_data[i][0] = quat.element.w;
         sensors_data[i][1] = quat.element.x;
         sensors_data[i][2] = quat.element.y;
@@ -161,32 +140,11 @@ void update_loop_no_lpf(float sleep_time, float sensors_data[][11], Sensor* sens
         FusionQuaternion quat = FusionAhrsGetQuaternion(&sensors[i].ahrs);
         quat = enforce_quaternion_continuity(quat, sensors[i].previousQuaternion);
         sensors[i].previousQuaternion = quat;  // Store for next iteration
-        quat = apply_mounting(sensors[i].mountingQuaternion, quat);
-        // Track pitch and optionally enforce pitch-only quaternion when requested
+        // Track pitch for telemetry only; do not modify quaternion on device
         float pitchDeg = quaternion_y_twist_deg(quat);
         float unwrapped = unwrap_angle_deg(pitchDeg, sensors[i].lastPitchDeg, &sensors[i].unwrapOffsetDeg);
         sensors[i].lastPitchDeg = pitchDeg;
-        sensors[i].pitchDeg = unwrapped - sensors[i].zeroOffsetDeg;
-        if (imu_reader_settings.pitchOnly) {
-            const float rad = sensors[i].pitchDeg * ((float)M_PI / 180.0f);
-            const float half = 0.5f * rad;
-            const float c = cosf(half);
-            const float s = sinf(half);
-            quat.element.w = c;
-            quat.element.x = 0.0f;
-            quat.element.y = s;
-            quat.element.z = 0.0f;
-        } else if (sensors[i].zeroOffsetDeg != 0.0f) {
-            // In FULL mode, apply a Y-axis correction to shift pitch center by -zeroOffsetDeg
-            const float rad_off = (-sensors[i].zeroOffsetDeg) * ((float)M_PI / 180.0f);
-            const float half_off = 0.5f * rad_off;
-            FusionQuaternion qcorr;
-            qcorr.element.w = cosf(half_off);
-            qcorr.element.x = 0.0f;
-            qcorr.element.y = sinf(half_off);
-            qcorr.element.z = 0.0f;
-            quat = FusionQuaternionMultiply(qcorr, quat);
-        }
+        sensors[i].pitchDeg = unwrapped;
         sensors_data[i][0] = quat.element.w;
         sensors_data[i][1] = quat.element.x;
         sensors_data[i][2] = quat.element.y;
@@ -232,7 +190,6 @@ static void startup_zero_alignment(Sensor* sensors) {
             FusionQuaternion q = FusionAhrsGetQuaternion(&sensors[i].ahrs);
             q = enforce_quaternion_continuity(q, sensors[i].previousQuaternion);
             sensors[i].previousQuaternion = q;  // Update for continuity during startup
-            q = apply_mounting(sensors[i].mountingQuaternion, q);
             float pitch = quaternion_y_twist_deg(q);
             accumPitch[i] += pitch;
             counts[i]++;

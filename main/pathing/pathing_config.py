@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 class EnvironmentConfig:
     """Environment setup configuration for both sim and real systems."""
 
+    # TODO: irl / sim Y pos flipped!
+
     # Point A configuration
     point_a_pos: Tuple[float, float, float] = (0.60, 0.15, -0.1)
     point_a_rotation_deg: float = 0.0 # y axis rotation. 0 = horizontal
@@ -39,8 +41,8 @@ class PathExecutionConfig:
     update_frequency: float = 100.0  # Hz - target loop frequency.
 
     # Acceleration/deceleration limits for trapezoid velocity profile
-    accel_mps2: float = 0.00  # Acceleration in m/s^2
-    decel_mps2: float = 0.00  # Deceleration in m/s^2
+    accel_mps2: float = 0.0#0.04  # Acceleration in m/s^2
+    decel_mps2: float = 0.0#0.04  # Deceleration in m/s^2
 
     # Path planning general parameters (apply to all algorithms)
     grid_resolution: float = 0.020  # Grid cell size used for A* (and bounds for others)
@@ -54,24 +56,22 @@ class PathExecutionConfig:
 
     # Inverse-kinematics controller
     ik_command_type: Literal["position", "pose"] = "pose"
-    ik_use_relative_mode: bool = True
-    ik_method: Literal["pinv", "svd", "trans", "dls"] = "svd"
+    ik_use_relative_mode: bool = False
+    ik_method: Literal["pinv", "svd", "trans", "dls"] = "svd" # dls 0.08 good
     
     # Method/weighting parameters (values are passed through to the IK implementation)
     # Explicit defaults (overrides controller fallbacks)
     ik_params: Dict[str, Union[float, List[float]]] = field(default_factory=lambda: {
-        "k_val": 1.25, #1.0
-        "min_singular_value": 5e-5,
-        # NOTE: 'lambda_val' is only used when ik_method == 'dls' (adaptive damping base)
+        "k_val": 1.00,
+        "min_singular_value": 1e-5,
         "lambda_val": 0.08,
-        "position_weight": 1.0, #2.0
-        "rotation_weight": 1.0,
-        "joint_weights" : [1.0, 1.0, 1.0, 1.0],#[0.8, 1.3, 1.0, 0.6],
+        "position_weight": 1.0,
+        "rotation_weight": 0.6,
+        "joint_weights": [1.0, 0.5, 0.5, 0.5],
     })
 
     # Relative-mode gains (applied to per-step delta pose when relative mode is enabled)
     relative_pos_gain: float = 1.0
-
     relative_rot_gain: float = 1.0
 
     # Axes to ignore in orientation error during IK solving.
