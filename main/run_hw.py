@@ -1,28 +1,6 @@
 #!/usr/bin/env python3
 """
-Real-hardware path planning runner V2 (using normalized planner wrappers).
-
-Goal:
-- Mirror the behavior of `run_hw.py`, but use the ready-made normalized
-  planner wrappers from `pathing/normalized_planners.py` instead of manually
-  calling raw planners + standardize_path.
-- Alternate between the configured A/B points, plan a path with different
-  planners, execute it on hardware via `ExcavatorController`, and log data
-  for later analysis.
-- Now includes support for a_star_plane algorithm.
-
-This script intentionally does NOT depend on Isaac Sim. It reuses:
-- configuration_files/pathing_config.py   (shared env + execution config)
-- pathing/normalized_planners.py          (standardized, constant-speed paths)
-- pathing/path_utils.py                   (geometry helpers)
-- modules/hardware_interface.py           (PWM/ADC/IMU)
-- modules/excavator_controller.py         (IK + PID loop on hardware)
-
-Usage (examples):
-    python run_hw_V2.py --algorithm a_star --log-data
-    python run_hw_V2.py --algorithm a_star_plane --debug --log-data
-    python run_hw_V2.py --algorithm rrt --debug --log-data
-    python run_hw_V2.py --test --once
+Hardware path planning runner using normalized planner wrappers.
 """
 
 import argparse
