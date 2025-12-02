@@ -3,6 +3,7 @@ Valve testing PWM controller with:
 - Derived PWM period from actual PCA9685 frequency
 - Simple deadband: compresses command range to skip dead zone (linear throughout!)
 - Optional dither (per-channel) to prevent valve stiction
+- Optional per-channel ramp/slew limiting to smooth step inputs
 
 Maintains linearity by packing commands into the working range around the dead zone.
 """
@@ -10,6 +11,7 @@ Maintains linearity by packing commands into the working range around the dead z
 import atexit
 import threading
 import time
+import logging
 import yaml
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Any
@@ -45,6 +47,13 @@ class ChannelConfig:
     dither_enable: bool = False
     dither_amp_us: float = 8.0  # vibration amplitude in microseconds
     dither_hz: float = 40.0  # vibration frequency
+
+    # Slew rate limiting (microseconds per second) to soften command steps
+    ramp_enable: bool = False
+    ramp_limit: float = 0.0  # us/s; ignored when ramp_enable is False
+
+    # Symmetric gamma shaping (1.0 = linear). Applied to magnitude for both directions.
+    gamma: float = 1.0
 
     def __post_init__(self):
         self.pulse_range = self.pulse_max - self.pulse_min
@@ -87,7 +96,27 @@ class PWMController:
 
     def __init__(self, config_file: str, pump_variable: bool = False,
                  toggle_channels: bool = True, input_rate_threshold: float = 0,
-                 default_unset_to_zero: bool = True):
+                 default_unset_to_zero: bool = True, log_level: str = "INFO"):
+        """Initialize PWM controller.
+
+        Args:
+            config_file: Path to YAML configuration file
+            pump_variable: Enable variable pump speed
+            toggle_channels: Enable toggleable channels
+            input_rate_threshold: Input rate threshold for safety monitoring
+            default_unset_to_zero: Default unset channels to zero
+            log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        # Setup logger
+        self.logger = logging.getLogger(f"{__name__}.PWMController")
+        self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Add console handler if no handlers exist
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
 
         self.pump_variable = pump_variable
         self.toggle_channels = toggle_channels
@@ -174,6 +203,11 @@ class PWMController:
                     dither_enable=cfg.get('dither_enable', False),
                     dither_amp_us=cfg.get('dither_amp_us', 8.0),
                     dither_hz=cfg.get('dither_hz', 40.0),
+                    # Ramp/slew limiting - opt-in per channel
+                    ramp_enable=cfg.get('ramp_enable', False),
+                    ramp_limit=float(cfg.get('ramp_limit', 0.0)),
+                    # Symmetric gamma shaping
+                    gamma=float(cfg.get('gamma', 1.0)),
                 )
 
         return channel_configs, pump_config
@@ -222,6 +256,12 @@ class PWMController:
             # dither frequency sensible
             if float(config.dither_hz) <= 0.0 or float(config.dither_hz) > 200.0:
                 errors.append(f"Channel '{name}': dither_hz must be within (0, 200]")
+            # ramp limits: enabled channels need a positive rate
+            if config.ramp_enable and float(config.ramp_limit) <= 0.0:
+                errors.append(f"Channel '{name}': ramp_limit must be > 0 when ramp_enable is true")
+            # gamma shaping bounds (keep reasonable)
+            if float(config.gamma) <= 0.0 or float(config.gamma) > 5.0:
+                errors.append(f"Channel '{name}': gamma must be within (0, 5]")
 
         if self.pump_config:
             if self.pump_config.output_channel in used_outputs:
@@ -324,18 +364,19 @@ class PWMController:
                 continue
 
             value = self.values[config.output_channel]
-            pulse = self._pulse_from_value(config, value, now)
+            pulse = self._pulse_from_value(config, value, now, apply_ramp=True)
 
             # Convert to duty and push
             duty_cycle = int((pulse / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
             self.pca.channels[config.output_channel].duty_cycle = duty_cycle
 
-    def _pulse_from_value(self, config: ChannelConfig, value: float, now: Optional[float] = None) -> float:
+    def _pulse_from_value(self, config: ChannelConfig, value: float, now: Optional[float] = None,
+                          apply_ramp: bool = False) -> float:
         """Compute output pulse width (us) from normalized value using current config.
 
         Applies simple deadband by compressing command range into working area.
         Optional dither adds vibration to prevent valve stiction.
-        Linear mapping throughout - no discontinuities!
+        Optional ramp limits slew rate so even deadband jumps are spread over time.
         """
         if now is None:
             now = time.time()
@@ -343,33 +384,85 @@ class PWMController:
         # Enforce input deadzone locally so preview/compute_pulse() honors it too
         if abs(value) < float(getattr(config, 'deadzone_threshold', 0.0)):
             value = 0.0
+        # Apply symmetric gamma shaping for both directions
+        value = self._apply_gamma(value, float(config.gamma))
 
+        base_pulse = self._compute_base_pulse(config, value)
+        if apply_ramp:
+            base_pulse = self._apply_ramp(config, base_pulse, now)
+        pulse = self._apply_dither(config, base_pulse, value, now)
+
+        # Clamp to limits
+        pulse = max(config.pulse_min, min(config.pulse_max, pulse))
+        return pulse
+
+    def _compute_base_pulse(self, config: ChannelConfig, value: float) -> float:
+        """Map normalized value to physical pulse without dither or ramp."""
         # Simple deadband by physical sign (value * direction):
         # - s > 0 => physical positive: jump to center + deadband_us_pos, then scale to pulse_max
         # - s < 0 => physical negative: jump to center - deadband_us_neg, then scale to pulse_min
         # - s == 0 => center
         s = float(value) * float(config.direction)
         if s == 0.0:
-            pulse = float(config.center)
+            return float(config.center)
         elif s > 0.0:
             base = float(config.center) + float(config.deadband_us_pos)
             working_range = float(config.pulse_max) - base
-            pulse = base + abs(float(value)) * working_range
+            return base + abs(float(value)) * working_range
         else:  # s < 0.0
             base = float(config.center) - float(config.deadband_us_neg)
             working_range = base - float(config.pulse_min)
-            pulse = base - abs(float(value)) * working_range
+            return base - abs(float(value)) * working_range
 
+    def _apply_dither(self, config: ChannelConfig, pulse: float, value: float, now: float) -> float:
         # Dither to prevent valve stiction (only when actively commanding)
         if config.dither_enable and abs(value) >= float(getattr(config, 'deadzone_threshold', 0.0)):
             # Per-channel phase offset using output_channel index to avoid perfect sync
             phase = 2.0 * 3.141592653589793 * config.dither_hz * now + (config.output_channel * 1.0471975512)
             dither = config.dither_amp_us * __import__('math').sin(phase)
             pulse += dither
-
-        # Clamp to limits
-        pulse = max(config.pulse_min, min(config.pulse_max, pulse))
         return pulse
+
+    def _apply_ramp(self, config: ChannelConfig, target_pulse: float, now: float) -> float:
+        """Limit slew rate so large steps are spread over time."""
+        state_container = getattr(self, "_channel_ramp_state", None)
+        if state_container is None:
+            self._channel_ramp_state = {}
+            state_container = self._channel_ramp_state
+
+        state = state_container.get(config.output_channel)
+        if state is None:
+            # Initialize state lazily if a channel was added later
+            self._channel_ramp_state[config.output_channel] = (target_pulse, now)
+            return target_pulse
+
+        last_pulse, last_time = state
+        if not config.ramp_enable or float(config.ramp_limit) <= 0.0:
+            self._channel_ramp_state[config.output_channel] = (target_pulse, now)
+            return target_pulse
+
+        dt_raw = max(0.0, now - last_time)
+        # Clamp dt so a stalled loop cannot create a giant one-shot jump; allow up to 2x the prior interval.
+        if self._last_ramp_dt > 0.0:
+            dt = min(dt_raw, self._last_ramp_dt * 2.0)
+        else:
+            dt = dt_raw
+        if dt <= 0.0:
+            self._channel_ramp_state[config.output_channel] = (last_pulse, now)
+            return last_pulse
+
+        allowed_step = float(config.ramp_limit) * dt  # microseconds permitted in this interval
+        delta = target_pulse - last_pulse
+        if abs(delta) <= allowed_step:
+            new_pulse = target_pulse
+        else:
+            new_pulse = last_pulse + allowed_step * (1 if delta > 0 else -1)
+
+        self._channel_ramp_state[config.output_channel] = (new_pulse, now)
+        # Remember unclamped dt to keep the clamp adaptive to the real loop cadence
+        if dt_raw > 0.0:
+            self._last_ramp_dt = dt_raw
+        return new_pulse
 
     # Public helper for testers to preview the pulse for a value
     def compute_pulse(self, name: str, value: float, now: Optional[float] = None) -> Optional[float]:
@@ -378,6 +471,14 @@ class PWMController:
             return None
         value = max(-1.0, min(1.0, float(value)))
         return self._pulse_from_value(cfg, value, now)
+
+    @staticmethod
+    def _apply_gamma(value: float, gamma: float) -> float:
+        """Apply symmetric gamma shaping to a normalized command."""
+        if gamma == 1.0 or value == 0.0:
+            return value
+        sign = 1.0 if value >= 0 else -1.0
+        return sign * (abs(value) ** gamma)
 
     def _update_pump(self):
         if not self.pump_config:
@@ -403,6 +504,7 @@ class PWMController:
         for name, config in self.channel_configs.items():
             duty_cycle = int((config.center / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
             self.pca.channels[config.output_channel].duty_cycle = duty_cycle
+        self._init_ramp_state()
         if reset_pump and self.pump_config:
             duty_cycle = int((self.pump_config.pulse_min / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
             self.pca.channels[self.pump_config.output_channel].duty_cycle = duty_cycle
@@ -467,8 +569,24 @@ class PWMController:
                 self._start_monitoring()
             return True
         except Exception as e:
-            print(f"Error loading configuration: {e}")
+            self.logger.error(f"Error loading configuration: {e}")
             return False
+
+    def set_log_level(self, level: str) -> None:
+        """Change the logging level at runtime.
+
+        Args:
+            level: One of "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    def _init_ramp_state(self):
+        now = time.time()
+        self._channel_ramp_state: Dict[int, tuple[float, float]] = {}
+        for cfg in self.channel_configs.values():
+            self._channel_ramp_state[cfg.output_channel] = (float(cfg.center), now)
+        # Track last observed dt for adaptive clamp
+        self._last_ramp_dt: float = 0.0
 
     def _simple_cleanup(self):
         try:

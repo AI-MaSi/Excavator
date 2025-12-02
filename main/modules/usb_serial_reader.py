@@ -1,10 +1,30 @@
 import serial
 import time
+import logging
 import serial.tools.list_ports
 
 
 class USBSerialReader:
-    def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False):
+    def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False, log_level: str = "INFO"):
+        """Initialize USB serial reader.
+
+        Args:
+            baud_rate: Serial baud rate
+            timeout: Serial timeout in seconds
+            simulation_mode: If True, generate synthetic data instead of reading hardware
+            log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        # Setup logger
+        self.logger = logging.getLogger(f"{__name__}.USBSerialReader")
+        self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Add console handler if no handlers exist
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
         self.baud_rate = baud_rate
         self.timeout = timeout
         self.ser = None
@@ -15,33 +35,41 @@ class USBSerialReader:
         if not simulation_mode:
             self.connect()
         else:
-            print("Simulation mode: generating synthetic IMU data")
+            self.logger.info("Simulation mode: generating synthetic IMU data")
 
     def find_pico_port(self):
         """Try to find the Pico automatically"""
         ports = serial.tools.list_ports.comports()
         for port in ports:
             if 'Pico' in port.description or 'USB Serial' in port.description:
-                print(f"Found Pico on port: {port.device}")
+                self.logger.info(f"Found Pico on port: {port.device}")
                 return port.device
 
         # Default fallback: pick first available port on this system
         if ports:
-            print(f"No Pico descriptor match; defaulting to {ports[0].device}")
+            self.logger.warning(f"No Pico descriptor match; defaulting to {ports[0].device}")
             return ports[0].device
-        print("No serial ports found. Please specify manually (e.g., COM3).")
+        self.logger.error("No serial ports found. Please specify manually (e.g., COM3).")
         return 'COM3'
+
+    def set_log_level(self, level: str) -> None:
+        """Change the logging level at runtime.
+
+        Args:
+            level: One of "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     def connect(self):
         """Connect to the serial port"""
         self.port = self.find_pico_port()
         try:
             self.ser = serial.Serial(self.port, self.baud_rate, timeout=self.timeout)
-            print(f"Connected to {self.port} at {self.baud_rate} baud")
+            self.logger.info(f"Connected to {self.port} at {self.baud_rate} baud")
             # Wait a moment for connection to stabilize
             time.sleep(0.1)
         except serial.SerialException as e:
-            print(f"Serial connection error: {e}")
+            self.logger.error(f"Serial connection error: {e}")
             raise
 
     def send_handshake_config(self, sensor_count=3, sample_rate=120, qmode="FULL",
@@ -56,7 +84,7 @@ class USBSerialReader:
             sample_rate: Sample rate in Hz
         """
         if not self.ser or not self.ser.is_open:
-            print("Serial port not connected - cannot send handshake")
+            self.logger.warning("Serial port not connected - cannot send handshake")
             return False
         try:
             # Always CSV stream on-device; minimal fields
@@ -70,23 +98,23 @@ class USBSerialReader:
                 f"SC={sensor_count}|LPF_ENABLED={lpf_enabled}|LPF_ALPHA={lpf_alpha}|SR={sample_rate}|QMODE={qm}|\n"
             )
             self.ser.write(format_response.encode("utf-8"))
-            print(f"Sent handshake config: {format_response.strip()}")
+            self.logger.debug(f"Sent handshake config: {format_response.strip()}")
             return True
         except serial.SerialException as e:
-            print(f"Error sending handshake: {e}")
+            self.logger.error(f"Error sending handshake: {e}")
             return False
 
     def send_zero(self):
         """Request re-zero from device (sets current pitch as zero)."""
         if not self.ser or not self.ser.is_open:
-            print("Serial port not connected - cannot send ZERO")
+            self.logger.warning("Serial port not connected - cannot send ZERO")
             return False
         try:
             self.ser.write(b"CMD=ZERO\n")
-            print("Sent ZERO command")
+            self.logger.info("Sent ZERO command")
             return True
         except serial.SerialException as e:
-            print(f"Error sending ZERO: {e}")
+            self.logger.error(f"Error sending ZERO: {e}")
             return False
 
     def parse_imu_line(self, line):
@@ -186,7 +214,7 @@ class USBSerialReader:
                     return self.parse_imu_line(line)
             return None
         except serial.SerialException as e:
-            print(f"Serial read error: {e}")
+            self.logger.error(f"Serial read error: {e}")
             return None
 
 
@@ -206,7 +234,7 @@ class USBSerialReader:
         """Close the serial connection"""
         if self.ser and self.ser.is_open:
             self.ser.close()
-            print("Serial connection closed")
+            self.logger.info("Serial connection closed")
 
     def __del__(self):
         """Cleanup on object destruction"""
@@ -227,15 +255,18 @@ if __name__ == "__main__":
                 if time.time() - t0 >= 1.0:
                     # Print raw quaternions
                     quats = []
+                    gyro = []
                     for idx, imu in enumerate(data):
                         if len(imu) >= 4:
                             w, x, y, z = imu[0:4]
+                            gx, gy, gz = 0.0, 0.0, 0.0
                             quats.append(f"[{w:.3f},{x:.3f},{y:.3f},{z:.3f}]")
+                            gyro.append(f"[{gx:.2f},{gy:.2f},{gz:.2f}]")
                     ts = reader.last_timestamp_us
                     if ts is not None:
-                        print(f"SPS={n}, ts_us={ts}, raw quats={quats}")
+                        reader.logger.info(f"SPS={n}, ts_us={ts}, quats={quats}, gyro={gyro}")
                     else:
-                        print(f"SPS={n}, raw quats={quats}")
+                        reader.logger(info(f"[No timestamp] SPS={n}"))
                     n = 0
                     t0 = time.time()
             time.sleep(0.001)

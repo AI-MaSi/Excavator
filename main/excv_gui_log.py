@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """
 Well not gui but it reads values sent from client GUI haha
+
+  # Normal operation with INFO level (default)
+  python excv_gui_log.py
+  # Debug mode - see all internal details
+  python excv_gui_log.py --log-level DEBUG
+  # Quiet mode - only warnings and errors
+  python excv_gui_log.py --log-level WARNING
+  # Performance monitoring mode (compact output)
+  python excv_gui_log.py --perf
+  # Jacobian debugging with detailed IK logging
+  python excv_gui_log.py --jac
+  # Jacobian debugging with full DEBUG output
+  python excv_gui_log.py --log-level DEBUG --jac
+
 """
 
 import time
+import logging
 import argparse
 import numpy as np
 from modules.udp_socket import UDPSocket
@@ -83,14 +98,15 @@ def decode_bytes_to_position(bytes_list):
 
 def encode_joint_positions_to_bytes(joint_positions):
     """
-    Encode 4 joint positions to 24 bytes (2 bytes per coordinate, 3 coords per joint).
+    Encode joint positions to bytes (2 bytes per coordinate, 3 coords per joint).
 
     Args:
-        joint_positions: List of 4 positions [[x,y,z], [x,y,z], [x,y,z], [x,y,z]]
-                        Order: [boom_mount, arm_mount, bucket_mount, tool_mount]
+        joint_positions: List of positions [[x,y,z], ...]
+                        For excavator with EE: [boom_mount, arm_mount, bucket_mount, tool_mount, ee_actual]
+                        Returns 30 bytes for 5 positions
 
     Returns:
-        List of 24 signed bytes
+        List of signed bytes (6 bytes per position)
     """
     SCALE = 13107.0
 
@@ -132,109 +148,114 @@ def encode_joint_positions_to_bytes(joint_positions):
 
 def main():
     """Receive position commands and control excavator"""
-    # CLI args for enabling Jacobian logging and performance debug
-    parser = argparse.ArgumentParser(description="GUI receiver with optional Jacobian logging")
-    parser.add_argument("--log", action="store_true", help="Enable Jacobian-level debug logging")
-    parser.add_argument("--debug", action="store_true", help="Enable clean performance metrics display (loop time, headroom, CPU)")
+    # CLI args for log level and performance debug
+    parser = argparse.ArgumentParser(description="GUI receiver with configurable logging")
     parser.add_argument(
-        "--interpolate",
-        nargs=2,
-        type=float,
-        metavar=("MPS", "DEG_PER_S"),
-        help="Interpolate commands at given linear speed (m/s) and angular speed (deg/s). Default: off",
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level for controller and modules (default: INFO)"
     )
+    parser.add_argument("--jac", action="store_true", help="Enable Jacobian-level debug logging")
+    parser.add_argument("--perf", action="store_true", help="Enable clean performance metrics display (loop time, headroom, CPU)")
     args, _ = parser.parse_known_args()
+
+    # Setup main application logger
+    app_logger = logging.getLogger("excv_gui_log")
+    app_logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+    handler.setFormatter(formatter)
+    app_logger.addHandler(handler)
+
     global DEBUG_JAC
-    if args.log:
-        DEBUG_JAC = True
+    DEBUG_JAC = args.jac
 
-    # Performance debug mode disables normal logging
-    DEBUG_PERF = args.debug
+    # Performance debug mode uses compact output
+    DEBUG_PERF = args.perf
 
     if not DEBUG_PERF:
-        print("="*60)
-        print("  GUI POSITION RECEIVER WITH LIVE VISUALIZATION")
-        print("  Receiving position commands from excavator_gui.py")
-        print("  Sending back joint positions for live arm display")
-        print("="*60)
+        app_logger.info("="*60)
+        app_logger.info("  GUI POSITION RECEIVER WITH LIVE VISUALIZATION")
+        app_logger.info("  Receiving position commands from excavator_gui.py")
+        app_logger.info("  Sending back joint positions for live arm display")
+        app_logger.info("="*60)
 
-    # Setup UDP server to receive 9 bytes (position + rotation + reload_flag) and send 24 bytes (joint positions)
+    # Setup UDP server to receive 9 bytes (position + rotation + reload_flag) and send 30 bytes (joint positions + EE)
     server = UDPSocket(local_id=2, max_age_seconds=0.5)
-    server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=24, is_server=True)
+    server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=30, is_server=True)
 
     if not DEBUG_PERF:
-        print("\nWaiting for GUI connection...")
+        app_logger.info("\nWaiting for GUI connection...")
     if not server.handshake(timeout=30.0):
         if not DEBUG_PERF:
-            print("Handshake failed!")
+            app_logger.error("Handshake failed!")
         return
 
     if not DEBUG_PERF:
-        print("✓ Connected to GUI!")
+        app_logger.info("✓ Connected to GUI!")
 
     # Create hardware interface
     if not DEBUG_PERF:
-        print("\nInitializing hardware...")
+        app_logger.info("\nInitializing hardware...")
     from modules.hardware_interface import HardwareInterface
-    hardware = HardwareInterface()
+
+    # Set log level based on mode: WARNING in perf mode, user-specified otherwise
+    hw_log_level = "WARNING" if DEBUG_PERF else args.log_level.upper()
+    hardware = HardwareInterface(log_level=hw_log_level)
 
     if not DEBUG_PERF:
-        print("Waiting for hardware to be ready...")
+        app_logger.info("Waiting for hardware to be ready...")
     while not hardware.is_hardware_ready():
         time.sleep(0.1)
     if not DEBUG_PERF:
-        print("✓ Hardware ready!")
+        app_logger.info("✓ Hardware ready!")
 
     # Create controller
     if not DEBUG_PERF:
-        print("\nInitializing controller (includes numba warmup)...")
-    # Load all config from general_config.yaml
-    # Enable perf tracking when in DEBUG_PERF mode, disable verbose logging
+        app_logger.info("\nInitializing controller (includes numba warmup)...")
+
+    # Enable perf tracking when in DEBUG_PERF mode
+    # Set log level: WARNING in perf mode, DEBUG if --jac, otherwise user-specified
+    ctrl_log_level = "WARNING" if DEBUG_PERF else ("DEBUG" if DEBUG_JAC else args.log_level.upper())
     controller = ExcavatorController(
         hardware,
         config=None,
         enable_perf_tracking=DEBUG_PERF,
-        verbose=not DEBUG_PERF,
+        log_level=ctrl_log_level,
     )
+    # TODO: this
+    #controller.ik_controller.cfg.enable_frame_transform = False
 
     # Start the background control loop
     controller.start()
     if not DEBUG_PERF:
-        print("Waiting for controller to initialize...")
+        app_logger.info("Waiting for controller to initialize...")
     time.sleep(5.0)
 
     # Create robot config for FK computation
     robot_config = create_excavator_config()
 
     if not DEBUG_PERF:
-        print("\n" + "="*60)
-        print("  READY TO RECEIVE COMMANDS")
-        print("  Start streaming from the GUI!")
+        app_logger.info("\n" + "="*60)
+        app_logger.info("  READY TO RECEIVE COMMANDS")
+        app_logger.info("  Start streaming from the GUI!")
         # Brief IK config context
         try:
             jw = DEFAULT_CONFIG.ik_params.get('joint_weights') if hasattr(DEFAULT_CONFIG, 'ik_params') else None
-            print(f"  IK: method={getattr(DEFAULT_CONFIG,'ik_method',None)} ignore_axes={getattr(DEFAULT_CONFIG,'ignore_axes',None)} joint_weights={jw}")
+            app_logger.info(f"  IK: method={getattr(DEFAULT_CONFIG,'ik_method',None)} ignore_axes={getattr(DEFAULT_CONFIG,'ignore_axes',None)} joint_weights={jw}")
         except Exception:
             pass
-        print("="*60 + "\n")
+        app_logger.info("="*60 + "\n")
 
     # Start receiving UDP data
     server.start_receiving()
 
     last_position = None
     last_rotation = 0.0
-    # Smoothed (rate-limited) command state
-    smoothed_pos = None
-    smoothed_rot = 0.0
     last_time = time.perf_counter()
-    # Optional interpolation (rate limiting); default off unless --interpolate provided
-    INTERP_ARGS = args.interpolate
-    INTERPOLATE_ENABLED = INTERP_ARGS is not None
-    gui_max_speed_mps = None
-    gui_max_rot_deg_per_s = None
-    if INTERPOLATE_ENABLED:
-        gui_max_speed_mps = float(max(0.0, INTERP_ARGS[0]))
-        gui_max_rot_deg_per_s = float(max(0.0, INTERP_ARGS[1]))
+
     last_print_time = time.time()
     packets_received = 0
     last_packet_count = 0
@@ -263,6 +284,14 @@ def main():
     dbg_joint_deg = None
     dbg_dq_deg = None
 
+    # Target loop timing from pathing_config (DEFAULT_CONFIG)
+    target_hz = getattr(DEFAULT_CONFIG, "update_frequency", 100.0)
+    try:
+        target_dt = 1.0 / max(1e-3, float(target_hz))
+    except Exception:
+        target_dt = 0.01  # Fallback to 100 Hz if config is malformed
+    next_tick = time.perf_counter()
+
     try:
         while True:
             # Get latest UDP packet
@@ -281,17 +310,17 @@ def main():
                     if reload_flag > flag_threshold and reload_flag_prev <= flag_threshold:
                         try:
                             if not DEBUG_PERF:
-                                print("Reload config requested by client GUI...")
+                                app_logger.info("Reload config requested by client GUI...")
                             servo_ok = hardware.reload_config()
                             general_ok = hardware.reload_general_config()
                             if not DEBUG_PERF:
                                 if servo_ok or general_ok:
-                                    print(f"✓ Config reloaded (servo={servo_ok}, general={general_ok})")
+                                    app_logger.info(f"✓ Config reloaded (servo={servo_ok}, general={general_ok})")
                                 else:
-                                    print("Config reload: no changes detected")
+                                    app_logger.info("Config reload: no changes detected")
                         except Exception as e:
                             if not DEBUG_PERF:
-                                print(f"Config reload failed: {e}")
+                                app_logger.error(f"Config reload failed: {e}")
 
                     reload_flag_prev = reload_flag
 
@@ -302,54 +331,20 @@ def main():
 
                 except Exception as e:
                     if not DEBUG_PERF:
-                        print(f"Decode error: {e}")
+                        app_logger.error(f"Decode error: {e}")
                     continue
 
-            # Apply optional interpolation/rate limiting towards target (opt-in via --interpolate)
+            # Send latest target directly; controller handles smoothing internally
             try:
                 now_t = time.perf_counter()
                 dt = max(0.0, min(now_t - last_time, 0.2))
                 last_time = now_t
 
                 if last_position is not None:
-                    if INTERPOLATE_ENABLED:
-                        if smoothed_pos is None:
-                            smoothed_pos = np.array(last_position, dtype=np.float32)
-                            smoothed_rot = float(last_rotation)
-
-                        # Linear speed clamp in Cartesian space
-                        target = np.array(last_position, dtype=np.float32)
-                        delta = target - smoothed_pos
-                        dist = float(np.linalg.norm(delta))
-                        if dist > 1e-6 and gui_max_speed_mps is not None:
-                            max_step = gui_max_speed_mps * dt
-                            step = min(max_step, dist)
-                            smoothed_pos = smoothed_pos + (delta / dist) * step
-                        else:
-                            smoothed_pos = target
-
-                        # Angular speed clamp around Y in degrees
-                        def wrap_deg(e):
-                            # Wrap to [-180, 180]
-                            e = (e + 180.0) % 360.0 - 180.0
-                            return e
-
-                        rot_err = wrap_deg(float(last_rotation) - float(smoothed_rot))
-                        if gui_max_rot_deg_per_s is not None:
-                            max_rot_step = gui_max_rot_deg_per_s * dt
-                            if abs(rot_err) > 1e-6:
-                                rot_step = np.sign(rot_err) * min(abs(rot_err), max_rot_step)
-                                smoothed_rot = float(smoothed_rot + rot_step)
-                            else:
-                                smoothed_rot = float(last_rotation)
-                        else:
-                            smoothed_rot = float(last_rotation)
-
-                        # Send smoothed command to controller
-                        controller.give_pose(smoothed_pos, smoothed_rot)
-                    else:
-                        # No interpolation: send raw target directly
-                        controller.give_pose(np.array(last_position, dtype=np.float32), float(last_rotation))
+                    controller.give_pose(
+                        np.array(last_position, dtype=np.float32),
+                        float(last_rotation),
+                    )
             except Exception:
                 pass
 
@@ -368,6 +363,9 @@ def main():
 
                     # Compute forward kinematics to get joint positions
                     joint_positions = get_joint_positions(full_quats, robot_config)
+
+                    # Get actual end-effector position (with ee_offset applied)
+                    ee_position, _ = get_pose(full_quats, robot_config)
 
                     # Jacobian-level diagnostics (optional)
                     if DEBUG_JAC:
@@ -413,8 +411,9 @@ def main():
                             # Keep running even if diagnostics fail
                             pass
 
-                    # Encode and send back to GUI (24 bytes for 4 joint positions)
-                    encoded_joints = encode_joint_positions_to_bytes(joint_positions)
+                    # Encode and send back to GUI (30 bytes: 4 joint positions + 1 EE position)
+                    all_positions = list(joint_positions) + [ee_position]
+                    encoded_joints = encode_joint_positions_to_bytes(all_positions)
                     server.send(encoded_joints)
 
                     # Track network timing
@@ -556,28 +555,36 @@ def main():
                 else:
                     if not DEBUG_PERF:
                         if stats['is_connected']:
-                            print(f"Waiting for position data... (connected)")
+                            app_logger.info(f"Waiting for position data... (connected)")
                         else:
-                            print(f"No data received (connection lost)")
+                            app_logger.warning(f"No data received (connection lost)")
 
                 last_print_time = current_time
 
-            time.sleep(0.01)  # 100Hz check rate
+            # Deadline-based timing using configured target frequency
+            next_tick += target_dt
+            now = time.perf_counter()
+            sleep_time = next_tick - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # If we overrun, reset the schedule to avoid drift
+                next_tick = now
 
     except KeyboardInterrupt:
         if not DEBUG_PERF:
-            print("\n\nInterrupted by user")
+            app_logger.info("\n\nInterrupted by user")
 
     except Exception as e:
         if not DEBUG_PERF:
-            print(f"\nError: {e}")
+            app_logger.error(f"\nError: {e}")
             import traceback
             traceback.print_exc()
 
     finally:
         # Clean shutdown
         if not DEBUG_PERF:
-            print("\nStopping controller...")
+            app_logger.info("\nStopping controller...")
         controller.stop()
         hardware.reset(reset_pump=True)
 
@@ -585,13 +592,13 @@ def main():
         final_pos, final_rot_y = controller.get_pose()
 
         if not DEBUG_PERF:
-            print(f"\n{'='*60}")
-            print("FINAL STATUS:")
-            print(f"  Position: [{final_pos[0]:+.3f}, {final_pos[1]:+.3f}, {final_pos[2]:+.3f}]m")
-            print(f"  Rotation Y: {final_rot_y:+.2f}°")
-            print(f"  Total packets received: {packets_received}")
-            print(f"{'='*60}")
-            print("Done.")
+            app_logger.info(f"\n{'='*60}")
+            app_logger.info("FINAL STATUS:")
+            app_logger.info(f"  Position: [{final_pos[0]:+.3f}, {final_pos[1]:+.3f}, {final_pos[2]:+.3f}]m")
+            app_logger.info(f"  Rotation Y: {final_rot_y:+.2f}°")
+            app_logger.info(f"  Total packets received: {packets_received}")
+            app_logger.info(f"{'='*60}")
+            app_logger.info("Done.")
 
 
 if __name__ == "__main__":

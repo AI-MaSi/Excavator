@@ -30,12 +30,13 @@ IMPROVEMENTS IN V2:
 
 import numpy as np
 import numba
+import logging
 from dataclasses import dataclass
-from typing import Literal, Dict, Optional, List, Tuple
+from typing import Literal, Dict, Optional, List, Tuple, Any
 
-from modules.quaternion_math import (
-    quat_normalize, quat_multiply, quat_conjugate, quat_rotate_vector, 
-    quat_from_axis_angle, axis_angle_from_quat, wrap_to_pi, compute_pose_error,
+from .quaternion_math import (
+    quat_normalize, quat_multiply, quat_conjugate, quat_rotate_vector,
+    quat_from_axis_angle, axis_angle_from_quat, compute_pose_error,
     apply_delta_pose
 )
 
@@ -62,7 +63,11 @@ def extract_axis_rotation(quat: np.ndarray, axis: np.ndarray) -> float:
     v = np.array([x, y, z], dtype=np.float32)
     s = float(np.dot(v, a))  # signed component along axis
     ang = 2.0 * np.arctan2(s, w)
-    return float(wrap_to_pi(np.float32(ang))[()])
+    # Wrap angle to (-pi, pi] without relying on external helpers.
+    pi = np.float32(3.141592653589793)
+    two_pi = np.float32(6.283185307179586)
+    ang = (np.float32(ang) + pi) % two_pi - pi
+    return float(ang)
 
 
 def project_to_rotation_axes(quats: np.ndarray, axes: np.ndarray) -> np.ndarray:
@@ -106,6 +111,11 @@ class IKControllerConfig:
     # This provides stronger decoupling and stability when an orientation axis is intentionally ignored.
     # TODO: add to config!
     use_ignore_axes_in_jacobian: bool = True
+
+    enable_frame_transform: bool = True
+    """Transform target orientation to robot's local frame when using ignore_axes.
+    Ensures pitch commands are relative to robot heading, not global frame.
+    Critical for slew-based systems to prevent wonky behavior at large yaw angles."""
 
     enable_velocity_limiting: bool = True
     """Enable joint velocity limiting (safety feature)."""
@@ -252,13 +262,149 @@ class RobotConfig:
         self.origin_offset = np.asarray(self.origin_offset, dtype=np.float32)
 
 
+class CheckDOF:
+    # TODO: not used yet on anything meaningful!
+    # used in the future to automate "ignore_axes" setup
+    """
+    Jacobian-based DOF checker with nullspace analysis.
+
+    - Position DOFs: inferred from J_pos row norms and rank.
+    - Orientation DOFs: inferred from J_rot, but counted as "independent"
+      only if they can be excited while keeping position fixed
+      (i.e. non-zero component in the nullspace of J_pos).
+
+    This correctly identifies when orientation DOFs are coupled with position
+    (e.g., without rotating tool head the excavator slew affects both position and yaw simultaneously).
+    """
+
+    def __init__(
+        self,
+        robot_config: RobotConfig,
+        row_tol: float = 1e-4,
+        svd_tol: float = 1e-5,
+        null_rot_tol: float = 1e-4,
+    ):
+        """
+        Args:
+            robot_config: RobotConfig instance.
+            row_tol: minimum row norm to consider a DOF "present".
+            svd_tol: tolerance for rank/nullspace from SVD.
+            null_rot_tol: minimum magnitude of rotation in the position
+                nullspace to call an orientation DOF "independent".
+        """
+        self.robot_config = robot_config
+        self.row_tol = row_tol
+        self.svd_tol = svd_tol
+        self.null_rot_tol = null_rot_tol
+
+    def analyze(self, quats: np.ndarray) -> Dict[str, Any]:
+        """
+        Analyze controllable DOFs at a given joint configuration.
+
+        Args:
+            quats: joint orientations [num_joints x 4], wxyz.
+
+        Returns:
+            dict with:
+                - "pos_present": list[bool] for [x, y, z] - which position DOFs exist
+                - "rot_present": list[bool] for [roll, pitch, yaw] - which rotation DOFs exist
+                - "rot_independent": list[bool] for [roll, pitch, yaw] - which can be controlled
+                                     independently without affecting position
+                - "position_rank": int - rank of J_pos (max independent position DOFs)
+                - "independent_orientation_dofs": int - number of independently controllable orientations
+                - "total_independent_dofs": int - position_rank + independent_orientation_dofs
+        """
+        # 6 x n Jacobian
+        J = compute_jacobian(quats, self.robot_config)
+        J = np.asarray(J, dtype=np.float64)
+
+        if J.shape[0] != 6:
+            raise ValueError(f"Expected 6xN Jacobian, got {J.shape}")
+
+        J_pos = J[0:3, :]  # x, y, z
+        J_rot = J[3:6, :]  # roll, pitch, yaw
+
+        # --- Presence based on row norms ---
+        pos_present = [np.linalg.norm(J_pos[i]) > self.row_tol for i in range(3)]
+        rot_present = [np.linalg.norm(J_rot[i]) > self.row_tol for i in range(3)]
+
+        # --- Position rank (how many independent positional DOFs) ---
+        position_rank = int(np.linalg.matrix_rank(J_pos, tol=self.svd_tol))
+
+        # --- Nullspace of J_pos: motions that keep EE position fixed ---
+        # J_pos: 3 x n
+        # SVD: J_pos = U S V^T
+        # Nullspace basis = columns of V corresponding to zero singular values.
+        U, S, Vt = np.linalg.svd(J_pos, full_matrices=True)
+        # number of non-zero singular values
+        r = int(np.sum(S > self.svd_tol))
+        # Vt is (n x n); rows [r:] correspond to nullspace basis vectors
+        # Nullspace N: n x (n-r)
+        N = Vt[r:, :].T if r < Vt.shape[0] else np.zeros((J_pos.shape[1], 0))
+
+        rot_independent = [False, False, False]
+
+        if N.shape[1] > 0:
+            # For each rotational axis, check its component in null(J_pos)
+            for k in range(3):  # 0=roll, 1=pitch, 2=yaw
+                if not rot_present[k]:
+                    continue
+
+                r_k = J_rot[k, :]   # 1 x n
+                # Restrict to position-nullspace
+                # r_k_null = r_k @ N  -> 1 x (n-r)
+                r_k_null = r_k @ N
+
+                if np.linalg.norm(r_k_null) > self.null_rot_tol:
+                    rot_independent[k] = True
+        # If N has zero columns, there is no way to move without affecting position,
+        # so no independent orientation DOF (even if orientation is "present").
+
+        independent_orientation_dofs = int(sum(rot_independent))
+        total_independent_dofs = position_rank + independent_orientation_dofs
+
+        return {
+            "pos_present": pos_present,
+            "rot_present": rot_present,
+            "rot_independent": rot_independent,
+            "position_rank": position_rank,
+            "independent_orientation_dofs": independent_orientation_dofs,
+            "total_independent_dofs": total_independent_dofs,
+        }
+
+
 class IKController:
     """Differential inverse kinematics controller with numpy+numba optimization."""
 
-    def __init__(self, cfg: IKControllerConfig, robot_config: RobotConfig, verbose: bool = True):
+    def __init__(self, cfg: IKControllerConfig, robot_config: RobotConfig, verbose: bool = True, log_level: str = "INFO"):
+        """Initialize IK controller.
+
+        Args:
+            cfg: IK controller configuration
+            robot_config: Robot kinematic configuration
+            verbose: Legacy parameter, maps to DEBUG level if True
+            log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
+        """
         self.cfg = cfg
         self.robot_config = robot_config
-        self._verbose = verbose
+
+        # Setup logger
+        self.logger = logging.getLogger(f"{__name__}.IKController")
+        # If verbose flag is explicitly False, use WARNING level, otherwise use provided log_level
+        if not verbose:
+            self.logger.setLevel(logging.WARNING)
+        else:
+            self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Add console handler if no handlers exist
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
+        # Initialize debug counters
+        self._ik_raw_debug_counter = 0
 
         # Target pose buffers
         self.ee_pos_des = np.zeros(3, dtype=np.float32)
@@ -411,6 +557,45 @@ class IKController:
                 filtered[2] = 0.0
         return filtered
 
+
+    def _transform_to_robot_local_frame(self, quat: np.ndarray, joint_quats: np.ndarray) -> np.ndarray:
+        """
+        Transform a quaternion from global frame to robot's local frame by removing slew rotation.
+
+        This removes the base (slew) yaw component so that pitch/roll are expressed
+        relative to the robot's current heading, not the global frame.
+
+        Args:
+            quat: Quaternion in global frame [w, x, y, z]
+            joint_quats: Current joint quaternions (for extracting slew angle)
+
+        Returns:
+            Quaternion in robot's local frame [w, x, y, z]
+        """
+        # Extract slew angle from joint 0 (Z-axis rotation)
+        slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
+
+        # Create slew quaternion (yaw rotation around Z)
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        slew_quat = quat_from_axis_angle(z_axis, np.float32(slew_angle))
+        slew_quat_inv = quat_conjugate(slew_quat)
+
+        # Remove slew from quaternion: q_local = q_slew^-1 * q_global
+        quat_local = quat_normalize(quat_multiply(slew_quat_inv, quat))
+
+        return quat_local
+
+
+
+
+    def set_log_level(self, level: str) -> None:
+        """Change the logging level at runtime.
+
+        Args:
+            level: One of "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
     def set_command(self, command: np.ndarray, ee_pos: np.ndarray = None, ee_quat: np.ndarray = None):
         """Set target end-effector command."""
 
@@ -468,6 +653,29 @@ class IKController:
         # Compute full Jacobian (uses absolute quaternions after propagation)
         jacobian_full = compute_jacobian(joint_quats, self.robot_config)
 
+        # Optional frame transform: express everything in base (cab) frame to
+        # avoid world-frame coupling between slew yaw and pitch commands.
+        current_pos = ee_pos
+        target_pos = self.ee_pos_des
+        if self.cfg.enable_frame_transform:
+            # Extract slew angle (joint 0 rotates around Z)
+            slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
+            c = float(np.cos(-slew_angle))
+            s = float(np.sin(-slew_angle))
+            base_rot = np.array([
+                [c, -s, 0.0],
+                [s,  c, 0.0],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float32)
+
+            # Rotate poses into base frame
+            current_pos = (base_rot @ current_pos.astype(np.float32)).astype(np.float32)
+            target_pos = (base_rot @ target_pos.astype(np.float32)).astype(np.float32)
+
+            # Rotate full Jacobian rows before reduction (matches sim pipeline)
+            jacobian_full[:3, :] = base_rot @ jacobian_full[:3, :]
+            jacobian_full[3:, :] = base_rot @ jacobian_full[3:, :]
+
         # NEW: Extract reduced Jacobian if enabled
         if self.cfg.use_reduced_jacobian:
             jacobian = self._get_reduced_jacobian(jacobian_full)
@@ -479,7 +687,7 @@ class IKController:
 
         # Compute pose error and solve IK
         if self.cfg.command_type == "position":
-            position_error = self.ee_pos_des - ee_pos
+            position_error = target_pos - current_pos
             
             # NEW: Apply weighting to Jacobian rows instead of error vector
             pos_weight = self.cfg.ik_params.get("position_weight")
@@ -491,9 +699,34 @@ class IKController:
                 position_error, jacobian_pos, adaptive_lambda
             )
         else:
-            # Directly compare with desired quaternion; ignore configured axes below
+            # Transform both current and target orientations to robot's local frame if enabled
+            # This makes pitch/roll errors relative to robot heading, not global frame
+            # Critical for avoiding pitch->roll coupling at large slew angles
+            if self.cfg.enable_frame_transform:
+                ee_quat_local = self._transform_to_robot_local_frame(ee_quat, joint_quats)
+                target_quat_local = self._transform_to_robot_local_frame(self.ee_quat_des, joint_quats)
+            else:
+                ee_quat_local = ee_quat
+                target_quat_local = self.ee_quat_des
+
+            # Debug: show frame transformation
+            if self.logger.level <= logging.DEBUG:
+                try:
+                    slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
+                    slew_deg = float(np.degrees(slew_angle))
+                    self.logger.debug(
+                        "[IK dbg] slew_deg=%.2f | target_global=%s target_local=%s | ee_local=%s",
+                        slew_deg,
+                        np.round(self.ee_quat_des, 4),
+                        np.round(target_quat_local, 4),
+                        np.round(ee_quat_local, 4),
+                    )
+                except Exception:
+                    pass
+
+            # Compute pose error in local frame
             position_error, axis_angle_error = compute_pose_error(
-                ee_pos, ee_quat, self.ee_pos_des, self.ee_quat_des
+                current_pos, ee_quat_local, target_pos, target_quat_local
             )
 
             # Apply ignore_axes filtering to orientation error
@@ -550,16 +783,12 @@ class IKController:
             )
 
         # DEBUG: Log raw IK output before any limiting
-        if hasattr(self, '_ik_raw_debug_counter'):
-            self._ik_raw_debug_counter += 1
-        else:
-            self._ik_raw_debug_counter = 0
-
-        if self._verbose and self._ik_raw_debug_counter % 50 == 0:
+        self._ik_raw_debug_counter += 1
+        if self.logger.level <= logging.DEBUG and self._ik_raw_debug_counter % 50 == 0:
             raw_delta_deg = np.degrees(delta_joint_angles)
             raw_max = np.max(np.abs(raw_delta_deg))
             if raw_max > 0.01:
-                print(f"[IK-RAW] delta_deg={raw_delta_deg} (max={raw_max:.3f}°)")
+                self.logger.debug(f"IK raw delta: {raw_delta_deg} (max={raw_max:.3f}°)")
 
         # NEW: Apply velocity limiting (if enabled)
         if self.cfg.enable_velocity_limiting:
@@ -690,9 +919,9 @@ class IKController:
                     scale = 0.5 ** (self.windup_counter - 5)
                     scale = max(scale, 0.1)  # Don't go below 10%
                     delta_joint_angles *= scale
-                    # DEBUG: Print anti-windup activation
-                    if self._verbose and self.windup_counter % 50 == 6:  # Print occasionally
-                        print(f"[ANTI-WINDUP] counter={self.windup_counter} scale={scale:.3f} err_norm={current_error_norm:.4f}")
+                    # DEBUG: Log anti-windup activation
+                    if self.logger.level <= logging.DEBUG and self.windup_counter % 50 == 6:  # Log occasionally
+                        self.logger.debug(f"Anti-windup active: counter={self.windup_counter} scale={scale:.3f} err_norm={current_error_norm:.4f}")
             else:
                 # Error is decreasing - reset counter
                 self.windup_counter = max(0, self.windup_counter - 1)
@@ -881,9 +1110,7 @@ def ik_method_pinv(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float
 
 
 @numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
-def ik_method_svd(jacobian: np.ndarray, delta_pose: np.ndarray,
-                 k_val: np.float32, min_singular_value: np.float32, 
-                 w_inv: np.ndarray) -> np.ndarray:
+def ik_method_svd(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32, min_singular_value: np.float32, w_inv: np.ndarray) -> np.ndarray:
     """SVD-based IK method with singular value thresholding and joint weighting."""
     jac_f32 = np.asarray(jacobian, dtype=np.float32)
     delta_f32 = np.asarray(delta_pose, dtype=np.float32)
@@ -965,7 +1192,6 @@ def apply_imu_offsets(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.nd
 
 # Wrapper functions for Numba usage
 
-
 def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
     """
     Propagate base joint rotation to downstream joints in kinematic chain.
@@ -1011,7 +1237,7 @@ def compute_relative_joint_angles(quats: np.ndarray, robot_config: RobotConfig) 
     """
     Compute relative joint angles from absolute IMU quaternions.
     
-    For an excavator with absolute IMU orientations, joint limits are defined
+    For a robot with absolute IMU orientations, joint limits are defined
     relative to the parent link. This function extracts the relative rotation
     about each joint's axis.
     
@@ -1199,15 +1425,17 @@ def warmup_numba_functions():
             _ = ik_method_transpose(dummy_jacobian, dummy_delta_pose, np.float32(1.0))
             _ = ik_method_damped_least_squares(dummy_jacobian, dummy_delta_pose, np.float32(0.1), dummy_w_inv)
     except Exception as e:
+        # Note: Using print here as this is a module-level function called at import
+        # before any logger instances are created
         print(f"Numba warmup failed: {e}")
 
 
 def create_imu_offset_quat(angle_degrees: float) -> np.ndarray:
     """Helper function to create IMU offset quaternion for Y-axis rotation.
-    
+
     Args:
         angle_degrees: Rotation angle in degrees around Y-axis
-        
+
     Returns:
         np.ndarray: Quaternion [w, x, y, z] for the offset
     """
@@ -1273,69 +1501,3 @@ def create_excavator_config(boom_length: float = 0.468, arm_length: float = 0.25
         ee_offset=np.array([0.0, 0.0, -0.142], dtype=np.float32),  # Tool tip below bucket center
         origin_offset=np.array([0.0, 0.0, 0.0], dtype=np.float32)   # Slew axis is world origin
     )
-
-
-# ============================================================================
-# CONVENIENCE WRAPPER - Single Function for Complete IK Pipeline
-# ============================================================================
-
-def ik_step_excavator(
-    ik_controller: IKController,
-    robot_config: RobotConfig,
-    raw_imu_quats: np.ndarray,
-    target_pos: np.ndarray,
-    target_quat: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Complete IK step for excavator - handles all the conversions automatically.
-    
-    This is a convenience function that handles:
-    1. Computing relative angles from absolute IMU quaternions
-    2. Getting current end-effector pose
-    3. Setting the target
-    4. Computing new target angles
-    
-    Args:
-        ik_controller: Configured IK controller instance
-        robot_config: Robot configuration
-        raw_imu_quats: Raw IMU quaternions [4×4] from hardware (absolute orientations)
-        target_pos: Desired end-effector position [x, y, z]
-        target_quat: Desired end-effector orientation [w, x, y, z]
-        
-    Returns:
-        Tuple of:
-        - target_relative_angles: Target joint angles (relative) to send to motors
-        - current_ee_pos: Current end-effector position (for monitoring)
-        - relative_angles: Current relative joint angles (for monitoring)
-    
-    Example:
-        >>> target_angles, ee_pos, current_angles = ik_step_excavator(
-        ...     ik_controller, robot_config, raw_imus, 
-        ...     target_pos=[0.6, 0.0, 0.0],
-        ...     target_quat=[1, 0, 0, 0]
-        ... )
-        >>> send_to_motors(target_angles)
-    """
-    # Step 1: Compute relative angles for limit checking
-    relative_angles = compute_relative_joint_angles(raw_imu_quats, robot_config)
-    
-    # Step 2: Get current end-effector pose
-    ee_pos, ee_quat = get_pose(raw_imu_quats, robot_config)
-    
-    # Step 3: Set target command
-    target_command = np.concatenate([
-        np.asarray(target_pos, dtype=np.float32),
-        np.asarray(target_quat, dtype=np.float32)
-    ])
-    ik_controller.set_command(target_command, ee_pos, ee_quat)
-    
-    # Step 4: Compute new target angles
-    target_relative_angles = ik_controller.compute(
-        ee_pos=ee_pos,
-        ee_quat=ee_quat,
-        joint_angles=relative_angles,
-        joint_quats=raw_imu_quats
-    )
-    
-    return target_relative_angles, ee_pos, relative_angles
-

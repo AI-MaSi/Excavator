@@ -14,7 +14,6 @@ All algorithms use these shared utilities for consistency.
 from typing import Any, Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import numpy as np
-import math
 
 
 def interpolate_path(path: np.ndarray, interpolation_factor: int) -> np.ndarray:
@@ -167,7 +166,7 @@ def interpolate_at_s(path: np.ndarray, cum_dist: np.ndarray, s: float) -> np.nda
 
 
 # ============================================================================
-# Path Standardization (constant-speed resampling and waypoint reduction)
+# Path normalization (constant-speed resampling and waypoint reduction)
 # ============================================================================
 
 def resample_constant_speed(path: np.ndarray, speed_mps: float, dt: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -191,6 +190,113 @@ def resample_constant_speed(path: np.ndarray, speed_mps: float, dt: float) -> Tu
     positions = np.stack([interpolate_at_s(pts, cum_dist, float(s)) for s in s_vals], axis=0)
     times = s_vals / float(speed_mps)
     return positions.astype(np.float32), times.astype(np.float32)
+
+
+def resample_constant_circum_speed(
+    path: np.ndarray,
+    *,
+    speed_mps: float,
+    dt: float,
+    center_xz: Tuple[float, float] = (0.0, 0.0),
+) -> np.ndarray:
+    """Resample a path to approximate constant circumferential speed about the base.
+
+    Tailored for the excavator-style setup where the robot slews around a
+    vertical axis through the origin and motion is primarily in the X-Z plane.
+    It treats each waypoint as (x, y, z) in base/world frame and computes polar
+    coordinates in the X-Z plane:
+
+    - radius r = sqrt(x^2 + z^2)
+    - angle  theta = atan2(z, x)
+
+    The path is then reparameterized so that the cumulative circumferential
+    arc length r * |Δtheta| grows approximately linearly along the trajectory.
+    Geometric resampling is done before the standardizer; actual execution
+    timing is still governed by ``standardize_path`` (constant linear speed).
+
+    Args:
+        path: Input waypoints, shape [N, 3] (x, y, z) in base/world frame.
+        speed_mps: Target circumferential speed (m/s) used to choose the
+            approximate sampling density. Typically the same as the
+            standardizer's ``speed_mps``.
+        dt: Approximate sample period (s). Used together with ``speed_mps``
+            to decide how finely to resample. The final uniform timing still
+            comes from the standardizer.
+        center_xz: (x, z) coordinates of the rotation axis. For the current
+            demos this is always (0, 0).
+
+    Returns:
+        Resampled path of shape [M, 3]. If the path has fewer than 2 points or
+        the total circumferential length is negligible, the input path is
+        returned unchanged.
+    """
+    pts = np.asarray(path, dtype=np.float32)
+    if pts.shape[0] < 2:
+        return pts
+
+    if speed_mps <= 0.0 or dt <= 0.0:
+        # Degenerate config: nothing sensible to do, just return original.
+        return pts
+
+    cx, cz = center_xz
+
+    # Compute radius and angle in X-Z plane for each point.
+    x = pts[:, 0] - cx
+    z = pts[:, 2] - cz
+    r = np.sqrt(x * x + z * z).astype(np.float32)
+
+    # Avoid division by zero for points exactly on the axis — they contribute
+    # no circumferential motion anyway, so treat them as having a tiny radius.
+    r_safe = np.where(r < 1e-6, 1e-6, r)
+
+    theta = np.arctan2(z, x).astype(np.float32)
+    theta_unwrapped = np.unwrap(theta.astype(np.float64)).astype(np.float32)
+
+    # Segment-wise circumferential arc length: r_avg * |Δtheta|
+    dtheta = np.diff(theta_unwrapped)
+    r_mid = 0.5 * (r_safe[:-1] + r_safe[1:])
+    arc_seg = np.abs(r_mid * dtheta).astype(np.float32)
+
+    total_arc = float(np.sum(arc_seg))
+    if total_arc < 1e-6:
+        # Path has effectively no circumferential extent.
+        return pts
+
+    # Choose number of samples so that average arc between samples is close
+    # to speed_mps * dt. The standardizer will later enforce exact timing.
+    target_arc = speed_mps * dt
+    if target_arc <= 0.0:
+        return pts
+
+    num_segments = max(int(np.ceil(total_arc / target_arc)), 1)
+    num_samples = num_segments + 1
+
+    arc_cum = np.concatenate([[0.0], np.cumsum(arc_seg, dtype=np.float32)])
+    s_targets = np.linspace(0.0, total_arc, num_samples, dtype=np.float32)
+
+    resampled: List[np.ndarray] = []
+    seg_idx = 0
+    for s in s_targets:
+        # Find segment containing this arc position.
+        while seg_idx + 1 < len(arc_cum) and s > arc_cum[seg_idx + 1]:
+            seg_idx += 1
+
+        if seg_idx >= len(arc_seg):
+            # Numerical edge-case: clamp to last point.
+            resampled.append(pts[-1])
+            continue
+
+        s0 = arc_cum[seg_idx]
+        s1 = arc_cum[seg_idx + 1]
+        if s1 <= s0:
+            alpha = 0.0
+        else:
+            alpha = float((s - s0) / (s1 - s0))
+
+        p = (1.0 - alpha) * pts[seg_idx] + alpha * pts[seg_idx + 1]
+        resampled.append(p.astype(np.float32))
+
+    return np.stack(resampled, axis=0)
 
 
 def downsample_by_points(path: np.ndarray, max_points: int) -> np.ndarray:
@@ -240,49 +346,26 @@ def build_poses_xyz_quat(positions: np.ndarray) -> np.ndarray:
 def standardize_path(path: np.ndarray,
                      speed_mps: float,
                      dt: float,
-                     max_points: int = 30,
-                     smoothing: Optional[Dict[str, float]] = None,
                      return_poses: bool = True) -> Dict[str, np.ndarray]:
-    """Create a universal, constant-speed representation of a path.
+    """Create a normalized, constant-speed representation of a path.
 
     Args:
         path: Raw path [N,3]
         speed_mps: Target constant speed (m/s)
         dt: Sample period for execution (s)
-        max_points: Max control waypoints (<= this, arc-length spaced)
-        smoothing: Optional dict, e.g., {"window": 3, "strength": 1.0}; light moving average
         return_poses: If True, include Nx7 pose arrays with identity quaternions
 
     Returns dict with:
-        - control_positions: [M,3] (M <= max_points)
         - exec_positions: [K,3] constant-speed samples
         - times: [K] timestamps (s)
         - total_length_m: [1] total path length (m)
         - duration_s: [1] total duration (s)
-        - control_poses: [M,7] (optional)
         - exec_poses: [K,7] (optional)
     """
     pts = np.asarray(path, dtype=np.float32)
-    # Optional very light smoothing to reduce jitter but preserve overall shape
-    if smoothing and smoothing.get("strength", 0.0) > 0.0 and len(pts) >= 3:
-        win = int(max(1, smoothing.get("window", 3)))
-        win = 1 if win < 1 else win
-        if win > 1:
-            w = np.ones(win, dtype=np.float32) / float(win)
-            sm = np.vstack([
-                np.convolve(pts[:, 0], w, mode="same"),
-                np.convolve(pts[:, 1], w, mode="same"),
-                np.convolve(pts[:, 2], w, mode="same"),
-            ]).T.astype(np.float32)
-            sm[0] = pts[0]
-            sm[-1] = pts[-1]
-            pts = sm
-
     exec_positions, times = resample_constant_speed(pts, speed_mps, dt)
-    control_positions = downsample_by_points(exec_positions, max_points)
 
     result: Dict[str, np.ndarray] = {
-        "control_positions": control_positions,
         "exec_positions": exec_positions,
         "times": times,
         "total_length_m": np.asarray([calculate_path_length(exec_positions)], dtype=np.float32),
@@ -290,7 +373,6 @@ def standardize_path(path: np.ndarray,
     }
 
     if return_poses:
-        result["control_poses"] = build_poses_xyz_quat(control_positions)
         result["exec_poses"] = build_poses_xyz_quat(exec_positions)
 
     return result
@@ -506,9 +588,9 @@ def basis_start_goal_plane(start_w: np.ndarray, goal_w: np.ndarray) -> Tuple[np.
 def calculate_workspace_bounds(obstacle_data: List[Dict[str, Any]],
                                start_pos: Tuple[float, float, float],
                                goal_pos: Tuple[float, float, float],
-                               padding: float = 0.1,
-                               min_bounds: Tuple[float, float, float] = (0.34, -0.36, 0.0),
-                               max_bounds: Tuple[float, float, float] = (0.85, 0.36, 0.78)) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+                               padding: Optional[float] = None,
+                               min_bounds: Optional[Tuple[float, float, float]] = None,
+                               max_bounds: Optional[Tuple[float, float, float]] = None) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     """
     Calculate workspace bounds based on obstacles, start, and goal positions.
 
@@ -518,13 +600,49 @@ def calculate_workspace_bounds(obstacle_data: List[Dict[str, Any]],
         obstacle_data: List of obstacle dictionaries with "pos" keys
         start_pos: Start position (x, y, z)
         goal_pos: Goal position (x, y, z)
-        padding: Extra space around obstacles/points
-        min_bounds: Minimum workspace bounds (enforced)
-        max_bounds: Maximum workspace bounds (enforced)
+        padding: Extra space around obstacles/points (falls back to config/default)
+        min_bounds: Minimum workspace bounds (enforced, falls back to config/default)
+        max_bounds: Maximum workspace bounds (enforced, falls back to config/default)
 
     Returns:
         (bounds_min, bounds_max) as tuples
     """
+    # Pull defaults from configuration_files/pathing_config.py or error loudly if missing
+    if padding is None or min_bounds is None or max_bounds is None:
+        cfg = None
+        # Try packaged path first
+        try:
+            from configuration_files.pathing_config import DEFAULT_CONFIG  # type: ignore
+            cfg = DEFAULT_CONFIG
+        except Exception:
+            try:
+                from pathing_config import DEFAULT_CONFIG  # type: ignore
+                cfg = DEFAULT_CONFIG
+            except Exception as exc:
+                raise RuntimeError(
+                    "Workspace bounds require configuration. "
+                    "Set workspace_padding/min/max in configuration_files/pathing_config.py "
+                    "or pass explicit values into calculate_workspace_bounds."
+                ) from exc
+
+        if padding is None:
+            padding = getattr(cfg, "workspace_padding", None)
+        if min_bounds is None:
+            min_bounds = tuple(getattr(cfg, "workspace_min_bounds", ()))
+        if max_bounds is None:
+            max_bounds = tuple(getattr(cfg, "workspace_max_bounds", ()))
+
+    # Enforce presence after config lookup
+    if padding is None or min_bounds is None or max_bounds is None:
+        raise RuntimeError(
+            "Workspace bounds are not fully specified. "
+            "Ensure padding, min_bounds, and max_bounds are provided via arguments or config."
+        )
+
+    padding = float(padding)
+    min_bounds_arr = np.asarray(min_bounds, dtype=np.float32)
+    max_bounds_arr = np.asarray(max_bounds, dtype=np.float32)
+
     if len(obstacle_data) > 0:
         all_positions = [obs["pos"] for obs in obstacle_data] + [list(start_pos), list(goal_pos)]
         all_positions = np.array(all_positions)
@@ -533,8 +651,8 @@ def calculate_workspace_bounds(obstacle_data: List[Dict[str, Any]],
         bounds_max_calc = np.max(all_positions, axis=0) + padding
 
         # Ensure minimum workspace size
-        bounds_min_calc = np.minimum(bounds_min_calc, min_bounds)
-        bounds_max_calc = np.maximum(bounds_max_calc, max_bounds)
+        bounds_min_calc = np.minimum(bounds_min_calc, min_bounds_arr)
+        bounds_max_calc = np.maximum(bounds_max_calc, max_bounds_arr)
 
         return tuple(bounds_min_calc), tuple(bounds_max_calc)
     else:
@@ -562,7 +680,9 @@ class GridConfig:
 class ObstacleChecker:
     """Handles obstacle collision detection for path planning."""
 
-    def __init__(self, obstacle_data: List[Dict[str, Any]], safety_margin: float = 0.02):
+    def __init__(self, obstacle_data: List[Dict[str, Any]],
+                 safety_margin: float = 0.02,
+                 top_pad_multiplier: Optional[float] = None):
         """
         Initialize obstacle checker.
 
@@ -571,19 +691,42 @@ class ObstacleChecker:
                 - "size": np.array([x, y, z]) - obstacle dimensions
                 - "pos" or "position": np.array([x, y, z]) - obstacle center position
                 - "rot" or "rotation": np.array([w, x, y, z]) - quaternion rotation
-            safety_margin: Additional clearance around obstacles
+            safety_margin: Additional clearance around obstacles (applied here as padding)
+            top_pad_multiplier: Scale factor for padding on the top (+Z) face only.
+                If None, pulled from configuration_files/pathing_config.DEFAULT_CONFIG when available,
+                otherwise defaults to 1.0 (symmetric padding).
         """
+        self.original_obstacles = []
         self.obstacles = []
-        self.safety_margin = safety_margin
+        self.safety_margin = float(safety_margin)
 
-        # Normalize obstacle data format
+        if top_pad_multiplier is None:
+            cfg = None
+            try:
+                from configuration_files.pathing_config import DEFAULT_CONFIG  # type: ignore
+                cfg = DEFAULT_CONFIG
+            except Exception:
+                try:
+                    from pathing_config import DEFAULT_CONFIG  # type: ignore
+                    cfg = DEFAULT_CONFIG
+                except Exception:
+                    cfg = None
+
+            if cfg is not None:
+                top_pad_multiplier = getattr(cfg, "top_pad_multiplier", None)
+
+        self.top_pad_multiplier = 1.0 if top_pad_multiplier is None else float(top_pad_multiplier)
+
+        # Normalize and inflate obstacle data
         for obs in obstacle_data:
             normalized = {
                 "size": np.asarray(obs.get("size", [0.1, 0.1, 0.1]), dtype=np.float32),
                 "pos": np.asarray(obs.get("pos", obs.get("position", [0, 0, 0])), dtype=np.float32),
                 "rot": np.asarray(obs.get("rot", obs.get("rotation", [1, 0, 0, 0])), dtype=np.float32),
             }
-            self.obstacles.append(normalized)
+            self.original_obstacles.append(normalized)
+            inflated = self._inflate_obstacle(normalized)
+            self.obstacles.append(inflated)
 
         # Pre-compute axis-aligned bounding boxes for efficiency
         self._compute_aabbs()
@@ -593,25 +736,46 @@ class ObstacleChecker:
         self.aabbs = []
 
         for obs in self.obstacles:
-            size = obs["size"] + self.safety_margin * 2  # Add safety margin
             pos = obs["pos"]
-
-            # For rotated obstacles, we need to compute the AABB that encompasses
-            # the entire rotated bounding box
-            if np.allclose(obs["rot"], [1, 0, 0, 0]):  # No rotation
-                min_bounds = pos - size / 2
-                max_bounds = pos + size / 2
-            else:
-                # Compute oriented bounding box corners
-                corners = self._get_box_corners(size, pos, obs["rot"])
-                min_bounds = np.min(corners, axis=0)
-                max_bounds = np.max(corners, axis=0)
-
+            size = obs["size"]
+            corners = self._get_box_corners(size, pos, obs["rot"])
+            min_bounds = np.min(corners, axis=0)
+            max_bounds = np.max(corners, axis=0)
             self.aabbs.append({
                 "min": min_bounds,
                 "max": max_bounds,
                 "detailed": obs  # Keep reference for detailed collision checking
             })
+
+    def _inflate_obstacle(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a padded collision box using safety_margin and top_pad_multiplier.
+
+        Padding is applied in world +Z for asymmetry; for symmetric padding
+        top_pad_multiplier should be 1.0.
+        """
+        size = obs["size"]
+        pos = obs["pos"]
+        rot = obs["rot"]
+
+        bottom_pad = self.safety_margin
+        top_pad = self.safety_margin * self.top_pad_multiplier
+
+        inflated_size = np.array([
+            size[0] + 2 * self.safety_margin,
+            size[1] + 2 * self.safety_margin,
+            size[2] + bottom_pad + top_pad
+        ], dtype=np.float32)
+
+        # Shift center so reduced top padding sits mostly below the original box.
+        center_shift = np.array([0.0, 0.0, (top_pad - bottom_pad) / 2.0], dtype=np.float32)
+        inflated_pos = pos + center_shift
+
+        return {
+            "size": inflated_size,
+            "pos": inflated_pos,
+            "rot": rot,
+        }
 
     def _get_box_corners(self, size: np.ndarray, position: np.ndarray,
                         quaternion: np.ndarray) -> np.ndarray:
@@ -655,7 +819,7 @@ class ObstacleChecker:
         """Check if point is inside an oriented bounding box."""
         # For axis-aligned boxes (no rotation), use simple bounds check
         if np.allclose(obstacle["rot"], [1, 0, 0, 0], atol=1e-3):
-            half_size = (obstacle["size"] + self.safety_margin * 2) / 2
+            half_size = obstacle["size"] / 2
             min_bounds = obstacle["pos"] - half_size
             max_bounds = obstacle["pos"] + half_size
             return np.all(point >= min_bounds) and np.all(point <= max_bounds)
@@ -663,7 +827,7 @@ class ObstacleChecker:
         # For rotated boxes, transform point to local coordinates
         rot_matrix = quaternion_to_rotation_matrix(obstacle["rot"])
         local_point = rot_matrix.T @ (point - obstacle["pos"])
-        half_size = (obstacle["size"] + self.safety_margin * 2) / 2
+        half_size = obstacle["size"] / 2
 
         return np.all(np.abs(local_point) <= half_size)
 

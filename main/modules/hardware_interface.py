@@ -12,6 +12,7 @@ Usage:
 
 import time
 import numpy as np
+import logging
 from typing import List, Optional, Dict, Any
 import threading
 from pathlib import Path
@@ -35,12 +36,12 @@ def _safe_hardware_operation(func):
             return func(self, *args, **kwargs)
         except Exception as e:
             # CRITICAL SAFETY: Stop pump and reset all PWM channels before propagating error
-            print(f"[SAFETY] Error in {func.__name__}: {e}")
-            print(f"[SAFETY] Stopping pump and resetting all PWM channels...")
+            self.logger.critical(f"Error in {func.__name__}: {e}")
+            self.logger.critical("Stopping pump and resetting all PWM channels...")
             try:
                 self.reset(reset_pump=True)
             except Exception as reset_error:
-                print(f"[SAFETY] Warning: Reset failed: {reset_error}")
+                self.logger.error(f"Reset failed: {reset_error}")
             raise
     return wrapper
 
@@ -130,7 +131,7 @@ class HardwareInterface:
     Manages PWM control, IMU data, and encoder readings with background threads.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  config_file: str = "configuration_files/servo_config.yaml",
                  pump_variable: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
@@ -139,16 +140,29 @@ class HardwareInterface:
                  default_unset_to_zero: bool = True,
                  perf_enabled: bool = False,
                  imu_expected_hz: Optional[float] = None,
-                 general_config_path: str = "configuration_files/general_config.yaml"):
+                 general_config_path: str = "configuration_files/general_config.yaml",
+                 log_level: str = "INFO"):
         """
         Initialize real hardware interface.
-        
+
         Args:
             config_file: Path to PWM controller configuration
             pump_variable: Whether to use variable/static pump speed
             toggle_channels: Whether to allow usage of "toggleable" channels (i.e. tracks + center rotation)
             input_rate_threshold: Input rate threshold for PWM controller
+            log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
         """
+        # Setup logger first
+        self.logger = logging.getLogger(f"{__name__}.HardwareInterface")
+        self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Add console handler if no handlers exist
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
         self.config_file = config_file
         self._general_config_path = general_config_path
         self._general_config = self._load_general_config(general_config_path)
@@ -164,13 +178,13 @@ class HardwareInterface:
                     default_unset_to_zero=default_unset_to_zero
                 )
                 self.pwm_ready = True
-                print("PWM controller initialized")
+                self.logger.info("PWM controller initialized")
             except Exception as e:
-                print(f"PWM controller initialization failed: {e}")
+                self.logger.error(f"PWM controller initialization failed: {e}")
                 self.pwm_controller = None
                 self.pwm_ready = False
         else:
-            print("PWM controller not available")
+            self.logger.warning("PWM controller not available")
             self.pwm_controller = None
             self.pwm_ready = False
         
@@ -290,10 +304,10 @@ class HardwareInterface:
                 self.imu_thread.start()
 
             except Exception as e:
-                print(f"IMU initialization failed: {e}")
+                self.logger.error(f"IMU initialization failed: {e}")
                 self.usb_reader = None
         else:
-            print("IMU reader not available")
+            self.logger.warning("IMU reader not available")
             self.usb_reader = None
             
     def _imu_reader_thread(self) -> None:
@@ -331,7 +345,7 @@ class HardwareInterface:
                             # pitch = arcsin(2*(w*y - z*x))
                             if not self.imu_ready:
                                 self.imu_ready = True
-                                print("IMU data streaming (CSV)")
+                                self.logger.info("IMU data streaming (CSV)")
 
                         # Perf: count sample and interval stats (minimal, gated)
                         if self._perf_enabled:
@@ -381,7 +395,7 @@ class HardwareInterface:
                     next_run_time = time.perf_counter()
 
             except Exception as e:
-                print(f"IMU reader thread error: {e}")
+                self.logger.error(f"IMU reader thread error: {e}")
                 with self._imu_lock:
                     self.imu_ready = False
                 time.sleep(0.1)  # Back off on error
@@ -401,7 +415,7 @@ class HardwareInterface:
             self.adc_thread.start()
 
         except Exception as e:
-            print(f"ADC initialization failed: {e}")
+            self.logger.error(f"ADC initialization failed: {e}")
             self.adc = None
 
     def _adc_reader_thread(self) -> None:
@@ -421,7 +435,7 @@ class HardwareInterface:
                     self.latest_slew_quat = slew_data['quaternion']
                     if not self.adc_ready:
                         self.adc_ready = True
-                        print("ADC and encoder ready")
+                        self.logger.info("ADC and encoder ready")
 
                 # Perf: intervals and rate (gated)
                 if self._perf_enabled:
@@ -454,7 +468,7 @@ class HardwareInterface:
                     next_run_time = time.perf_counter()
 
             except Exception as e:
-                print(f"ADC reader thread error: {e}")
+                self.logger.error(f"ADC reader thread error: {e}")
                 with self._adc_lock:
                     self.adc_ready = False
                 time.sleep(0.1)  # Longer sleep on error
@@ -555,7 +569,7 @@ class HardwareInterface:
             try:
                 self.pwm_controller.reset(reset_pump=reset_pump)
             except Exception as e:
-                print(f"Hardware reset error: {e}")
+                self.logger.error(f"Hardware reset error: {e}")
 
     def shutdown(self) -> None:
         """Gracefully stop background threads and close I/O resources."""
@@ -613,7 +627,7 @@ class HardwareInterface:
                                              one_shot_pump_override=one_shot_pump_override)
             return True
         except Exception as e:
-            print(f"PWM named command error: {e}")
+            self.logger.error(f"PWM named command error: {e}")
             return False
 
     def get_pwm_channel_names(self, include_pump: bool = True) -> List[str]:
@@ -648,16 +662,16 @@ class HardwareInterface:
     def reload_config(self) -> bool:
         """Reload PWM controller configuration from config file."""
         if self.pwm_controller is None:
-            print("Cannot reload config: PWM controller not initialized")
+            self.logger.warning("Cannot reload config: PWM controller not initialized")
             return False
 
         try:
             success = self.pwm_controller.reload_config(self.config_file)
             if success:
-                print(f"Configuration reloaded from {self.config_file}")
+                self.logger.info(f"Configuration reloaded from {self.config_file}")
             return success
         except Exception as e:
-            print(f"Error reloading configuration: {e}")
+            self.logger.error(f"Error reloading configuration: {e}")
             return False
 
     def reload_general_config(self) -> bool:
@@ -676,7 +690,7 @@ class HardwareInterface:
                 pass
             return True
         except Exception as e:
-            print(f"Error reloading general config: {e}")
+            self.logger.error(f"Error reloading general config: {e}")
             return False
 
     def _load_general_config(self, path: str) -> Dict[str, Any]:
@@ -692,6 +706,23 @@ class HardwareInterface:
                 return data
         except Exception:
             return {}
+
+    def set_log_level(self, level: str) -> None:
+        """Change the logging level at runtime.
+
+        Args:
+            level: One of "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        self.logger.info(f"Hardware interface log level changed to {level.upper()}")
+
+        # Propagate to sub-modules that support logging
+        if hasattr(self, 'usb_reader') and self.usb_reader and hasattr(self.usb_reader, 'set_log_level'):
+            self.usb_reader.set_log_level(level)
+        if hasattr(self, 'pwm_controller') and self.pwm_controller and hasattr(self.pwm_controller, 'set_log_level'):
+            self.pwm_controller.set_log_level(level)
+        if hasattr(self, 'adc') and self.adc and hasattr(self.adc, 'set_log_level'):
+            self.adc.set_log_level(level)
 
     def _g(self, dotted: str, default=None):
         """Get nested config value from general config using dotted path."""

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 820">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1050">
   <defs>
     <style>
       .module-box { fill: #e8f4f8; stroke: #2c5f7d; stroke-width: 2; }
@@ -19,133 +19,131 @@
   </defs>
   
   <!-- Title -->
-  <text x="600" y="30" class="title-text" text-anchor="middle">PCA9685 Signal Processing Flow</text>
-  <text x="600" y="50" class="small-text" text-anchor="middle">Input [-1...1] → Output [μs]</text>
+  <text x="470" y="30" class="title-text" text-anchor="middle">PCA9685 Signal Processing Flow</text>
+  <text x="470" y="50" class="small-text" text-anchor="middle">Input [-1...1] → Output [μs]</text>
   
   <!-- Stage 1: Input Reception & Clamping -->
-  <rect x="450" y="80" width="300" height="55" class="module-box" rx="5"/>
-  <text x="600" y="108" class="label-text" text-anchor="middle" font-weight="bold">1. Input Reception</text>
-  <text x="600" y="126" class="code-text" text-anchor="middle">value = max(-1.0, min(1.0, value))</text>
+  <rect x="320" y="80" width="300" height="55" class="module-box" rx="5"/>
+  <text x="470" y="108" class="label-text" text-anchor="middle" font-weight="bold">1. Input Reception</text>
+  <text x="470" y="126" class="code-text" text-anchor="middle">value = max(-1.0, min(1.0, value))</text>
   
   <!-- Arrow down -->
-  <path d="M 600 135 L 600 165" class="flow-arrow"/>
+  <path d="M 470 135 L 470 165" class="flow-arrow"/>
   
   <!-- Stage 2: Deadzone Check (Decision) -->
-  <polygon points="600,165 740,210 600,255 460,210" class="decision-box"/>
-  <text x="600" y="208" class="label-text" text-anchor="middle" font-weight="bold">2. Deadzone Check</text>
-  <text x="600" y="226" class="condition-text" text-anchor="middle">|value| &lt; deadzone_threshold?</text>
+  <polygon points="470,165 610,210 470,255 330,210" class="decision-box"/>
+  <text x="470" y="208" class="label-text" text-anchor="middle" font-weight="bold">2. Deadzone Check</text>
+  <text x="470" y="226" class="condition-text" text-anchor="middle">|value| &lt; deadzone_threshold?</text>
   
   <!-- Yes branch - Set to zero -->
-  <path d="M 740 210 L 850 210 L 850 310" class="decision-arrow"/>
-  <text x="800 200" class="condition-text">YES</text>
-  <rect x="775" y="310" width="150" height="45" class="module-box" rx="5"/>
-  <text x="850" y="330" class="code-text" text-anchor="middle">value = 0.0</text>
-  <text x="850" y="346" class="small-text" text-anchor="middle">Skip to center</text>
-  <path d="M 850 355 L 850 390 L 600 390" class="decision-arrow"/>
+  <path d="M 610 210 L 720 210 L 720 360" class="decision-arrow"/>
+  <text x="670" y="200" class="condition-text">YES</text>
+  <rect x="645" y="360" width="150" height="40" class="module-box" rx="5"/>
+  <text x="720" y="385" class="code-text" text-anchor="middle">value = 0.0</text>
+  <path d="M 720 400 L 720 440 L 470 440" class="flow-arrow"/>
   
   <!-- No branch - Continue -->
-  <path d="M 600 255 L 600 280" class="decision-arrow"/>
-  <text x="550" y="275" class="condition-text">NO</text>
+  <path d="M 470 255 L 470 280" class="decision-arrow"/>
+  <text x="420" y="275" class="condition-text">NO</text>
   
-  <!-- Stage 3: Directional Sign Calculation -->
-  <rect x="450" y="280" width="300" height="55" class="module-box" rx="5"/>
-  <text x="600" y="308" class="label-text" text-anchor="middle" font-weight="bold">3. Apply Direction</text>
-  <text x="600" y="326" class="code-text" text-anchor="middle">s = value × config.direction</text>
+  <!-- Stage 3: Gamma Shaping (NEW) -->
+  <rect x="320" y="280" width="300" height="55" class="module-box" rx="5"/>
+  <text x="470" y="308" class="label-text" text-anchor="middle" font-weight="bold">3. Gamma Shaping</text>
+  <text x="470" y="326" class="code-text" text-anchor="middle">value = sign(value) × |value|^γ</text>
   
   <!-- Arrow down -->
-  <path d="M 600 335 L 600 390" class="flow-arrow"/>
+  <path d="M 470 335 L 470 360" class="flow-arrow"/>
   
-  <!-- Stage 4: Deadband Correction (Decision Tree) -->
-  <polygon points="600,390 740,435 600,480 460,435" class="decision-box"/>
-  <text x="600" y="433" class="label-text" text-anchor="middle" font-weight="bold">4. Deadband Correction</text>
-  <text x="600" y="451" class="condition-text" text-anchor="middle">s == 0? s &gt; 0? s &lt; 0?</text>
+  <!-- Stage 4: Directional Sign Calculation -->
+  <rect x="320" y="360" width="300" height="55" class="module-box" rx="5"/>
+  <text x="470" y="388" class="label-text" text-anchor="middle" font-weight="bold">4. Apply Direction</text>
+  <text x="470" y="406" class="code-text" text-anchor="middle">s = value × direction</text>
+  
+  <!-- Arrow down -->
+  <path d="M 470 415 L 470 440" class="flow-arrow"/>
+  
+  <!-- Stage 5: Deadband Correction (Decision Tree) -->
+  <polygon points="470,440 610,485 470,530 330,485" class="decision-box"/>
+  <text x="470" y="483" class="label-text" text-anchor="middle" font-weight="bold">5. Deadband Correction</text>
+  <text x="470" y="501" class="condition-text" text-anchor="middle">s == 0? s &gt; 0? s &lt; 0?</text>
   
   <!-- Center path (s == 0) -->
-  <path d="M 460 435 L 280 435 L 280 530" class="decision-arrow"/>
-  <text x="320" y="430" class="condition-text">s = 0</text>
-  <rect x="205" y="530" width="150" height="40" class="module-box" rx="5"/>
-  <text x="280" y="555" class="code-text" text-anchor="middle">pulse = center</text>
-  <path d="M 280 570 L 280 600 L 500 600" class="flow-arrow"/>
+  <path d="M 330 485 L 150 485 L 150 580" class="decision-arrow"/>
+  <text x="190" y="480" class="condition-text">s = 0</text>
+  <rect x="75" y="580" width="150" height="40" class="module-box" rx="5"/>
+  <text x="150" y="605" class="code-text" text-anchor="middle">pulse = center</text>
+  <path d="M 150 620 L 150 690 L 350 690" class="flow-arrow"/>
   
   <!-- Positive path (s > 0) -->
-  <path d="M 600 480 L 600 510" class="decision-arrow"/>
-  <text x="550" y="500" class="condition-text">s &gt; 0</text>
-  <rect x="475" y="510" width="250" height="60" class="module-box" rx="5"/>
-  <text x="600" y="530" class="code-text" text-anchor="middle" font-size="11">base = center + deadband_us_pos</text>
-  <text x="600" y="547" class="code-text" text-anchor="middle" font-size="11">range = pulse_max - base</text>
-  <text x="600" y="564" class="code-text" text-anchor="middle" font-size="11">pulse = base + |value| × range</text>
-  <path d="M 600 570 L 600 600" class="flow-arrow"/>
+  <path d="M 470 530 L 470 560" class="decision-arrow"/>
+  <text x="490" y="550" class="condition-text">s &gt; 0</text>
+  <rect x="345" y="560" width="250" height="60" class="module-box" rx="5"/>
+  <text x="470" y="580" class="code-text" text-anchor="middle" font-size="11">base = center + deadband_us_pos</text>
+  <text x="470" y="597" class="code-text" text-anchor="middle" font-size="11">range = pulse_max - base</text>
+  <text x="470" y="614" class="code-text" text-anchor="middle" font-size="11">pulse = base + |value| × range</text>
+  <path d="M 470 620 L 470 650" class="flow-arrow"/>
   
   <!-- Negative path (s < 0) -->
-  <path d="M 740 435 L 920 435 L 920 530" class="decision-arrow"/>
-  <text x="870" y="430" class="condition-text">s &lt; 0</text>
-  <rect x="845" y="530" width="250" height="60" class="module-box" rx="5"/>
-  <text x="970" y="550" class="code-text" text-anchor="middle" font-size="11">base = center - deadband_us_neg</text>
-  <text x="970" y="567" class="code-text" text-anchor="middle" font-size="11">range = base - pulse_min</text>
-  <text x="970" y="584" class="code-text" text-anchor="middle" font-size="11">pulse = base - |value| × range</text>
-  <path d="M 970 590 L 970 600 L 700 600" class="flow-arrow"/>
-  
-  <!-- Stage 5: Input-to-μs Conversion -->
-  <rect x="500" y="600" width="200" height="50" class="module-box" rx="5"/>
-  <text x="600" y="623" class="label-text" text-anchor="middle" font-weight="bold">5. Input-to-μs</text>
-  <text x="600" y="641" class="code-text" text-anchor="middle" font-size="11">clamp(pulse_min, pulse_max)</text>
-  
-  <!-- Arrow down -->
-  <path d="M 600 650 L 600 680" class="flow-arrow"/>
+  <path d="M 610 485 L 840 485 L 840 580" class="decision-arrow"/>
+  <text x="740" y="475" class="condition-text">s &lt; 0</text>
+  <rect x="715" y="580" width="250" height="60" class="module-box" rx="5"/>
+  <text x="840" y="600" class="code-text" text-anchor="middle" font-size="11">base = center - deadband_us_neg</text>
+  <text x="840" y="617" class="code-text" text-anchor="middle" font-size="11">range = base - pulse_min</text>
+  <text x="840" y="634" class="code-text" text-anchor="middle" font-size="11">pulse = base - |value| × range</text>
+  <path d="M 840 640 L 840 690 L 590 690" class="flow-arrow"/>
   
   <!-- Stage 6: Dither Check (Decision) -->
-  <polygon points="600,680 720,720 600,760 480,720" class="decision-box"/>
-  <text x="600" y="717" class="label-text" text-anchor="middle" font-weight="bold">6. Dither?</text>
-  <text x="600" y="735" class="condition-text" text-anchor="middle">dither_enable &amp;&amp; |value| ≥ thresh?</text>
+  <polygon points="470,650 590,690 470,730 350,690" class="decision-box"/>
+  <text x="470" y="687" class="label-text" text-anchor="middle" font-weight="bold">6. Dither</text>
+  <text x="470" y="705" class="condition-text" text-anchor="middle" font-size="11">d_enable &amp;&amp; |value| ≥ thresh?</text>
   
   <!-- Yes - Add Dither -->
-  <path d="M 720 720 L 850 720" class="decision-arrow"/>
-  <text x="770" y="710" class="condition-text">YES</text>
-  <rect x="850" y="695" width="210" height="50" class="module-box" rx="5"/>
-  <text x="955" y="715" class="code-text" text-anchor="middle" font-size="11">dither = amp × sin(2πf·t + φ)</text>
-  <text x="955" y="733" class="code-text" text-anchor="middle" font-size="11">pulse += dither</text>
-  <path d="M 955 745 L 955 800 L 700 800" class="decision-arrow"/>
+  <path d="M 590 690 L 690 790" class="decision-arrow"/>
+  <text x="630" y="730" class="condition-text">YES</text>
+  <rect x="690" y="790" width="210" height="50" class="module-box" rx="5"/>
+  <text x="795" y="810" class="code-text" text-anchor="middle" font-size="11">dither = amp × sin(2πf·t + φ)</text>
+  <text x="795" y="828" class="code-text" text-anchor="middle" font-size="11">pulse += dither</text>
+  <path d="M 690 815 L 570 815" class="flow-arrow"/>
   
   <!-- No - Skip Dither -->
-  <path d="M 480 720 L 380 720 L 380 800 L 500 800" class="decision-arrow"/>
-  <text x="420" y="710" class="condition-text">NO</text>
+  <path d="M 470 730 L 470 780" class="decision-arrow"/>
+  <text x="420" y="755" class="condition-text">NO</text>
+  
+  <!-- Stage 7: Ramp / Slew Limiting (NEW) -->
+  <rect x="320" y="780" width="300" height="55" class="module-box" rx="5"/>
+  <text x="470" y="808" class="label-text" text-anchor="middle" font-weight="bold">7. Ramp Limiting</text>
+  <text x="470" y="826" class="code-text" text-anchor="middle" font-size="11">limit Δpulse ≤ ramp_limit × Δt</text>
+  
+  <!-- Arrow down -->
+  <path d="M 470 835 L 470 860" class="flow-arrow"/>
+  
+  <!-- Stage 8: Output Clamping -->
+  <rect x="320" y="860" width="300" height="55" class="module-box" rx="5"/>
+  <text x="470" y="888" class="label-text" text-anchor="middle" font-weight="bold">8. Output</text>
+  <text x="470" y="906" class="code-text" text-anchor="middle" font-size="11">clamp(pulse_min, pulse_max)</text>
+  
+  <!-- Arrow down -->
+  <path d="M 470 915 L 470 990" class="flow-arrow"/>
   
   <!-- Final Output -->
-  <path d="M 600 800 L 600 830" class="flow-arrow"/>
-  <ellipse cx="600" cy="850" rx="80" ry="30" fill="#ffffff" stroke="#2c5f7d" stroke-width="2"/>
-  <text x="600" y="855" class="label-text" text-anchor="middle" font-weight="bold">OUTPUT [μs]</text>
+  <ellipse cx="470" cy="1020" rx="80" ry="30" fill="#ffffff" stroke="#2c5f7d" stroke-width="2"/>
+  <text x="470" y="1025" class="label-text" text-anchor="middle" font-weight="bold">OUTPUT [μs]</text>
   
   <!-- Legend -->
   <g transform="translate(50, 100)">
     <text x="0" y="0" class="label-text" font-weight="bold">Legend:</text>
-    <rect x="0" y="10" width="60" height="30" class="module-box" rx="3"/>
-    <text x="70" y="30" class="small-text">Processing</text>
     
-    <polygon points="0,60 30,75 0,90 -30,75" class="decision-box"/>
-    <text x="40" y="80" class="small-text">Decision</text>
-  </g>
-  
-  <!-- Key Details Box -->
-  <g transform="translate(50, 280)">
-    <rect x="0" y="0" width="300" height="195" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" rx="5"/>
-    <text x="10" y="20" class="label-text" font-weight="bold">Key Implementation Details:</text>
+    <!-- Processing box -->
+    <rect x="0" y="15" width="80" height="35" class="module-box" rx="3"/>
+    <text x="40" y="37" class="small-text" text-anchor="middle">Processing</text>
     
-    <text x="10" y="45" class="small-text" font-weight="bold">Deadzone:</text>
-    <text x="10" y="62" class="small-text">• Skips input value if below threshold</text>
-    <text x="10" y="77" class="small-text">• Prevents valve jitter at rest</text>
-    <text x="10" y="92" class="small-text">• Cuts the input</text>
-    
-    <text x="10" y="115" class="small-text" font-weight="bold">Deadband:</text>
-    <text x="10" y="132" class="small-text">• Jumps over the physical dead area</text>
-    <text x="10" y="147" class="small-text">• Compresses command range linearly</text>
-    <text x="10" y="162" class="small-text">  to working area (does not cut!)</text>
-    
-    <text x="10" y="185" class="small-text" font-weight="bold">Dither:</text>
-    <text x="10" y="202" class="small-text">• Add sine noise to the end output signal</text>
+    <!-- Decision diamond -->
+    <polygon points="40,75 70,95 40,115 10,95" class="decision-box"/>
+    <text x="40" y="100" class="small-text" text-anchor="middle">Decision</text>
   </g>
   
   <!-- Flow Direction Indicator -->
-  <g transform="translate(1080, 400)">
+  <g transform="translate(850, 450)">
     <path d="M 30 0 L 30 100" stroke="#2c5f7d" stroke-width="3" marker-end="url(#arrowhead)"/>
     <text x="50" y="50" class="small-text" transform="rotate(90, 50, 50)">Signal Flow</text>
   </g>

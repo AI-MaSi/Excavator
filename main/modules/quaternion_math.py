@@ -40,9 +40,6 @@ def wrap_to_pi(angles):
     wrapped_angle = (angles + pi) % two_pi
     # map to [-pi, pi]
     result = wrapped_angle - pi
-    # handle edge case where input is odd multiple of pi
-    mask = (wrapped_angle == np.float32(0.0)) & (angles > np.float32(0.0))
-    result = np.where(mask, pi, result)
     return result
 
 
@@ -170,10 +167,7 @@ def quat_rotate_vector(q, v):
 def quat_from_axis_angle(axis, angle):
     """Convert axis-angle to quaternion."""
     axis = np.asarray(axis, dtype=np.float32)
-    if hasattr(angle, 'astype'):
-        angle = angle.astype(np.float32)
-    else:
-        angle = np.float32(angle)
+    angle = np.float32(angle)
 
     # Normalize axis
     axis_norm = normalize_vector(axis)

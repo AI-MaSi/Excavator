@@ -3,7 +3,6 @@ from modules.hardware_interface import HardwareInterface
 from modules.diff_ik_V2 import (
     create_excavator_config,
     apply_imu_offsets,
-    project_to_rotation_axes,
     propagate_base_rotation,
     extract_axis_rotation,
     compute_relative_joint_angles,
@@ -347,8 +346,7 @@ class DataLogger:
                     full_quats = [slew_quat] + list(raw_imu_quats)
                     full_quats = np.array(full_quats, dtype=np.float32)
                     corrected = apply_imu_offsets(full_quats, self.robot_config)
-                    constrained = project_to_rotation_axes(corrected, self.robot_config.rotation_axes)
-                    propagated = propagate_base_rotation(constrained, self.robot_config)
+                    propagated = propagate_base_rotation(corrected, self.robot_config)
                     lift_corr = float(np.degrees(extract_axis_rotation(propagated[1], self.robot_config.rotation_axes[1])))
                     tilt_corr = float(np.degrees(extract_axis_rotation(propagated[2], self.robot_config.rotation_axes[2])))
                     scoop_corr = float(np.degrees(extract_axis_rotation(propagated[3], self.robot_config.rotation_axes[3])))
@@ -780,10 +778,14 @@ if server.handshake(timeout=30.0):
                         logger.save_with_pause(hardware)  # Pause and save
                         print("\nData collection complete! You can continue driving or exit.")
 
-                # Print input rate
+                # Print input rate (or disabled state)
                 if hardware.pwm_controller:
-                    avg_rate = hardware.pwm_controller.get_average_input_rate()
-                    print(f"Average input rate: {avg_rate:.2f}Hz")
+                    pwm = hardware.pwm_controller
+                    if getattr(pwm, "skip_rate_checking", True):
+                        print("Average input rate: rate checking disabled")
+                    else:
+                        avg_rate = pwm.get_average_input_rate()
+                        print(f"Average input rate: {avg_rate:.2f}Hz")
 
         else:
             # No data received (safety handled internally)

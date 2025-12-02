@@ -17,16 +17,17 @@ All algorithms:
 - Return NumPy arrays (float32, shape [N, 3])
 - Support both 3D and planar (X-Z) planning
 
-Author: Refactored for NumPy-only usage
+Refactored for NumPy-only usage
 Date: 2025
 """
 
 import heapq
+import logging
 import math
 import numpy as np
 import random
 import time
-from typing import List, Tuple, Optional, Dict, Any, Set
+from typing import List, Tuple, Optional, Dict, Any, Set, TypeAlias
 from dataclasses import dataclass
 
 # Import utilities from path_utils
@@ -37,10 +38,66 @@ from .path_utils import (
     quaternion_conjugate,
     quaternion_multiply,
     rotation_matrix_to_quaternion,
-    basis_start_goal_plane,
     normalize_vector,
-    standardize_path,
+    basis_start_goal_plane,
 )
+
+# ============================================================================
+# Type Aliases
+# ============================================================================
+
+Point3D: TypeAlias = Tuple[float, float, float]
+PathType: TypeAlias = List[Point3D]
+ObstacleData: TypeAlias = List[Dict[str, Any]]
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Custom Exceptions
+# ============================================================================
+
+class PathPlanningError(Exception):
+    """Base exception for all path planning errors."""
+    pass
+
+class NoPathFoundError(PathPlanningError):
+    """Raised when no valid path exists between start and goal."""
+    pass
+
+class CollisionError(PathPlanningError):
+    """Raised when start or goal position is in collision."""
+    pass
+
+class TimeoutError(PathPlanningError):
+    """Raised when planning exceeds maximum iterations."""
+    pass
+
+class InvalidInputError(PathPlanningError):
+    """Raised when input parameters are invalid."""
+    pass
+
+# ============================================================================
+# Algorithm Configuration Constants
+# ============================================================================
+
+# A* Constants
+ASTAR_DEFAULT_MAX_ITERATIONS = 200000
+ASTAR_PROGRESS_LOG_INTERVAL = 5000
+ASTAR_EDGE_SAMPLES_MIN = 5
+ASTAR_EDGE_SAMPLE_RESOLUTION = 0.5
+
+# RRT Constants
+RRT_DEFAULT_GOAL_SAMPLE_OFFSET = 0.05
+RRT_PROGRESS_LOG_INTERVAL = 500
+
+# PRM Constants
+PRM_MAX_SAMPLE_ATTEMPTS = 1000
+PRM_PROGRESS_LOG_INTERVAL_SAMPLES = 200
+PRM_PROGRESS_LOG_INTERVAL_CONNECTIONS = 100
 
 
 # ============================================================================
@@ -49,7 +106,12 @@ from .path_utils import (
 
 @dataclass
 class AStarParams:
+    """Parameters for A* path planning."""
     max_iterations: int = 200000
+
+
+# Kept for backwards compatibility - use AStarParams instead
+AStarPlanarParams = AStarParams
 
 
 @dataclass
@@ -70,18 +132,9 @@ class RRTStarParams(RRTParams):
 
 @dataclass
 class PRMParams:
-    num_samples: int = 1000
-    connection_radius: float = 0.12
+    num_samples: int = 1500
+    connection_radius: float = 0.20
     max_connections_per_node: int = 15
-
-
-@dataclass
-class StandardizerParams:
-    speed_mps: float = 0.10
-    dt: float = 0.20
-    max_points: int = 30
-    smoothing: Optional[Dict[str, float]] = None
-    return_poses: bool = True
 
 
 # ============================================================================
@@ -92,7 +145,7 @@ class AStar3D:
     """3D A* pathfinding algorithm with obstacle avoidance."""
 
     def __init__(self, grid_config: GridConfig, obstacle_checker: ObstacleChecker,
-                 use_3d: bool = True):
+                 use_3d: bool = True, verbose: bool = False):
         """
         Initialize 3D A* planner.
 
@@ -100,10 +153,12 @@ class AStar3D:
             grid_config: Grid configuration
             obstacle_checker: Obstacle collision checker
             use_3d: If True, use full 3D planning. If False, plan in X-Z plane only.
+            verbose: If True, log detailed progress information
         """
         self.grid_config = grid_config
         self.obstacle_checker = obstacle_checker
         self.use_3d = use_3d
+        self.verbose = verbose
 
         # Cache for grid conversions
         self._world_to_grid_cache = {}
@@ -201,8 +256,9 @@ class AStar3D:
 
             # --- Edge collision sampling to prevent skipping through thin geometry ---
             seg_len = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_config.resolution
-            # sample ~every 0.5 * resolution along the short edge (min 5)
-            num_samples = max(5, int(seg_len / (self.grid_config.resolution * 0.5)))
+            # sample ~every ASTAR_EDGE_SAMPLE_RESOLUTION * resolution along the short edge
+            num_samples = max(ASTAR_EDGE_SAMPLES_MIN,
+                            int(seg_len / (self.grid_config.resolution * ASTAR_EDGE_SAMPLE_RESOLUTION)))
             if not self.obstacle_checker.is_line_collision_free(world_curr, world_pos, num_samples=num_samples):
                 continue
 
@@ -212,9 +268,8 @@ class AStar3D:
 
         return neighbors
 
-    def plan_path(self, start: Tuple[float, float, float],
-                  goal: Tuple[float, float, float],
-                  max_iterations: int = 200000) -> List[Tuple[float, float, float]]:
+    def plan_path(self, start: Point3D, goal: Point3D,
+                  max_iterations: int = ASTAR_DEFAULT_MAX_ITERATIONS) -> PathType:
         """
         Plan a path from start to goal using A*.
 
@@ -224,7 +279,12 @@ class AStar3D:
             max_iterations: Maximum search iterations
 
         Returns:
-            List of waypoints in world coordinates, or empty list if no path found
+            List of waypoints in world coordinates
+
+        Raises:
+            CollisionError: If start or goal is in collision
+            TimeoutError: If max iterations exceeded
+            NoPathFoundError: If no valid path exists
         """
         # Convert to grid coordinates
         start_grid = self.world_to_grid(start)
@@ -232,12 +292,10 @@ class AStar3D:
 
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
-            print(f"[A*] Start position {start} is in collision!")
-            return []
+            raise CollisionError(f"Start position {start} is in collision")
 
         if not self.obstacle_checker.is_point_collision_free(goal):
-            print(f"[A*] Goal position {goal} is in collision!")
-            return []
+            raise CollisionError(f"Goal position {goal} is in collision")
 
         # A* algorithm
         open_set = []
@@ -247,21 +305,21 @@ class AStar3D:
         cost_so_far = {start_grid: 0}
 
         iteration = 0
-        print(f"[A*] Starting search from {start} to {goal}")
-        print(f"[A*] Grid start: {start_grid}, Grid goal: {goal_grid}")
-        print(f"[A*] Max iterations: {max_iterations}")
+        logger.info(f"A* starting search from {start} to {goal}")
+        logger.debug(f"Grid start: {start_grid}, Grid goal: {goal_grid}")
+        logger.debug(f"Max iterations: {max_iterations}, 3D mode: {self.use_3d}")
 
         while open_set and iteration < max_iterations:
             iteration += 1
 
-            if iteration % 5000 == 0:
-                print(f"[A*] Iteration {iteration}, open set size: {len(open_set)}")
+            if self.verbose and iteration % ASTAR_PROGRESS_LOG_INTERVAL == 0:
+                logger.info(f"A* iteration {iteration}, open set size: {len(open_set)}")
 
             _, cost, current = heapq.heappop(open_set)
 
             # Check if we reached the goal
             if current == goal_grid:
-                print(f"[A*] Path found after {iteration} iterations!")
+                logger.info(f"A* path found after {iteration} iterations")
                 break
 
             # Explore neighbors
@@ -275,10 +333,9 @@ class AStar3D:
                     came_from[neighbor] = current
         else:
             if iteration >= max_iterations:
-                print(f"[A*] Max iterations ({max_iterations}) reached!")
+                raise TimeoutError(f"A* exceeded max iterations ({max_iterations})")
             else:
-                print(f"[A*] No path found after {iteration} iterations!")
-            return []
+                raise NoPathFoundError(f"A* found no path after {iteration} iterations")
 
         # Reconstruct path
         path_grid = []
@@ -291,18 +348,18 @@ class AStar3D:
         # Convert to world coordinates
         path_world = [self.grid_to_world(grid_pos) for grid_pos in path_grid]
 
-        print(f"[A*] Path reconstructed with {len(path_world)} waypoints")
+        logger.info(f"A* path reconstructed with {len(path_world)} waypoints")
         return path_world
 
 
 # ============================================================================
-# RRT* (Rapidly-exploring Random Tree Star) Algorithm
+# RRT (Rapidly-exploring Random Tree) Algorithm Family
 # ============================================================================
 
 @dataclass
 class RRTNode:
-    """Node for RRT* tree."""
-    position: Tuple[float, float, float]
+    """Node for RRT tree."""
+    position: Point3D
     parent: Optional['RRTNode'] = None
     children: List['RRTNode'] = None
     cost: float = 0.0
@@ -312,19 +369,17 @@ class RRTNode:
             self.children = []
 
 
-class RRTStar:
-    """RRT* (Rapidly-exploring Random Tree Star) pathfinding algorithm with obstacle avoidance."""
+class RRTBase:
+    """Base class for RRT algorithms with common sampling and steering logic."""
 
     def __init__(self, grid_config: GridConfig, obstacle_checker: ObstacleChecker,
                  use_3d: bool = True,
                  max_step_size: float = 0.05,
                  goal_bias: float = 0.1,
-                 rewire_radius: float = 0.08,
                  goal_tolerance: float = 0.02,
-                 minimum_iterations: int = 1000,
-                 cost_improvement_patience: int = 5000):
+                 verbose: bool = False):
         """
-        Initialize RRT* planner.
+        Initialize RRT base planner.
 
         Args:
             grid_config: Grid configuration for bounds and resolution
@@ -332,66 +387,25 @@ class RRTStar:
             use_3d: If True, use full 3D planning. If False, plan in X-Z plane only.
             max_step_size: Maximum distance for extending tree
             goal_bias: Probability of sampling toward goal (0.0-1.0)
-            rewire_radius: Radius for rewiring optimization
             goal_tolerance: Distance to consider goal reached
-            minimum_iterations: Minimum iterations before early termination
-            cost_improvement_patience: Iterations to wait for cost improvement before terminating
+            verbose: If True, log detailed progress information
         """
         self.grid_config = grid_config
         self.obstacle_checker = obstacle_checker
         self.use_3d = use_3d
+        self.verbose = verbose
 
-        # RRT* specific parameters (now configurable!)
+        # RRT parameters
         self.max_step_size = max_step_size
         self.goal_bias = goal_bias
-        self.rewire_radius = rewire_radius
         self.goal_tolerance = goal_tolerance
 
-        # Early termination parameters
-        self.max_acceptable_cost = None  # Set during plan_path call
-        self.cost_improvement_patience = cost_improvement_patience
-        self.minimum_iterations = minimum_iterations
-
-    def should_terminate_early(self, goal_node: Optional[RRTNode], iteration: int,
-                          last_improvement_iteration: int) -> bool:
-        """
-        Check if we should terminate early based on cost threshold.
-
-        Args:
-            goal_node: Current best goal node (None if no path found yet)
-            iteration: Current iteration number
-            last_improvement_iteration: Iteration when cost was last improved
-
-        Returns:
-            True if should terminate early, False otherwise
-        """
-        # Don't terminate before minimum iterations
-        if iteration < self.minimum_iterations:
-            return False
-
-        # No goal found yet
-        if goal_node is None:
-            return False
-
-        # Check if we have an acceptable cost
-        if (self.max_acceptable_cost is not None and
-            goal_node.cost <= self.max_acceptable_cost):
-            print(f"[RRT*] Early termination: Acceptable cost {goal_node.cost:.3f}m <= {self.max_acceptable_cost:.3f}m")
-            return True
-
-        # Check if we haven't improved in a while
-        if iteration - last_improvement_iteration > self.cost_improvement_patience:
-            print(f"[RRT*] Early termination: No improvement for {self.cost_improvement_patience} iterations")
-            return True
-
-        return False
-
-    def sample_random_point(self, goal: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    def sample_random_point(self, goal: Point3D) -> Point3D:
         """Sample a random point in the configuration space."""
         # Goal biasing: occasionally sample near the goal
         if random.random() < self.goal_bias:
             # Sample in small sphere around goal
-            offset_radius = 0.05
+            offset_radius = RRT_DEFAULT_GOAL_SAMPLE_OFFSET
             if self.use_3d:
                 offset = np.array([
                     random.uniform(-offset_radius, offset_radius),
@@ -529,7 +543,7 @@ class RRTStar:
 
         return best_parent, best_cost
 
-    def extract_path(self, goal_node: RRTNode) -> List[Tuple[float, float, float]]:
+    def extract_path(self, goal_node: RRTNode) -> PathType:
         """Extract path from start to goal by following parent pointers."""
         path = []
         current = goal_node
@@ -541,10 +555,207 @@ class RRTStar:
         path.reverse()
         return path
 
-    def plan_path(self, start: Tuple[float, float, float],
-                  goal: Tuple[float, float, float],
-                  max_iterations: int = 5000,
-                  max_acceptable_cost: Optional[float] = None) -> List[Tuple[float, float, float]]:
+
+class RRT(RRTBase):
+    """Basic RRT algorithm (no rewiring optimization)."""
+
+    def choose_parent(self, near_nodes: List[RRTNode], new_position: Point3D) -> Tuple[Optional[RRTNode], float]:
+        """Just use nearest node, no cost optimization."""
+        if not near_nodes:
+            return None, 0.0
+        return near_nodes[0], near_nodes[0].cost + self.calculate_distance(near_nodes[0].position, new_position)
+
+    def rewire_tree(self, tree: List[RRTNode], new_node: RRTNode, near_nodes: List[RRTNode]):
+        """No rewiring in basic RRT."""
+        pass
+
+    def plan_path(self, start: Point3D, goal: Point3D,
+                  max_iterations: int = 10000,
+                  max_acceptable_cost: Optional[float] = None) -> PathType:
+        """
+        Plan a path from start to goal using basic RRT.
+
+        Args:
+            start: Start position in world coordinates
+            goal: Goal position in world coordinates
+            max_iterations: Maximum planning iterations
+            max_acceptable_cost: Unused in basic RRT (kept for API compatibility)
+
+        Returns:
+            List of waypoints in world coordinates
+
+        Raises:
+            CollisionError: If start or goal is in collision
+            NoPathFoundError: If no valid path exists
+        """
+        # Check if start and goal are valid
+        if not self.obstacle_checker.is_point_collision_free(start):
+            raise CollisionError(f"Start position {start} is in collision")
+
+        if not self.obstacle_checker.is_point_collision_free(goal):
+            raise CollisionError(f"Goal position {goal} is in collision")
+
+        # Calculate straight-line distance for reference
+        straight_line_distance = self.calculate_distance(start, goal)
+
+        # Initialize tree with start node
+        start_node = RRTNode(position=start, cost=0.0)
+        tree = [start_node]
+        goal_node = None
+
+        logger.info(f"RRT starting planning from {start} to {goal}")
+        logger.debug(f"Straight-line distance: {straight_line_distance:.3f}m")
+        logger.debug(f"Max iterations: {max_iterations}, 3D mode: {self.use_3d}")
+
+        for iteration in range(max_iterations):
+            if self.verbose and iteration % RRT_PROGRESS_LOG_INTERVAL == 0 and iteration > 0:
+                logger.info(f"RRT iteration {iteration}, tree size: {len(tree)}")
+
+            # Sample random point
+            rand_point = self.sample_random_point(goal)
+
+            # Find nearest node
+            nearest_node = self.find_nearest_node(tree, rand_point)
+
+            # Steer toward random point
+            new_position = self.steer(nearest_node.position, rand_point)
+
+            # Check if new position is collision-free
+            if not self.obstacle_checker.is_point_collision_free(new_position):
+                continue
+
+            # Check if path to new position is collision-free
+            if not self.obstacle_checker.is_line_collision_free(nearest_node.position, new_position):
+                continue
+
+            # Create new node (basic RRT: just use nearest as parent)
+            new_cost = nearest_node.cost + self.calculate_distance(nearest_node.position, new_position)
+            new_node = RRTNode(position=new_position, parent=nearest_node, cost=new_cost)
+            nearest_node.children.append(new_node)
+            tree.append(new_node)
+
+            # Check if we reached the goal
+            if self.calculate_distance(new_position, goal) <= self.goal_tolerance:
+                goal_node = new_node
+                logger.info(f"RRT goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m")
+                break
+
+        if goal_node is None:
+            raise NoPathFoundError(f"RRT found no path after {max_iterations} iterations")
+
+        # Extract and return path
+        path = self.extract_path(goal_node)
+        logger.info(f"RRT path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
+
+        return path
+
+
+class RRTStar(RRTBase):
+    """RRT* with rewiring optimization for improved path quality."""
+
+    def __init__(self, grid_config: GridConfig, obstacle_checker: ObstacleChecker,
+                 use_3d: bool = True,
+                 max_step_size: float = 0.05,
+                 goal_bias: float = 0.1,
+                 goal_tolerance: float = 0.02,
+                 rewire_radius: float = 0.08,
+                 minimum_iterations: int = 1000,
+                 cost_improvement_patience: int = 5000,
+                 verbose: bool = False):
+        """
+        Initialize RRT* planner with rewiring optimization.
+
+        Args:
+            grid_config: Grid configuration for bounds and resolution
+            obstacle_checker: Obstacle collision checker
+            use_3d: If True, use full 3D planning. If False, plan in X-Z plane only.
+            max_step_size: Maximum distance for extending tree
+            goal_bias: Probability of sampling toward goal (0.0-1.0)
+            goal_tolerance: Distance to consider goal reached
+            rewire_radius: Radius for rewiring optimization
+            minimum_iterations: Minimum iterations before early termination
+            cost_improvement_patience: Iterations to wait for cost improvement
+            verbose: If True, log detailed progress information
+        """
+        super().__init__(grid_config, obstacle_checker, use_3d, max_step_size,
+                        goal_bias, goal_tolerance, verbose)
+
+        # RRT* specific parameters
+        self.rewire_radius = rewire_radius
+        self.minimum_iterations = minimum_iterations
+        self.cost_improvement_patience = cost_improvement_patience
+        self.max_acceptable_cost = None  # Set during plan_path call
+
+    def should_terminate_early(self, goal_node: Optional[RRTNode], iteration: int,
+                              last_improvement_iteration: int) -> bool:
+        """Check if we should terminate early based on cost threshold."""
+        if iteration < self.minimum_iterations:
+            return False
+
+        if goal_node is None:
+            return False
+
+        if (self.max_acceptable_cost is not None and
+            goal_node.cost <= self.max_acceptable_cost):
+            logger.info(f"RRT* early termination: cost {goal_node.cost:.3f}m <= {self.max_acceptable_cost:.3f}m")
+            return True
+
+        if iteration - last_improvement_iteration > self.cost_improvement_patience:
+            logger.info(f"RRT* early termination: no improvement for {self.cost_improvement_patience} iterations")
+            return True
+
+        return False
+
+    def choose_parent(self, near_nodes: List[RRTNode], new_position: Point3D) -> Tuple[Optional[RRTNode], float]:
+        """Choose the best parent from near nodes to minimize cost."""
+        best_parent = None
+        best_cost = float('inf')
+
+        for node in near_nodes:
+            potential_cost = node.cost + self.calculate_distance(node.position, new_position)
+
+            if (potential_cost < best_cost and
+                self.obstacle_checker.is_line_collision_free(node.position, new_position)):
+                best_parent = node
+                best_cost = potential_cost
+
+        return best_parent, best_cost
+
+    def rewire_tree(self, tree: List[RRTNode], new_node: RRTNode, near_nodes: List[RRTNode]):
+        """Rewire the tree to optimize paths through the new node."""
+        for near_node in near_nodes:
+            if near_node == new_node.parent:
+                continue
+
+            # Calculate potential new cost through new_node
+            potential_cost = new_node.cost + self.calculate_distance(new_node.position, near_node.position)
+
+            # If this path is better and collision-free, rewire
+            if (potential_cost < near_node.cost and
+                self.obstacle_checker.is_line_collision_free(new_node.position, near_node.position)):
+
+                # Remove old parent connection
+                if near_node.parent:
+                    near_node.parent.children.remove(near_node)
+
+                # Establish new parent connection
+                near_node.parent = new_node
+                new_node.children.append(near_node)
+
+                # Update cost and propagate to descendants
+                old_cost = near_node.cost
+                near_node.cost = potential_cost
+                self._propagate_cost_update(near_node, near_node.cost - old_cost)
+
+    def _propagate_cost_update(self, node: RRTNode, cost_delta: float):
+        """Recursively update costs of all descendants."""
+        for child in node.children:
+            child.cost += cost_delta
+            self._propagate_cost_update(child, cost_delta)
+
+    def plan_path(self, start: Point3D, goal: Point3D,
+                  max_iterations: int = 10000,
+                  max_acceptable_cost: Optional[float] = None) -> PathType:
         """
         Plan a path from start to goal using RRT*.
 
@@ -555,16 +766,18 @@ class RRTStar:
             max_acceptable_cost: Early termination cost threshold (meters)
 
         Returns:
-            List of waypoints in world coordinates, or empty list if no path found
+            List of waypoints in world coordinates
+
+        Raises:
+            CollisionError: If start or goal is in collision
+            NoPathFoundError: If no valid path exists
         """
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
-            print(f"[RRT*] Start position {start} is in collision!")
-            return []
+            raise CollisionError(f"Start position {start} is in collision")
 
         if not self.obstacle_checker.is_point_collision_free(goal):
-            print(f"[RRT*] Goal position {goal} is in collision!")
-            return []
+            raise CollisionError(f"Goal position {goal} is in collision")
 
         # Set cost threshold
         self.max_acceptable_cost = max_acceptable_cost
@@ -579,15 +792,15 @@ class RRTStar:
 
         last_improvement_iteration = 0
 
-        print(f"[RRT*] Starting planning from {start} to {goal}")
-        print(f"[RRT*] Straight-line distance: {straight_line_distance:.3f}m")
-        print(f"[RRT*] Max acceptable cost: {max_acceptable_cost}m" if max_acceptable_cost else "[RRT*] No cost limit set")
-        print(f"[RRT*] Max iterations: {max_iterations}")
-        print(f"[RRT*] Parameters: step={self.max_step_size}, bias={self.goal_bias}, rewire={self.rewire_radius}")
+        logger.info(f"RRT* starting planning from {start} to {goal}")
+        logger.debug(f"Straight-line distance: {straight_line_distance:.3f}m")
+        logger.debug(f"Max acceptable cost: {max_acceptable_cost}m" if max_acceptable_cost else "No cost limit set")
+        logger.debug(f"Max iterations: {max_iterations}, 3D mode: {self.use_3d}")
+        logger.debug(f"Parameters: step={self.max_step_size}, bias={self.goal_bias}, rewire={self.rewire_radius}")
 
         for iteration in range(max_iterations):
-            if iteration % 500 == 0 and iteration > 0:
-                print(f"[RRT*] Iteration {iteration}, tree size: {len(tree)}")
+            if self.verbose and iteration % RRT_PROGRESS_LOG_INTERVAL == 0 and iteration > 0:
+                logger.info(f"RRT* iteration {iteration}, tree size: {len(tree)}")
 
             # Sample random point
             rand_point = self.sample_random_point(goal)
@@ -631,38 +844,21 @@ class RRTStar:
                     old_cost = goal_node.cost if goal_node else float('inf')
                     goal_node = new_node
                     last_improvement_iteration = iteration
-                    print(f"[RRT*] Goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m (improved from {old_cost:.3f}m)")
+                    logger.info(f"RRT* goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m (improved from {old_cost:.3f}m)")
 
             # Check for early termination
             if self.should_terminate_early(goal_node, iteration, last_improvement_iteration):
-                print(f"[RRT*] Early termination at iteration {iteration}")
+                logger.info(f"RRT* early termination at iteration {iteration}")
                 break
 
         if goal_node is None:
-            print(f"[RRT*] No path found after {max_iterations} iterations!")
-            return []
+            raise NoPathFoundError(f"RRT* found no path after {max_iterations} iterations")
 
         # Extract and return path
         path = self.extract_path(goal_node)
-        print(f"[RRT*] Path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
+        logger.info(f"RRT* path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
 
         return path
-
-
-# ============================================================================
-# RRT (Basic Rapidly-exploring Random Tree) Algorithm
-# ============================================================================
-
-class RRT(RRTStar):
-    """Basic RRT algorithm (no rewiring optimization)."""
-
-    def rewire_tree(self, tree, new_node, near_nodes):
-        """No rewiring in basic RRT."""
-        pass
-
-    def choose_parent(self, near_nodes, new_position):
-        """Just use nearest node, no cost optimization."""
-        return near_nodes[0] if near_nodes else None, 0.0
 
 
 # ============================================================================
@@ -763,7 +959,8 @@ class PRM:
                  use_3d: bool = True,
                  num_samples: int = 1000,
                  connection_radius: float = 0.12,
-                 max_connections_per_node: int = 15):
+                 max_connections_per_node: int = 15,
+                 verbose: bool = False):
         """
         Initialize PRM planner.
 
@@ -774,10 +971,12 @@ class PRM:
             num_samples: Number of random samples for roadmap
             connection_radius: Max distance for connecting nodes
             max_connections_per_node: Limit connections for efficiency
+            verbose: If True, log detailed progress information
         """
         self.grid_config = grid_config
         self.obstacle_checker = obstacle_checker
         self.use_3d = use_3d
+        self.verbose = verbose
 
         # PRM-specific parameters (now configurable!)
         self.num_samples = num_samples
@@ -789,9 +988,9 @@ class PRM:
         self.roadmap_built = False
         self.construction_time = 0.0
 
-    def sample_random_point(self) -> Tuple[float, float, float]:
+    def sample_random_point(self) -> Point3D:
         """Sample a random collision-free point in the workspace."""
-        max_attempts = 1000
+        max_attempts = PRM_MAX_SAMPLE_ATTEMPTS
 
         for _ in range(max_attempts):
             if self.use_3d:
@@ -834,15 +1033,14 @@ class PRM:
         nearby_nodes.sort(key=lambda x: x[1])
         return nearby_nodes[:self.max_connections_per_node]
 
-    def construct_roadmap(self, verbose: bool = True):
+    def construct_roadmap(self):
         """Construct the PRM roadmap through sampling and connection."""
         if self.roadmap_built:
             return
 
         start_time = time.time()
 
-        if verbose:
-            print(f"[PRM] Constructing roadmap with {self.num_samples} samples...")
+        logger.info(f"PRM constructing roadmap with {self.num_samples} samples")
 
         # Phase 1: Sampling
         valid_samples = 0
@@ -855,11 +1053,10 @@ class PRM:
                 self.roadmap.add_node(sample_point)
                 valid_samples += 1
 
-                if verbose and valid_samples % 200 == 0:
-                    print(f"[PRM] Sampled {valid_samples}/{self.num_samples} collision-free points")
+                if self.verbose and valid_samples % PRM_PROGRESS_LOG_INTERVAL_SAMPLES == 0:
+                    logger.info(f"PRM sampled {valid_samples}/{self.num_samples} collision-free points")
 
-        if verbose:
-            print(f"[PRM] Successfully sampled {valid_samples} collision-free points")
+        logger.info(f"PRM successfully sampled {valid_samples} collision-free points")
 
         # Phase 2: Connection
         connections_made = 0
@@ -874,18 +1071,16 @@ class PRM:
                         self.roadmap.add_edge(node_id, nearby_id, distance)
                         connections_made += 1
 
-            if verbose and node_id % 100 == 0:
-                print(f"[PRM] Connected {node_id}/{len(self.roadmap.nodes)} nodes")
+            if self.verbose and node_id % PRM_PROGRESS_LOG_INTERVAL_CONNECTIONS == 0:
+                logger.info(f"PRM connected {node_id}/{len(self.roadmap.nodes)} nodes")
 
         self.construction_time = time.time() - start_time
         self.roadmap_built = True
 
-        if verbose:
-            print(f"[PRM] Roadmap construction complete!")
-            print(f"[PRM] {len(self.roadmap.nodes)} nodes, {connections_made//2} edges")
-            print(f"[PRM] Construction time: {self.construction_time:.2f}s")
-            print(f"[PRM] Average connections per node: {connections_made/len(self.roadmap.nodes):.1f}")
-            print(f"[PRM] Parameters: samples={self.num_samples}, radius={self.connection_radius}")
+        logger.info(f"PRM roadmap construction complete")
+        logger.info(f"{len(self.roadmap.nodes)} nodes, {connections_made//2} edges, {self.construction_time:.2f}s")
+        logger.debug(f"Average connections per node: {connections_made/len(self.roadmap.nodes):.1f}")
+        logger.debug(f"Parameters: samples={self.num_samples}, radius={self.connection_radius}, 3D mode={self.use_3d}")
 
     def add_temporary_nodes(self, start: Tuple[float, float, float],
                            goal: Tuple[float, float, float]) -> Tuple[int, int]:
@@ -930,8 +1125,7 @@ class PRM:
                         del self.roadmap.nodes[neighbor_id].distances[goal_id]
             del self.roadmap.nodes[goal_id]
 
-    def plan_path(self, start: Tuple[float, float, float],
-                  goal: Tuple[float, float, float]) -> List[Tuple[float, float, float]]:
+    def plan_path(self, start: Point3D, goal: Point3D) -> PathType:
         """
         Plan a path from start to goal using PRM.
 
@@ -940,22 +1134,24 @@ class PRM:
             goal: Goal position in world coordinates
 
         Returns:
-            List of waypoints in world coordinates, or empty list if no path found
+            List of waypoints in world coordinates
+
+        Raises:
+            CollisionError: If start or goal is in collision
+            NoPathFoundError: If no valid path exists in the roadmap
         """
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
-            print(f"[PRM] Start position {start} is in collision!")
-            return []
+            raise CollisionError(f"Start position {start} is in collision")
 
         if not self.obstacle_checker.is_point_collision_free(goal):
-            print(f"[PRM] Goal position {goal} is in collision!")
-            return []
+            raise CollisionError(f"Goal position {goal} is in collision")
 
         # Build roadmap if not already built
         if not self.roadmap_built:
             self.construct_roadmap()
 
-        print(f"[PRM] Planning path from {start} to {goal}")
+        logger.info(f"PRM planning path from {start} to {goal}")
 
         # Add temporary start and goal nodes
         start_id, goal_id = self.add_temporary_nodes(start, goal)
@@ -964,9 +1160,8 @@ class PRM:
         path_ids = self.roadmap.dijkstra(start_id, goal_id)
 
         if not path_ids:
-            print(f"[PRM] No path found in roadmap!")
             self.remove_temporary_nodes(start_id, goal_id)
-            return []
+            raise NoPathFoundError("PRM found no path in roadmap")
 
         # Convert path IDs to world coordinates
         path_world = []
@@ -985,24 +1180,63 @@ class PRM:
         # Clean up temporary nodes
         self.remove_temporary_nodes(start_id, goal_id)
 
-        print(f"[PRM] Path found with {len(path_world)} waypoints")
-        print(f"[PRM] Total path length: {total_distance:.3f}m")
-        print(f"[PRM] Using roadmap with {len(self.roadmap.nodes)} nodes")
+        logger.info(f"PRM path found with {len(path_world)} waypoints, length: {total_distance:.3f}m")
+        logger.debug(f"Using roadmap with {len(self.roadmap.nodes)} nodes")
 
         return path_world
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def setup_planner_environment(
+    start_pos: Point3D,
+    goal_pos: Point3D,
+    obstacle_data: ObstacleData,
+    grid_resolution: float,
+    safety_margin: float
+) -> Tuple[GridConfig, ObstacleChecker]:
+    """
+    Setup common planner environment (grid config and obstacle checker).
+
+    Args:
+        start_pos: Start position
+        goal_pos: Goal position
+        obstacle_data: List of obstacle dictionaries
+        grid_resolution: Grid cell size in meters
+        safety_margin: Additional clearance around obstacles
+
+    Returns:
+        Tuple of (grid_config, obstacle_checker)
+    """
+    bounds_min, bounds_max = calculate_workspace_bounds(obstacle_data, start_pos, goal_pos)
+
+    grid_config = GridConfig(
+        resolution=grid_resolution,
+        bounds_min=bounds_min,
+        bounds_max=bounds_max,
+        safety_margin=safety_margin
+    )
+
+    obstacle_checker = ObstacleChecker(obstacle_data, safety_margin)
+
+    return grid_config, obstacle_checker
 
 
 # ============================================================================
 # High-Level Wrapper Functions
 # ============================================================================
 
-def create_astar_3d_trajectory(start_pos: Tuple[float, float, float],
-                              goal_pos: Tuple[float, float, float],
-                              obstacle_data: List[Dict[str, Any]],
-                              grid_resolution: float = 0.01,
-                              safety_margin: float = 0.02,
-                              use_3d: bool = True,
-                              max_iterations: int = 200000) -> np.ndarray:
+def create_astar_3d_trajectory(
+    start_pos: Point3D,
+    goal_pos: Point3D,
+    obstacle_data: ObstacleData,
+    grid_resolution: float = 0.01,
+    safety_margin: float = 0.02,
+    max_iterations: int = ASTAR_DEFAULT_MAX_ITERATIONS,
+    verbose: bool = False
+) -> np.ndarray:
     """
     High-level interface to create A* trajectory with obstacle avoidance.
 
@@ -1012,138 +1246,177 @@ def create_astar_3d_trajectory(start_pos: Tuple[float, float, float],
         obstacle_data: List of obstacle dictionaries
         grid_resolution: Grid cell size in meters
         safety_margin: Additional clearance around obstacles
-        use_3d: Use full 3D planning or just X-Z plane
         max_iterations: Maximum A* search iterations
+        verbose: If True, log detailed progress
 
     Returns:
         NumPy array of shape [N, 3] containing path waypoints
-    """
-    # Calculate workspace bounds
-    bounds_min, bounds_max = calculate_workspace_bounds(obstacle_data, start_pos, goal_pos)
 
-    # Create grid configuration
-    grid_config = GridConfig(
-        resolution=grid_resolution,
-        bounds_min=bounds_min,
-        bounds_max=bounds_max,
-        safety_margin=safety_margin
+    Raises:
+        PathPlanningError: If path planning fails
+    """
+    # Setup environment
+    grid_config, obstacle_checker = setup_planner_environment(
+        start_pos, goal_pos, obstacle_data, grid_resolution, safety_margin
     )
 
-    # Create obstacle checker
-    obstacle_checker = ObstacleChecker(obstacle_data, safety_margin)
+    # Create A* planner (always full 3D)
+    planner = AStar3D(grid_config, obstacle_checker, use_3d=True, verbose=verbose)
 
-    # Create A* planner
-    planner = AStar3D(grid_config, obstacle_checker, use_3d=use_3d)
-
-    # Plan path
+    # Plan path (exceptions propagate up)
     path = planner.plan_path(start_pos, goal_pos, max_iterations=max_iterations)
-
-    if not path:
-        raise RuntimeError("A* failed to find a path")
 
     # Convert to numpy array
     path_array = np.array(path, dtype=np.float32)
 
-    print(f"[A*] Created trajectory with {len(path)} waypoints")
-    print(f"[A*] Start: {start_pos}, Goal: {goal_pos}")
-    print(f"[A*] Grid resolution: {grid_resolution}m, Safety margin: {safety_margin}m")
-    print(f"[A*] Workspace bounds: {bounds_min} to {bounds_max}")
+    logger.debug(f"A* 3D created trajectory with {len(path)} waypoints")
+    logger.debug(f"Workspace bounds: {grid_config.bounds_min} to {grid_config.bounds_max}")
 
     return path_array
 
 
-def create_astar_plane_trajectory(start_pos: Tuple[float, float, float],
-                                  goal_pos: Tuple[float, float, float],
-                                  obstacle_data: List[Dict[str, Any]],
-                                  grid_resolution: float = 0.01,
-                                  safety_margin: float = 0.02,
-                                  max_iterations: int = 200000,
-                                  tool_radius: float = 0.0275) -> np.ndarray:
+def create_astar_plane_trajectory(
+    start_pos: Point3D,
+    goal_pos: Point3D,
+    obstacle_data: ObstacleData,
+    grid_resolution: float = 0.01,
+    safety_margin: float = 0.02,
+    max_iterations: int = ASTAR_DEFAULT_MAX_ITERATIONS,
+    verbose: bool = False,
+) -> np.ndarray:
     """
-    A* constrained to the vertical plane defined by start→goal.
+    Plan A* path on the vertical plane containing start→goal.
 
-    - Rotates the scene into that plane so planning occurs in Xp–Zp (Yp locked to 0).
-    - Plans with A* in 2D (use_3d=False) for smoother, more linear slew motion.
-    - Transforms the resulting path back to world coordinates.
+    Rotates the scene into the start→goal vertical plane so that it becomes
+    the X-Z plane, plans with A* in 2D (use_3d=False), then rotates path back
+    to world coordinates. This is useful for scenarios where the robot moves
+    primarily in a plane defined by its start and goal positions.
+
+    Note: This planner uses only the FIRST obstacle in obstacle_data as the
+    wall to navigate around. For multi-obstacle scenarios, use the full 3D A*.
 
     Args:
-        tool_radius: **A* Plane-specific parameter**. Radius of the tool/end-effector
-                     in meters. Obstacles are widened by 2*tool_radius in the X and Z
-                     plane directions for collision avoidance. This is unique to the
-                     plane algorithm due to its coordinate transformation approach.
-                     Default: 0.0275m (27.5mm). Not used by other algorithms.
+        start_pos: Start position (x, y, z) in world coordinates
+        goal_pos: Goal position (x, y, z) in world coordinates
+        obstacle_data: List of obstacle dictionaries. Only the first obstacle
+            is used as the wall for planar planning. Each should have:
+            - "size": np.array([x, y, z]) - obstacle dimensions
+            - "pos": np.array([x, y, z]) - obstacle center position
+            - "rot": np.array([w, x, y, z]) - quaternion rotation (optional)
+        grid_resolution: Grid cell size in meters for A* search
+        safety_margin: Additional clearance around obstacles (applied by ObstacleChecker)
+        max_iterations: Maximum A* search iterations
+        verbose: If True, log detailed progress information
+
+    Returns:
+        NumPy array of shape [N, 3] containing path waypoints in world frame
+
+    Raises:
+        CollisionError: If start or goal is in collision
+        TimeoutError: If max iterations exceeded
+        NoPathFoundError: If no valid path exists on the plane
+        InvalidInputError: If obstacle_data is empty
     """
-    # Build plane basis (columns Xp, Yp, Zp) and rotation matrix world↔plane
+    # Validate input
+    if not obstacle_data:
+        raise InvalidInputError("Planar A* requires at least one obstacle (wall) in obstacle_data")
+
+    # Use first obstacle as the wall
+    wall_obstacle = obstacle_data[0]
+
+    # Convert to numpy arrays
     s_w = np.asarray(start_pos, dtype=np.float32)
     g_w = np.asarray(goal_pos, dtype=np.float32)
-    Xp, Yp, Zp = basis_start_goal_plane(s_w, g_w)  # columns for R_wp = [Xp Yp Zp]
-    R_wp = np.stack([Xp, Yp, Zp], axis=1).astype(np.float32)  # maps plane axes to world
+
+    # Build orthonormal basis for the start→goal plane
+    # Xp = along start→goal, Yp = plane normal, Zp = in-plane vertical
+    Xp, Yp, Zp = basis_start_goal_plane(s_w, g_w)
+    R_wp = np.stack([Xp, Yp, Zp], axis=1)  # Rotation matrix: plane→world
 
     def world_to_plane(p_w: np.ndarray) -> np.ndarray:
+        """Transform point from world frame to plane frame."""
         return R_wp.T @ (p_w - s_w)
 
     def plane_to_world(p_p: np.ndarray) -> np.ndarray:
+        """Transform point from plane frame to world frame."""
         return (R_wp @ p_p) + s_w
 
-    # Quaternion for world→plane transform: q_wp corresponds to R_wp
+    # Transform wall obstacle into plane frame
+    size_w = np.asarray(wall_obstacle["size"], dtype=np.float32)
+    pos_w = np.asarray(wall_obstacle["pos"], dtype=np.float32)
+    rot_w = np.asarray(wall_obstacle.get("rot", [1, 0, 0, 0]), dtype=np.float32)
+
+    # Use obstacle size directly (no tool_radius expansion)
+    # ObstacleChecker will apply safety_margin like in 3D A*
+    size_p = size_w.astype(np.float32).copy()
+    # Keep an epsilon-thin but non-zero Yp thickness so the 2D checker is stable
+    size_p[1] = max(size_p[1], 1e-3)
+
+    # Transform position to plane frame
+    pos_p = world_to_plane(pos_w)
+
+    # Transform rotation to plane frame
+    # q_plane = (q_wp)^* ⊗ q_wall
     q_wp = rotation_matrix_to_quaternion(R_wp)
     q_wp_conj = quaternion_conjugate(q_wp)
+    rot_p = quaternion_multiply(q_wp_conj, rot_w)
 
-    # Transform obstacles into plane frame (normalize keys first)
-    obstacles_plane: List[Dict[str, Any]] = []
-    for obs in obstacle_data or []:
-        size_w = np.asarray(obs.get("size", obs.get("dimensions", [0.1, 0.1, 0.1])), dtype=np.float32)
-        pos_w = np.asarray(obs.get("pos", obs.get("position", [0.0, 0.0, 0.0])), dtype=np.float32)
-        rot_w = np.asarray(obs.get("rot", obs.get("rotation", [1.0, 0.0, 0.0, 0.0])), dtype=np.float32)
+    # Build obstacle list in plane frame
+    wall_plane = [{
+        "size": size_p,
+        "pos": pos_p.astype(np.float32),
+        "rot": rot_p.astype(np.float32)
+    }]
 
-        # Widen obstacle by tool_radius in plane X and Z directions
-        size_p = size_w.astype(np.float32).copy()
-        size_p[0] += 2.0 * tool_radius    # widen along X_p
-        size_p[2] += 2.0 * tool_radius    # widen along Z_p
-        # Keep a very thin but non-zero Y_p thickness so the 2D checker is stable
-        size_p[1] = max(size_p[1], 0.02)
+    # Transform start/goal to plane frame
+    # Y (plane normal) is index 1 and must be ~0 in planning
+    s_p = world_to_plane(s_w)
+    s_p[1] = 0.0
+    g_p = world_to_plane(g_w)
+    g_p[1] = 0.0
 
-        pos_p = world_to_plane(pos_w)
-        rot_p = quaternion_multiply(q_wp_conj, rot_w)
-
-        obstacles_plane.append({
-            "size": size_p.astype(np.float32),
-            "pos": pos_p.astype(np.float32),
-            "rot": rot_p.astype(np.float32),
-        })
-
-    # Start/goal in plane frame with Yp locked to 0
-    s_p = world_to_plane(s_w); s_p[1] = 0.0
-    g_p = world_to_plane(g_w); g_p[1] = 0.0
-
-    # Bounds in plane frame (use shared utility for consistency)
-    bounds_min_p, bounds_max_p = calculate_workspace_bounds(obstacles_plane, tuple(s_p), tuple(g_p))
+    # Calculate bounds in plane frame (pad generously)
+    pts = np.stack([s_p, g_p, pos_p], axis=0)
+    bmin = np.min(pts, axis=0) - np.array([0.20, 0.05, 0.20], dtype=np.float32)
+    bmax = np.max(pts, axis=0) + np.array([0.20, 0.05, 0.20], dtype=np.float32)
 
     # Create grid configuration in plane frame
-    grid_config_p = GridConfig(
+    grid_cfg = GridConfig(
         resolution=float(grid_resolution),
-        bounds_min=bounds_min_p,
-        bounds_max=bounds_max_p,
+        bounds_min=(float(bmin[0]), float(bmin[1]), float(bmin[2])),
+        bounds_max=(float(bmax[0]), float(bmax[1]), float(bmax[2])),
         safety_margin=float(safety_margin),
     )
 
-    # Obstacle checker in plane frame
-    obstacle_checker_p = ObstacleChecker(obstacles_plane, safety_margin=float(safety_margin))
+    # Create obstacle checker and planner
+    obs_checker = ObstacleChecker(wall_plane, safety_margin=float(safety_margin))
+    planner = AStar3D(grid_cfg, obs_checker, use_3d=False, verbose=verbose)
 
-    # Plan with 2D A* in plane
-    planner = AStar3D(grid_config_p, obstacle_checker_p, use_3d=False)
-    path_plane = planner.plan_path(tuple(s_p.tolist()), tuple(g_p.tolist()), max_iterations=max_iterations)
-    if not path_plane:
-        raise RuntimeError("A* Plane: no feasible path found on the start→goal plane")
+    logger.info(f"Planar A* starting on start→goal plane")
+    logger.debug(f"Start (world): {start_pos}, Goal (world): {goal_pos}")
+    logger.debug(f"Start (plane): {tuple(s_p)}, Goal (plane): {tuple(g_p)}")
+    logger.debug(f"Grid resolution: {grid_resolution}m, Safety margin: {safety_margin}m")
 
-    # Map path back to world (enforce Yp=0)
+    # Plan path in plane frame
+    path_plane = planner.plan_path(
+        tuple(s_p.tolist()),
+        tuple(g_p.tolist()),
+        max_iterations=max_iterations
+    )
+
+    # Transform path back to world frame
     path_world = []
     for p in path_plane:
-        pp = np.array([p[0], 0.0, p[2]], dtype=np.float32)
+        pp = np.array([p[0], 0.0, p[2]], dtype=np.float32)  # Enforce Yp=0
         pw = plane_to_world(pp)
         path_world.append(pw.tolist())
 
-    return np.asarray(path_world, dtype=np.float32)
+    # Convert to numpy array
+    path_array = np.array(path_world, dtype=np.float32)
+
+    logger.info(f"Planar A* found path with {len(path_world)} waypoints on start→goal plane")
+
+    return path_array
 
 
 def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
@@ -1275,10 +1548,8 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
         grid_config, obstacle_checker, use_3d=use_3d,
         max_step_size=max_step_size,
         goal_bias=goal_bias,
-        rewire_radius=0.0,  # Not used in basic RRT
         goal_tolerance=goal_tolerance,
-        minimum_iterations=100,  # Lower for basic RRT
-        cost_improvement_patience=10000
+        verbose=False,
     )
 
     # Plan path
@@ -1306,8 +1577,8 @@ def create_prm_trajectory(start_pos: Tuple[float, float, float],
                          grid_resolution: float = 0.01,
                          safety_margin: float = 0.02,
                          use_3d: bool = True,
-                         num_samples: int = 1000,
-                         connection_radius: float = 0.12,
+                         num_samples: int = 1500,
+                         connection_radius: float = 0.20,
                          max_connections_per_node: int = 15) -> np.ndarray:
     """
     High-level interface to create PRM trajectory with obstacle avoidance.
@@ -1364,296 +1635,3 @@ def create_prm_trajectory(start_pos: Tuple[float, float, float],
     print(f"[PRM] Workspace bounds: {bounds_min} to {bounds_max}")
 
     return path_array
-
-
-# ============================================================================
-# Standardized (Constant-Speed) Wrapper Functions
-# ============================================================================
-
-def create_astar_3d_trajectory_standardized(start_pos: Tuple[float, float, float],
-                                            goal_pos: Tuple[float, float, float],
-                                            obstacle_data: List[Dict[str, Any]],
-                                            grid_resolution: float = 0.01,
-                                            safety_margin: float = 0.02,
-                                            use_3d: bool = True,
-                                            max_iterations: int = 200000,
-                                            *,
-                                            params: Optional['AStarParams'] = None,
-                                            standardizer: Optional['StandardizerParams'] = None,
-                                            speed_mps: float = 0.10,
-                                            dt: float = 0.20,
-                                            max_points: int = 30,
-                                            smoothing: Optional[Dict[str, float]] = None,
-                                            return_poses: bool = True) -> Dict[str, np.ndarray]:
-    """Create an A* path and standardize it to constant-speed execution.
-
-    Returns a dictionary from standardize_path with positions/poses and times.
-    """
-    # Resolve algorithm parameters (kwargs > params > defaults)
-    if params is not None and max_iterations is None:
-        max_iterations = params.max_iterations
-
-    raw = create_astar_3d_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        max_iterations=max_iterations,
-    )
-    # Resolve standardizer parameters (kwargs > object > defaults)
-    if standardizer is not None:
-        if speed_mps is None: speed_mps = standardizer.speed_mps
-        if dt is None: dt = standardizer.dt
-        if max_points is None: max_points = standardizer.max_points
-        if smoothing is None: smoothing = standardizer.smoothing
-        if return_poses is None: return_poses = standardizer.return_poses
-
-    return standardize_path(raw, speed_mps=speed_mps, dt=dt,
-                            max_points=max_points, smoothing=smoothing,
-                            return_poses=return_poses)
-
-
-def create_astar_plane_trajectory_standardized(start_pos: Tuple[float, float, float],
-                                               goal_pos: Tuple[float, float, float],
-                                               obstacle_data: List[Dict[str, Any]],
-                                               grid_resolution: float = 0.01,
-                                               safety_margin: float = 0.02,
-                                               max_iterations: int = 200000,
-                                               tool_radius: float = 0.0275,
-                                               *,
-                                               params: Optional['AStarParams'] = None,
-                                               standardizer: Optional['StandardizerParams'] = None,
-                                               speed_mps: float = 0.10,
-                                               dt: float = 0.20,
-                                               max_points: int = 30,
-                                               smoothing: Optional[Dict[str, float]] = None,
-                                               return_poses: bool = True) -> Dict[str, np.ndarray]:
-    """Planar (X-Z) A* standardized to constant-speed execution.
-
-    Signature mirrors create_astar_3d_trajectory_standardized, with the addition
-    of the A* Plane-specific tool_radius parameter.
-
-    Args:
-        tool_radius: **A* Plane-specific parameter**. Radius of the tool/end-effector
-                     in meters. Obstacles are widened by 2*tool_radius in the X and Z
-                     plane directions for collision avoidance. This is unique to the
-                     plane algorithm due to its coordinate transformation approach.
-                     Default: 0.0275m (27.5mm). Not used by other algorithms.
-    """
-    # Resolve algorithm parameters (kwargs > params > defaults)
-    if params is not None and max_iterations is None:
-        max_iterations = params.max_iterations
-
-    raw = create_astar_plane_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        max_iterations=max_iterations,
-        tool_radius=tool_radius,
-    )
-
-    # Resolve standardizer parameters (kwargs > object > defaults)
-    if standardizer is not None:
-        if speed_mps is None: speed_mps = standardizer.speed_mps
-        if dt is None: dt = standardizer.dt
-        if max_points is None: max_points = standardizer.max_points
-        if smoothing is None: smoothing = standardizer.smoothing
-        if return_poses is None: return_poses = standardizer.return_poses
-
-    return standardize_path(raw, speed_mps=speed_mps, dt=dt,
-                            max_points=max_points, smoothing=smoothing,
-                            return_poses=return_poses)
-
-
-# ---------------------------------------------------------------------------
-# Back-compat shim for older sim code expecting a plane-specific A*
-# ---------------------------------------------------------------------------
-def create_astar_on_start_goal_plane(start_pos: Tuple[float, float, float],
-                                     goal_pos: Tuple[float, float, float],
-                                     wall_obstacle: Dict[str, Any],
-                                     grid_resolution: float = 0.01,
-                                     safety_margin: float = 0.02) -> np.ndarray:
-    """
-    Compatibility wrapper for older sim/run_sim.py that used a plane-constrained A*.
-
-    Internally calls the planar A* wrapper with obstacle_data=[wall_obstacle].
-    Returns a NumPy array of shape [N, 3].
-    """
-    obstacle_data = [wall_obstacle] if wall_obstacle is not None else []
-    return create_astar_plane_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        max_iterations=200000,
-    )
-
-
-def create_rrt_star_trajectory_standardized(start_pos: Tuple[float, float, float],
-                                            goal_pos: Tuple[float, float, float],
-                                            obstacle_data: List[Dict[str, Any]],
-                                            grid_resolution: float = 0.01,
-                                            safety_margin: float = 0.02,
-                                            use_3d: bool = True,
-                                            max_iterations: int = 10000,
-                                            max_acceptable_cost: Optional[float] = None,
-                                            max_step_size: float = 0.05,
-                                            goal_bias: float = 0.1,
-                                            rewire_radius: float = 0.08,
-                                            goal_tolerance: float = 0.02,
-                                            minimum_iterations: int = 1000,
-                                            cost_improvement_patience: int = 5000,
-                                            *,
-                                            params: Optional['RRTStarParams'] = None,
-                                            standardizer: Optional['StandardizerParams'] = None,
-                                            speed_mps: float = 0.10,
-                                            dt: float = 0.20,
-                                            max_points: int = 30,
-                                            smoothing: Optional[Dict[str, float]] = None,
-                                            return_poses: bool = True) -> Dict[str, np.ndarray]:
-    """Create an RRT* path and standardize it to constant-speed execution."""
-    # Resolve algorithm parameters (kwargs > params > defaults)
-    if params is not None:
-        if max_iterations is None: max_iterations = params.max_iterations
-        if max_acceptable_cost is None: max_acceptable_cost = params.max_acceptable_cost
-        if max_step_size is None: max_step_size = params.max_step_size
-        if goal_bias is None: goal_bias = params.goal_bias
-        if goal_tolerance is None: goal_tolerance = params.goal_tolerance
-        if rewire_radius is None: rewire_radius = params.rewire_radius
-        if minimum_iterations is None: minimum_iterations = params.minimum_iterations
-        if cost_improvement_patience is None: cost_improvement_patience = params.cost_improvement_patience
-
-    raw = create_rrt_star_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        max_iterations=max_iterations,
-        max_acceptable_cost=max_acceptable_cost,
-        max_step_size=max_step_size,
-        goal_bias=goal_bias,
-        rewire_radius=rewire_radius,
-        goal_tolerance=goal_tolerance,
-        minimum_iterations=minimum_iterations,
-        cost_improvement_patience=cost_improvement_patience,
-    )
-    # Resolve standardizer parameters
-    if standardizer is not None:
-        if speed_mps is None: speed_mps = standardizer.speed_mps
-        if dt is None: dt = standardizer.dt
-        if max_points is None: max_points = standardizer.max_points
-        if smoothing is None: smoothing = standardizer.smoothing
-        if return_poses is None: return_poses = standardizer.return_poses
-
-    return standardize_path(raw, speed_mps=speed_mps, dt=dt,
-                            max_points=max_points, smoothing=smoothing,
-                            return_poses=return_poses)
-
-
-def create_rrt_trajectory_standardized(start_pos: Tuple[float, float, float],
-                                       goal_pos: Tuple[float, float, float],
-                                       obstacle_data: List[Dict[str, Any]],
-                                       grid_resolution: float = 0.01,
-                                       safety_margin: float = 0.02,
-                                       use_3d: bool = True,
-                                       max_iterations: int = 10000,
-                                       max_acceptable_cost: Optional[float] = None,
-                                       max_step_size: float = 0.05,
-                                       goal_bias: float = 0.1,
-                                       goal_tolerance: float = 0.02,
-                                       *,
-                                       params: Optional['RRTParams'] = None,
-                                       standardizer: Optional['StandardizerParams'] = None,
-                                       speed_mps: float = 0.10,
-                                       dt: float = 0.20,
-                                       max_points: int = 30,
-                                       smoothing: Optional[Dict[str, float]] = None,
-                                       return_poses: bool = True) -> Dict[str, np.ndarray]:
-    """Create an RRT path and standardize it to constant-speed execution."""
-    # Resolve algorithm parameters (kwargs > params > defaults)
-    if params is not None:
-        if max_iterations is None: max_iterations = params.max_iterations
-        if max_acceptable_cost is None: max_acceptable_cost = params.max_acceptable_cost
-        if max_step_size is None: max_step_size = params.max_step_size
-        if goal_bias is None: goal_bias = params.goal_bias
-        if goal_tolerance is None: goal_tolerance = params.goal_tolerance
-
-    raw = create_rrt_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        max_iterations=max_iterations,
-        max_acceptable_cost=max_acceptable_cost,
-        max_step_size=max_step_size,
-        goal_bias=goal_bias,
-        goal_tolerance=goal_tolerance,
-    )
-    # Resolve standardizer parameters
-    if standardizer is not None:
-        if speed_mps is None: speed_mps = standardizer.speed_mps
-        if dt is None: dt = standardizer.dt
-        if max_points is None: max_points = standardizer.max_points
-        if smoothing is None: smoothing = standardizer.smoothing
-        if return_poses is None: return_poses = standardizer.return_poses
-
-    return standardize_path(raw, speed_mps=speed_mps, dt=dt,
-                            max_points=max_points, smoothing=smoothing,
-                            return_poses=return_poses)
-
-
-def create_prm_trajectory_standardized(start_pos: Tuple[float, float, float],
-                                       goal_pos: Tuple[float, float, float],
-                                       obstacle_data: List[Dict[str, Any]],
-                                       grid_resolution: float = 0.01,
-                                       safety_margin: float = 0.02,
-                                       use_3d: bool = True,
-                                       num_samples: int = 1000,
-                                       connection_radius: float = 0.12,
-                                       max_connections_per_node: int = 15,
-                                       *,
-                                       params: Optional['PRMParams'] = None,
-                                       standardizer: Optional['StandardizerParams'] = None,
-                                       speed_mps: float = 0.10,
-                                       dt: float = 0.20,
-                                       max_points: int = 30,
-                                       smoothing: Optional[Dict[str, float]] = None,
-                                       return_poses: bool = True) -> Dict[str, np.ndarray]:
-    """Create a PRM path and standardize it to constant-speed execution."""
-    # Resolve algorithm parameters (kwargs > params > defaults)
-    if params is not None:
-        if num_samples is None: num_samples = params.num_samples
-        if connection_radius is None: connection_radius = params.connection_radius
-        if max_connections_per_node is None: max_connections_per_node = params.max_connections_per_node
-
-    raw = create_prm_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        num_samples=num_samples,
-        connection_radius=connection_radius,
-        max_connections_per_node=max_connections_per_node,
-    )
-    # Resolve standardizer parameters
-    if standardizer is not None:
-        if speed_mps is None: speed_mps = standardizer.speed_mps
-        if dt is None: dt = standardizer.dt
-        if max_points is None: max_points = standardizer.max_points
-        if smoothing is None: smoothing = standardizer.smoothing
-        if return_poses is None: return_poses = standardizer.return_poses
-
-    return standardize_path(raw, speed_mps=speed_mps, dt=dt,
-                            max_points=max_points, smoothing=smoothing,
-                            return_poses=return_poses)

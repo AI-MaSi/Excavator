@@ -10,72 +10,84 @@ CHANNEL_CONFIGS:
         output_channel: 9
         pulse_min: 1000
         pulse_max: 1700
-        idle: 0.45 # 0.40
+        idle: 0.40 # 0.45
         multiplier: 0.4
 
 
     lift_boom:
         output_channel: 3  # output pin on the servo board
-        affects_pump: True # whether moving this servo affects the pump speed
+        affects_pump: True # whether moving this servo affects the pump speed (if set to variable)
         toggleable: False  # whether this servo can be toggled on/off via call
-        center: 1566       # 1572 center pulse width in microseconds
+        center: 1570       # 1566 center pulse width in microseconds
         direction: 1       # pretty self-explanatory, -1 or 1
-        pulse_min: 1340    # extend. This sets max velocity
-        pulse_max: 1785    # retract. Max velocity in other direction
-        deadzone: 1.0      # % of total range to ignore around center (=cuts out values)
-        # Simple deadband - separate pos/neg offsets from center (us)
-        deadband_us_pos: 146.0 #Try to match tese!
-        deadband_us_neg: 146.0
-        # Dither - prevent valve stiction
-        dither_enable: true # enable/disable dither
-        dither_amp_us: 12.0 # amplitude in microseconds
-        dither_hz: 10.0     # frequency in Hz
+        pulse_min: 1358    # extend. This sets max velocity. Increase until arm doesn't go faster --> valve fully open
+        pulse_max: 1770    # retract. Max velocity in other direction
+        deadzone: 1.2      # % of total range to ignore around center (=cuts out values)
+
+        deadband_us_pos: 155.0 #150 pos/neg offsets from center (us)
+        deadband_us_neg: 155.0 # if these match, your center value is prob correct :)
+
+        dither_enable: True # enable/disable dither. Adds sine wave to the control signal.
+        dither_amp_us: 20.0 # amplitude in microseconds
+        dither_hz: 15.0     # frequency in Hz
+
+        ramp_enable: False   # slew limit.
+        ramp_limit: 1200.0  # us/s. Reduce to limit servo overshoot when exiting deadband
+
+        gamma: 1.0          # control signal curve. Set to 0.5 for classic inverse square root shaping
+
+
 
     tilt_boom:
         output_channel: 4
         affects_pump: True
         toggleable: False
-        center: 1487 # 1487
+        center: 1485 # 1487
         direction: 1
-        pulse_min: 1225     #1220 ret
-        pulse_max: 1685     #1690 ext
+        pulse_min: 1250     # ret
+        pulse_max: 1720     # ext
         deadzone: 1.0
-        # Simple deadband - separate pos/neg
-        deadband_us_pos: 137.0 #140.0
-        deadband_us_neg: 137.0 #145.0
-        # Dither settings
+        deadband_us_pos: 130.0
+        deadband_us_neg: 130.0
         dither_enable: true
-        dither_amp_us: 10.0
-        dither_hz: 50.0
+        dither_amp_us: 20.0
+        dither_hz: 15.0
+        ramp_enable: False
+        ramp_limit: 1000.0
+        gamma: 1.0
 
     scoop:
         output_channel: 2
-        affects_pump: True  # we can leave this true but use toggle_pump_variable(False) in the controller for static speed
+        affects_pump: True
         toggleable: False
-        center: 1395        # 1395
-        direction: -1
-        pulse_min: 1191     # 1175direction -1, so extend
-        pulse_max: 1620     #1620 retract
+        center: 1395
+        direction: -1       # ext/ret flipped!
+        pulse_min: 1170     # ext
+        pulse_max: 1620     # ret 1620
         deadzone: 1.0
-        # Simple deadband - separate pos/neg
-        deadband_us_pos: 130.0 # 137
-        deadband_us_neg: 130.0
+        deadband_us_pos: 120.0
+        deadband_us_neg: 120.0 # 140 all
         dither_enable: true
-        dither_amp_us: 10.0
-        dither_hz: 50.0
+        dither_amp_us: 20.0
+        dither_hz: 15.0
+        ramp_enable: False
+        ramp_limit: 1000.0
+        gamma: 1.0
 
     rotate:
         output_channel: 5
         affects_pump: False
         toggleable: False
-        center: 1559 # 1555 Predicted true center: 1565-1570 (10-15 µs higher)
-        direction: -1 #1
-        pulse_min: 1500 #1505
-        pulse_max: 1611
+        center: 1558
+        direction: -1
+        pulse_min: 1509
+        pulse_max: 1604  #1604
         deadzone: 1.0
-        deadband_us_pos: 43.0
-        deadband_us_neg: 43.0
-        dither_enable: false
-        dither_amp_us: 16.0 # 12
-        dither_hz: 25.0 # 20
- 
+        deadband_us_pos: 45.5
+        deadband_us_neg: 45
+        dither_enable: False
+        dither_amp_us: 15.0
+        dither_hz: 16.0
+        ramp_enable: false
+        ramp_limit: 100.0
+        gamma: 1.0

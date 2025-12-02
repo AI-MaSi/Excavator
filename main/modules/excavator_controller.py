@@ -15,6 +15,7 @@ towards the last given target pose. Use pause()/resume() for safe A* planning.
 import time
 import threading
 import numpy as np
+import logging
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import sys
@@ -47,12 +48,319 @@ class ControllerConfig:
     control_frequency: float  # Hz
 
 
+@dataclass
+class MotionState:
+    """Internal state for jerk-limited motion smoothing."""
+
+    # Linear motion state (Cartesian position)
+    current_position: np.ndarray  # [x, y, z] in meters
+    current_velocity: float       # Linear velocity magnitude in m/s
+    current_acceleration: float   # Linear acceleration magnitude in m/s^2
+
+    # Rotational motion state (around Y axis for excavator)
+    current_rotation_deg: float    # Current rotation in degrees
+    current_rot_velocity_dps: float  # Rotational velocity in deg/s
+    current_rot_acceleration_dps2: float  # Rotational acceleration in deg/s^2
+
+    # Timing
+    last_update_time: float  # Timestamp of last update (perf_counter)
+    is_initialized: bool     # Whether state has been initialized
+
+
+@dataclass
+class _SCurveParams:
+    max_velocity: float
+    max_acceleration: float
+    max_deceleration: float
+    max_jerk: float
+
+
+class _SCurveGenerator:
+    """Jerk-limited velocity profile (inlined from the old scurve_profile)."""
+
+    def __init__(self, params: _SCurveParams):
+        self.params = params
+        self.reset()
+
+    def reset(self):
+        self.current_velocity = 0.0
+        self.current_acceleration = 0.0
+
+    def compute_next_velocity(
+        self,
+        current_velocity: float,
+        current_acceleration: float,
+        target_velocity: float,
+        distance_remaining: float,
+        dt: float
+    ):
+        max_jerk = self.params.max_jerk
+        max_accel = self.params.max_acceleration
+        max_decel = self.params.max_deceleration
+        max_vel = min(self.params.max_velocity, target_velocity)
+
+        t_jerk = max_decel / max_jerk if max_jerk > 0 else 0.0
+
+        d_jerk_up = current_velocity * t_jerk + (1 / 6) * max_jerk * t_jerk**3
+        v_after_ramp = current_velocity + 0.5 * max_decel * t_jerk
+
+        t_const_decel = 0.0
+        if v_after_ramp > 0 and max_decel > 0:
+            t_const_decel = max(0, (v_after_ramp - 0.5 * max_decel * t_jerk) / max_decel)
+
+        d_const = v_after_ramp * t_const_decel - 0.5 * max_decel * t_const_decel**2
+
+        v_before_final = v_after_ramp - max_decel * t_const_decel
+        d_jerk_down = v_before_final * t_jerk - 0.5 * max_decel * t_jerk**2 + (1 / 6) * (-max_jerk) * t_jerk**3
+
+        stopping_distance = d_jerk_up + max(0, d_const) + max(0, d_jerk_down)
+        need_decelerate = distance_remaining <= stopping_distance * 1.2
+
+        if need_decelerate:
+            target_accel = -max_decel
+            if current_acceleration > target_accel:
+                jerk = -max_jerk
+            else:
+                jerk = 0
+                current_acceleration = target_accel
+        else:
+            if current_velocity < max_vel:
+                target_accel = max_accel
+                if current_acceleration < target_accel:
+                    jerk = max_jerk
+                else:
+                    jerk = 0
+                    current_acceleration = target_accel
+            else:
+                if abs(current_acceleration) > 1e-6:
+                    jerk = -np.sign(current_acceleration) * max_jerk
+                else:
+                    jerk = 0
+                    current_acceleration = 0
+
+        next_acceleration = current_acceleration + jerk * dt
+        next_acceleration = np.clip(next_acceleration, -max_decel, max_accel)
+
+        next_velocity = current_velocity + next_acceleration * dt
+        next_velocity = np.clip(next_velocity, 0.0, max_vel)
+
+        if distance_remaining < 0.001 and next_velocity < 0.01:
+            next_velocity = 0.0
+            next_acceleration = 0.0
+
+        return next_velocity, next_acceleration
+
+
+def _create_scurve_generator(
+    max_velocity: float,
+    max_acceleration: float,
+    max_deceleration: float,
+    max_jerk: float
+) -> _SCurveGenerator:
+    params = _SCurveParams(
+        max_velocity=max_velocity,
+        max_acceleration=max_acceleration,
+        max_deceleration=max_deceleration,
+        max_jerk=max_jerk
+    )
+    return _SCurveGenerator(params)
+
+
+class MotionProcessor:
+    """
+    Jerk-limited smoothing layer for pose commands.
+
+    Kept lightweight: operates on EE position + yaw, uses jerk-limited S-curve
+    profiles, and accepts measured feedback to stay aligned with hardware state.
+    """
+
+    def __init__(
+        self,
+        max_velocity: float = 0.02,
+        max_acceleration: float = 0.5,
+        max_deceleration: float = 0.5,
+        max_jerk: float = 2.0,
+        max_rot_velocity_dps: float = 45.0,
+        max_rot_acceleration_dps2: float = 180.0,
+        max_rot_jerk_dps3: float = 720.0,
+        enable_smoothing: bool = True
+    ):
+        self.max_velocity = max_velocity
+        self.max_acceleration = max_acceleration
+        self.max_deceleration = max_deceleration
+        self.max_jerk = max_jerk
+
+        self.max_rot_velocity_dps = max_rot_velocity_dps
+        self.max_rot_acceleration_dps2 = max_rot_acceleration_dps2
+        self.max_rot_jerk_dps3 = max_rot_jerk_dps3
+
+        self.enable_smoothing = enable_smoothing
+
+        self.linear_scurve = _create_scurve_generator(
+            max_velocity=max_velocity,
+            max_acceleration=max_acceleration,
+            max_deceleration=max_deceleration,
+            max_jerk=max_jerk
+        )
+
+        self.rotation_scurve = _create_scurve_generator(
+            max_velocity=max_rot_velocity_dps,
+            max_acceleration=max_rot_acceleration_dps2,
+            max_deceleration=max_rot_acceleration_dps2,
+            max_jerk=max_rot_jerk_dps3
+        )
+
+        self.state = MotionState(
+            current_position=np.zeros(3, dtype=np.float32),
+            current_velocity=0.0,
+            current_acceleration=0.0,
+            current_rotation_deg=0.0,
+            current_rot_velocity_dps=0.0,
+            current_rot_acceleration_dps2=0.0,
+            last_update_time=0.0,
+            is_initialized=False
+        )
+
+    def reset(self, position: Optional[np.ndarray] = None, rotation_deg: float = 0.0):
+        """Reset smoothing state; keeps last position if none provided."""
+        if position is not None:
+            self.state.current_position = np.array(position, dtype=np.float32)
+        self.state.current_velocity = 0.0
+        self.state.current_acceleration = 0.0
+        self.state.current_rotation_deg = float(rotation_deg)
+        self.state.current_rot_velocity_dps = 0.0
+        self.state.current_rot_acceleration_dps2 = 0.0
+        self.state.last_update_time = time.perf_counter()
+        self.state.is_initialized = True
+        self.linear_scurve.reset()
+        self.rotation_scurve.reset()
+
+    def sync_feedback(
+        self,
+        position: np.ndarray,
+        rotation_deg: float,
+        linear_velocity: Optional[float] = None,
+        rot_velocity_dps: Optional[float] = None
+    ):
+        """Align internal state with measured pose/velocity (cheap re-seed)."""
+        self.state.current_position = np.array(position, dtype=np.float32)
+        self.state.current_rotation_deg = float(rotation_deg)
+        if linear_velocity is not None:
+            self.state.current_velocity = float(abs(linear_velocity))
+        if rot_velocity_dps is not None:
+            self.state.current_rot_velocity_dps = float(rot_velocity_dps)
+        self.state.last_update_time = time.perf_counter()
+        self.state.is_initialized = True
+
+    def process_target(
+        self,
+        target_pos: np.ndarray,
+        target_rot_deg: float,
+        dt: float
+    ) -> Tuple[np.ndarray, float]:
+        """Smooth a single target pose given an explicit dt."""
+        target_pos = np.array(target_pos, dtype=np.float32)
+
+        if not self.state.is_initialized:
+            self.reset(position=target_pos, rotation_deg=target_rot_deg)
+            return target_pos.copy(), float(target_rot_deg)
+
+        dt = max(0.001, min(float(dt), 0.1))
+
+        if not self.enable_smoothing:
+            self.state.current_position = target_pos.copy()
+            self.state.current_rotation_deg = float(target_rot_deg)
+            return target_pos.copy(), float(target_rot_deg)
+
+        smoothed_pos = self._process_linear_motion(target_pos, dt)
+        smoothed_rot = self._process_rotational_motion(target_rot_deg, dt)
+        return smoothed_pos, smoothed_rot
+
+    def _process_linear_motion(self, target_pos: np.ndarray, dt: float) -> np.ndarray:
+        delta = target_pos - self.state.current_position
+        distance = float(np.linalg.norm(delta))
+
+        if distance < 1e-6:
+            self.state.current_velocity = 0.0
+            self.state.current_acceleration = 0.0
+            return self.state.current_position.copy()
+
+        direction = delta / distance
+        next_velocity, next_acceleration = self.linear_scurve.compute_next_velocity(
+            current_velocity=self.state.current_velocity,
+            current_acceleration=self.state.current_acceleration,
+            target_velocity=self.max_velocity,
+            distance_remaining=distance,
+            dt=dt
+        )
+
+        step_distance = min(distance, next_velocity * dt)
+        next_position = self.state.current_position + direction * step_distance
+
+        self.state.current_position = next_position
+        self.state.current_velocity = next_velocity
+        self.state.current_acceleration = next_acceleration
+        return next_position.copy()
+
+    def _process_rotational_motion(self, target_rot_deg: float, dt: float) -> float:
+        def wrap_deg(angle: float) -> float:
+            return (angle + 180.0) % 360.0 - 180.0
+
+        rot_error = wrap_deg(target_rot_deg - self.state.current_rotation_deg)
+        abs_rot_error = abs(rot_error)
+
+        if abs_rot_error < 1e-3:
+            self.state.current_rot_velocity_dps = 0.0
+            self.state.current_rot_acceleration_dps2 = 0.0
+            return self.state.current_rotation_deg
+
+        direction = np.sign(rot_error)
+        next_velocity, next_acceleration = self.rotation_scurve.compute_next_velocity(
+            current_velocity=abs(self.state.current_rot_velocity_dps),
+            current_acceleration=abs(self.state.current_rot_acceleration_dps2),
+            target_velocity=self.max_rot_velocity_dps,
+            distance_remaining=abs_rot_error,
+            dt=dt
+        )
+
+        next_velocity_signed = next_velocity * direction
+        step_angle = min(abs_rot_error, next_velocity * dt) * direction
+        next_rotation = self.state.current_rotation_deg + step_angle
+
+        self.state.current_rotation_deg = next_rotation
+        self.state.current_rot_velocity_dps = next_velocity_signed
+        self.state.current_rot_acceleration_dps2 = next_acceleration * direction
+        return next_rotation
+
+
 class ExcavatorController:
     def __init__(self, hardware_interface, config: Optional[ControllerConfig] = None,
-                 enable_perf_tracking: bool = False, verbose: bool = True):
+                 enable_perf_tracking: bool = False, log_level: str = "INFO"):
+        """Initialize the excavator controller.
+
+        Args:
+            hardware_interface: Hardware interface instance
+            config: Optional controller configuration
+            enable_perf_tracking: Enable performance statistics tracking
+            log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR" (default: "INFO")
+        """
         self.hardware = hardware_interface
         self._enable_perf_tracking = enable_perf_tracking
-        self._verbose = verbose
+
+        # Setup logger for this controller instance
+        self.logger = logging.getLogger(f"{__name__}.ExcavatorController")
+        self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Add console handler if no handlers exist
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
+        # Initialize debug counters (for periodic logging)
+        self._debug_counter = 0
+        self._ik_debug_counter = 0
 
         # Cascade perf flag to hardware if supported (no-op otherwise)
         try:
@@ -145,7 +453,9 @@ class ExcavatorController:
             max_joint_velocities=max_joint_velocities,
             joint_limits=joint_limits
         )
-        self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config, verbose=self._verbose)  # Advanced with weighting
+        # Pass verbose flag if IK controller supports it, else use DEBUG level check
+        ik_verbose = self.logger.level <= logging.DEBUG
+        self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config, verbose=ik_verbose)
 
         # Relative IK control parameters (pulling toward target)
         try:
@@ -184,6 +494,15 @@ class ExcavatorController:
             )
             self.joint_pids.append(pid)
 
+        # Motion processor for jerk-limited pose commands (aligned with IK loop)
+        self.motion_processor = MotionProcessor(
+            max_velocity=float(_DEFAULT_CONFIG.speed_mps),
+            max_acceleration=float(_DEFAULT_CONFIG.max_accel_mps2),
+            max_deceleration=float(_DEFAULT_CONFIG.max_decel_mps2),
+            max_jerk=float(_DEFAULT_CONFIG.max_jerk_mps3),
+            enable_smoothing=bool(getattr(_DEFAULT_CONFIG, 'enable_jerk', True)),
+        )
+
         # Thread control
         self._control_thread = None
         self._stop_event = threading.Event()
@@ -191,19 +510,25 @@ class ExcavatorController:
         self._lock = threading.Lock()
 
         # State variables
-        self._target_position = None
+        self._raw_target_position = None  # Un-smoothed target input
+        self._raw_target_rotation_deg = None
+        self._target_position = None     # Smoothed target (fed to IK)
         self._target_orientation = None
         self._current_position = np.zeros(3, dtype=np.float32)
         self._current_orientation_y_deg = 0.0
         self._current_projected_quats = None  # Cache processed quaternions
+        self._current_linear_velocity = 0.0
+        self._current_rot_velocity_degps = 0.0
         self._outputs_zeroed = False  # Track whether we've already sent a zero/neutral command
-        # Gated debug telemetry (disabled by default to avoid overhead)
-        self._debug_telemetry_enabled = False
+        # Debug telemetry (data capture for detailed logging/analysis)
         self._last_pi_outputs = None
         self._last_named_commands = None
         self._prev_joint_angles = None
         self._prev_joint_time = None
         self._last_joint_vel_radps = None
+        self._prev_pose_time = None
+        self._prev_pose = None
+        self._prev_orientation_deg = None
 
         # Performance tracking
         self._loop_times = []
@@ -217,18 +542,18 @@ class ExcavatorController:
         self._ik_fk_times = []
         self._pwm_times = []
 
-        print("Controller initialized")
+        self.logger.info("Controller initialized")
 
     def start(self) -> None:
         if self._control_thread is not None:
-            print("Controller already running!")
+            self.logger.warning("Controller already running!")
             return
 
         self._stop_event.clear()
         self._pause_event.clear()  # Start unpaused
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._control_thread.start()
-        print("Control loop started")
+        self.logger.info("Control loop started")
 
     def stop(self) -> None:
         if self._control_thread is None:
@@ -248,7 +573,7 @@ class ExcavatorController:
     def pause(self) -> None:
         """Pause the control loop and clear any pending IK target."""
         if self._control_thread is None:
-            print("Controller not running - cannot pause")
+            self.logger.warning("Controller not running - cannot pause")
             return
 
         # Engage paused state immediately so the loop stops computing commands
@@ -257,18 +582,19 @@ class ExcavatorController:
         # Clear target and controller states to avoid stale jumps on resume
         self.clear_target()
         # Ensure hardware is commanded to safe (zero) outputs while paused
-        # This guarantees actuators hold still during path planning
+        # This guarantees actuators hold still during path planning. Reset pump too
+        # so hydraulics are depressurized while idle.
         try:
-            self.hardware.reset(reset_pump=False)
+            self.hardware.reset(reset_pump=True)
         except Exception:
             pass
         self._outputs_zeroed = True
-        print("Controller paused (target cleared)")
+        self.logger.info("Controller paused (target cleared)")
 
     def resume(self) -> None:
         """Resume the control loop from paused state."""
         if self._control_thread is None:
-            print("Controller not running - cannot resume")
+            self.logger.warning("Controller not running - cannot resume")
             return
         
         # Clear stale PID states to prevent old integral/derivative terms
@@ -284,15 +610,18 @@ class ExcavatorController:
         # IMPORTANT: Update current state before resuming
         # This prevents IK confusion from stale position data
         self._update_current_state()
+        # Sync smoother to measured pose so next command starts from reality
+        self.motion_processor.reset(
+            position=self._current_position,
+            rotation_deg=self._current_orientation_y_deg
+        )
 
         self._pause_event.clear()
 
     def give_pose(self, position, rotation_y_deg: float = 0.0) -> None:
         with self._lock:
-            self._target_position = np.array(position, dtype=np.float32)
-            y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            y_rotation_rad = np.radians(rotation_y_deg)
-            self._target_orientation = quat_from_axis_angle(y_axis, y_rotation_rad)
+            self._raw_target_position = np.array(position, dtype=np.float32)
+            self._raw_target_rotation_deg = float(rotation_y_deg)
         # We're about to actively command again
         self._outputs_zeroed = False
 
@@ -322,12 +651,19 @@ class ExcavatorController:
         until a new target is provided with give_pose().
         """
         with self._lock:
+            self._raw_target_position = None
+            self._raw_target_rotation_deg = None
             self._target_position = None
             self._target_orientation = None
 
         # Reset PIDs to avoid residual terms
         for pid in self.joint_pids:
             pid.reset()
+        # Reset smoother to measured state to avoid jumps on next command
+        self.motion_processor.reset(
+            position=self._current_position,
+            rotation_deg=self._current_orientation_y_deg
+        )
 
     def get_pose(self) -> Tuple[np.ndarray, float]:
         with self._lock:
@@ -458,15 +794,19 @@ class ExcavatorController:
 
         return stats
 
-    def set_debug_telemetry(self, enabled: bool) -> None:
-        """Enable/disable capturing of extra telemetry for logging.
+    def set_log_level(self, level: str) -> None:
+        """Change the logging level at runtime.
 
-        When enabled, caches last PID outputs, PWM commands, and joint velocities.
-        Also cascades to hardware to enable IMU gyro capture.
+        Args:
+            level: One of "DEBUG", "INFO", "WARNING", "ERROR"
         """
-        self._debug_telemetry_enabled = bool(enabled)
-        if hasattr(self.hardware, 'set_debug_telemetry_enabled'):
-            self.hardware.set_debug_telemetry_enabled(bool(enabled))
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        self.logger.info(f"Log level changed to {level.upper()}")
+
+        # Update IK controller verbose flag if DEBUG level
+        ik_verbose = self.logger.level <= logging.DEBUG
+        if hasattr(self.ik_controller, 'verbose'):
+            self.ik_controller.verbose = ik_verbose
 
     def get_last_pid_outputs(self):
         """Return last per-joint PID outputs [slew, boom, arm, bucket] or None if not captured."""
@@ -527,7 +867,7 @@ class ExcavatorController:
             return all_quaternions
 
         except Exception as e:
-            print(f"Error reading quaternions: {e}")
+            self.logger.error(f"Error reading quaternions: {e}")
             return None
 
     def _control_loop(self) -> None:
@@ -537,6 +877,8 @@ class ExcavatorController:
 
         while not self._stop_event.is_set():
             loop_start_time = time.perf_counter()
+            loop_dt = loop_start_time - last_loop_start if last_loop_start is not None else loop_period
+            loop_dt = max(0.001, min(loop_dt, 0.1))
 
             # Check if paused - if so, just sleep and continue
             if self._pause_event.is_set():
@@ -557,6 +899,9 @@ class ExcavatorController:
                     t_sensor_end = time.perf_counter()
                     t_ik_fk_start = t_sensor_end
 
+                # Refresh smoothed target using latest feedback + loop timing
+                self._refresh_smoothed_target(loop_dt)
+
                 with self._lock:
                     has_target = self._target_position is not None
                 if has_target:
@@ -571,7 +916,7 @@ class ExcavatorController:
                     t_ik_fk_end = time.perf_counter()
 
             except Exception as e:
-                print(f"Control loop error: {e}")
+                self.logger.error(f"Control loop error: {e}")
                 self.hardware.reset(reset_pump=True)
                 break
 
@@ -647,8 +992,60 @@ class ExcavatorController:
                 self._current_raw_quats = raw_quats
                 self._current_ee_quat_full = ee_quat
 
+            # Update simple EE velocity estimates for smoother seeding
+            now_t = time.perf_counter()
+            if self._prev_pose_time is not None:
+                dt = max(1e-6, now_t - self._prev_pose_time)
+                pos_delta = ee_pos - (self._prev_pose if self._prev_pose is not None else ee_pos)
+                lin_vel = float(np.linalg.norm(pos_delta) / dt)
+                rot_delta = ee_y_angle_deg - (self._prev_orientation_deg if self._prev_orientation_deg is not None else ee_y_angle_deg)
+                rot_delta = (rot_delta + 180.0) % 360.0 - 180.0
+                rot_vel = float(rot_delta / dt)
+                self._current_linear_velocity = lin_vel
+                self._current_rot_velocity_degps = rot_vel
+            self._prev_pose_time = now_t
+            self._prev_pose = ee_pos
+            self._prev_orientation_deg = ee_y_angle_deg
+
         except Exception as e:
-            print(f"Error in state update: {e}")
+            self.logger.error(f"Error in state update: {e}")
+
+    def _refresh_smoothed_target(self, loop_dt: float) -> None:
+        """Update smoothed IK target using jerk-limited motion processor."""
+        with self._lock:
+            raw_pos = None if self._raw_target_position is None else self._raw_target_position.copy()
+            raw_rot = self._raw_target_rotation_deg
+            current_pos = self._current_position.copy()
+            current_rot = float(self._current_orientation_y_deg)
+            lin_vel = self._current_linear_velocity
+            rot_vel = self._current_rot_velocity_degps
+
+        if raw_pos is None or raw_rot is None:
+            with self._lock:
+                self._target_position = None
+                self._target_orientation = None
+            return
+
+        # Keep smoother aligned with measured state each loop
+        self.motion_processor.sync_feedback(
+            position=current_pos,
+            rotation_deg=current_rot,
+            linear_velocity=lin_vel,
+            rot_velocity_dps=rot_vel
+        )
+
+        smoothed_pos, smoothed_rot = self.motion_processor.process_target(
+            target_pos=raw_pos,
+            target_rot_deg=raw_rot,
+            dt=loop_dt
+        )
+
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        smoothed_quat = quat_from_axis_angle(y_axis, np.radians(smoothed_rot))
+
+        with self._lock:
+            self._target_position = smoothed_pos.astype(np.float32)
+            self._target_orientation = smoothed_quat
 
     def _compute_control_commands(self) -> None:
         """Compute and send control commands based on current state and target."""
@@ -715,32 +1112,29 @@ class ExcavatorController:
                 joint_quats=raw_quats  # Pass raw IMU quats; V2 handles offsets/propagation
             )
 
-            # DEBUG: Check if IK produced output
-            if hasattr(self, '_ik_debug_counter'):
-                self._ik_debug_counter += 1
-            else:
-                self._ik_debug_counter = 0
-
-            if self._verbose and self._ik_debug_counter % 50 == 0:
+            # DEBUG: Periodic IK output check (every ~1 second at 50Hz)
+            self._ik_debug_counter += 1
+            if self.logger.level <= logging.DEBUG and self._ik_debug_counter % 50 == 0:
                 if target_joint_angles is not None:
                     delta_angles = target_joint_angles - current_joint_angles
                     delta_deg = np.degrees(delta_angles)
                     max_delta = np.max(np.abs(delta_deg))
                     if max_delta > 0.1:
-                        print(f"[IK] Delta: {delta_deg} deg (max={max_delta:.2f})")
+                        self.logger.debug(f"IK delta: {delta_deg} deg (max={max_delta:.2f})")
                 else:
-                    print("[IK] WARNING: IK returned None!")
+                    self.logger.warning("IK returned None!")
 
         except Exception as e:
-            print(f"Error in control computation: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"Error in control computation: {e}")
+            if self.logger.level <= logging.DEBUG:
+                import traceback
+                traceback.print_exc()
             return
 
         if target_joint_angles is None:
             # If IK failed, command neutral once (avoid constant zeroing)
             if not self._outputs_zeroed:
-                print("WARNING: IK returned None, sending neutral command")
+                self.logger.warning("IK returned None, sending neutral command")
                 self.hardware.reset(reset_pump=False)
                 self._outputs_zeroed = True
             return
@@ -773,21 +1167,16 @@ class ExcavatorController:
         self._prev_joint_angles = current_joint_angles.copy()
         self._prev_joint_time = now_t
 
-        # Gated debug telemetry capture (minimal overhead when disabled)
-        if self._debug_telemetry_enabled:
-            self._last_pi_outputs = list(pi_outputs)
-            self._last_named_commands = dict(named_commands)
+        # Debug telemetry capture (always enabled for get_last_* methods)
+        self._last_pi_outputs = list(pi_outputs)
+        self._last_named_commands = dict(named_commands)
 
-        # DEBUG: Print commands periodically (every ~50 loops = ~1 sec at 50Hz)
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 0
-
-        if self._verbose and self._debug_counter % 50 == 0:
+        # DEBUG: Print commands periodically (every ~1 second at 50Hz)
+        self._debug_counter += 1
+        if self.logger.level <= logging.DEBUG and self._debug_counter % 50 == 0:
             max_cmd = max(abs(x) for x in pi_outputs)
             if max_cmd > 0.01:  # Only print if non-trivial commands
-                print(f"[CTRL] Commands: slew={pi_outputs[0]:+.3f} boom={pi_outputs[1]:+.3f} arm={pi_outputs[2]:+.3f} bucket={pi_outputs[3]:+.3f}")
+                self.logger.debug(f"Control commands: slew={pi_outputs[0]:+.3f} boom={pi_outputs[1]:+.3f} arm={pi_outputs[2]:+.3f} bucket={pi_outputs[3]:+.3f}")
 
         # Track IK/FK completion time before PWM
         if self._enable_perf_tracking:

@@ -8,6 +8,7 @@ Simplified ADC Interface optimized for excavator ADC sensors.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import time
+import logging
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
@@ -216,19 +217,39 @@ class ADCConfig:
 
 
 class SimpleADC:
-    def __init__(self, custom_config: ADCConfig = None, filter_alpha: float = 0.8):
+    def __init__(self, custom_config: ADCConfig = None, filter_alpha: float = 0.5, log_level: str = "INFO"):
         """
         Initialize ADC with built-in or custom configuration.
 
         :param custom_config: Optional custom ADCConfig instance. If None, uses default excavator config.
         :param filter_alpha: EMA filter alpha (0-1). Higher = more responsive, lower = smoother. Default 0.8.
+        :param log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
         """
+        # Setup logger
+        self.logger = logging.getLogger(f"{__name__}.SimpleADC")
+        self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Add console handler if no handlers exist
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
         self.config = custom_config if custom_config else ADCConfig()
         self.adcs = {}
         self.initialized = False
         self.filter_alpha = filter_alpha
         self.filtered_values = {}  # Store filtered values per board/channel: {(board, channel): value}
         self.initialize_adc()
+
+    def set_log_level(self, level: str) -> None:
+        """Change the logging level at runtime.
+
+        Args:
+            level: One of "DEBUG", "INFO", "WARNING", "ERROR"
+        """
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     def _board_needed(self, board_name: str) -> bool:
         """Check if a board is needed by any configured sensor."""

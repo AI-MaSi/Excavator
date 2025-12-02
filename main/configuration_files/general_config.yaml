@@ -27,35 +27,35 @@ imu:
 
 pwm:
   # PWM controller options forwarded to PCA9685 driver initialization
-  pump_variable: false
-  toggle_channels: false
+  pump_variable: False
+  toggle_channels: False
   input_rate_threshold: 0
 
 pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 8.0 #10.0
+    kp: 5.0
     ki: 0.250
-    kd: 0.0
+    kd: 0.75
 
   # Joint 1: Boom (lift arm)
   joint1:
-    kp: 15.0
-    ki: 1.0
+    kp: 15.0 #13
+    ki: 0.5
     kd: 0.0
 
   # Joint 2: Arm (tilt)
   joint2:
-    kp: 8.0
-    ki: 0.30
+    kp: 7.0 #5
+    ki: 0.50
     kd: 0.15
 
   # Joint 3: Bucket (scoop)
   joint3:
-    kp: 11.0
+    kp: 5.0 #11
     ki: 0.50
-    kd: 0.2
+    kd: 0.15
 
 controller:
   # PID output limits (normalized -1.0 to 1.0)
@@ -71,5 +71,5 @@ controller:
   # Examples at 100Hz:
   #   0.1 rad/iter = 5.73°/iter = 573°/s
 
-  per_joint_max_velocity: [0.15, 0.15, 0.15, 0.15]
+  per_joint_max_velocity: [0.5, 1.0, 1.0, 1.0] #0.15
 

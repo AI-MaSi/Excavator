@@ -34,13 +34,9 @@ from typing import Optional, Tuple
 
 from modules.pid import PIDController
 from modules.udp_socket import UDPSocket
-from modules.quaternion_math import y_deg_from_quat
 from modules.diff_ik_V2 import (
     create_excavator_config,
-    apply_imu_offsets,
-    project_to_rotation_axes,
-    propagate_base_rotation,
-    extract_axis_rotation,
+    compute_relative_joint_angles,
 )
 from modules.hardware_interface import HardwareInterface
 
@@ -162,6 +158,8 @@ class RobotPIDTuner:
         Returns:
             Joint angle in radians, or None if sensors not ready
         """
+        if not self.hw.is_hardware_ready():
+            return None
         try:
             # Read IMU data and slew quaternion (may raise on error)
             imu_quats = self.hw.read_imu_data()
@@ -172,15 +170,11 @@ class RobotPIDTuner:
             # Combine into 4-joint quaternion array [slew, boom, arm, bucket]
             all_quats = np.array([slew_quat] + imu_quats[:3], dtype=np.float32)
 
-            # Apply full quaternion processing pipeline
-            corrected = apply_imu_offsets(all_quats, self.robot_config)
-            projected = project_to_rotation_axes(corrected, self.robot_config.rotation_axes)
-            propagated = propagate_base_rotation(projected, self.robot_config)
-
-            # Extract angle about this joint's rotation axis
-            axis = self.robot_config.rotation_axes[joint_id]
-            angle = float(extract_axis_rotation(propagated[joint_id], axis))
-            return angle
+            # Use the same relative-angle pipeline as the main controller
+            joint_angles = compute_relative_joint_angles(all_quats, self.robot_config)
+            if joint_id < 0 or joint_id >= len(joint_angles):
+                return None
+            return float(joint_angles[joint_id])
         except Exception as e:
             # Hardware errors (sensors not ready, etc.) are caught and logged
             # Safety decorator has already reset hardware if needed
@@ -301,10 +295,11 @@ class RobotPIDTuner:
                         )
                 else:
                     # No measurement; drive all channels to zero for safety
-                    try:
-                        self.hw.reset(reset_pump=False)
-                    except Exception:
-                        pass
+                    if self.hw.is_hardware_ready():
+                        try:
+                            self.hw.reset(reset_pump=False)
+                        except Exception:
+                            pass
 
                 # Sleep to maintain loop rate
                 next_t += period
