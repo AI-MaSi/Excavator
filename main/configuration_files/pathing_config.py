@@ -13,16 +13,16 @@ class EnvironmentConfig:
     """Environment setup configuration for both sim and real systems."""
 
     # Point A configuration
-    point_a_pos: Tuple[float, float, float] = (0.43, 0.1, -0.15)
+    point_a_pos: Tuple[float, float, float] = (0.43, 0.1, -0.20)
     point_a_rotation_deg: float = 0.0 # y axis rotation. 0 = horizontal
     
     # Point B configuration  
-    point_b_pos: Tuple[float, float, float] = (0.63, -0.1, -0.15)
+    point_b_pos: Tuple[float, float, float] = (0.63, -0.1, -0.20)
     point_b_rotation_deg: float = 0.0
     
     # Single wall configuration (matches real hardware format)
-    wall_size: Tuple[float, float, float] = (0.03, 0.50, 0.30)  # [width, depth, height]
-    wall_pos: Tuple[float, float, float] = (0.55, 0.0, -0.125)     # Wall center position
+    wall_size: Tuple[float, float, float] = (0.03, 0.50, 0.60)  # [width, depth, height]
+    wall_pos: Tuple[float, float, float] = (0.55, 0.0, -0.45)     # Wall center position
     wall_rot: Tuple[float, float, float, float] = (0.985, 0.0, 0.0, -0.174)  # Quaternion rotation
 
 
@@ -32,9 +32,12 @@ class PathExecutionConfig:
 
     # Motion parameters ------------------------------
     speed_mps: float = 0.020  # Target constant speed for standardized execution (m/s)
-    dt: float = 0.02          # 50Hz Execution sample period for standardized paths (s)
+    update_frequency: float = 100.0  # Hz - target harware loop frequency / simulation update rate
+    # TODO: ass name, change someday haha
+    dt: float = 0.02          # 50Hz Pathing Execution sample period for standardized paths (s). NOT the hw/sim_dt time!
 
-    # very experimental
+
+    # TODO: very experimental
     enable_jerk: bool = False  # Enable jerk-limited motion smoothing (S-curve)
     # S-curve velocity profile parameters (jerk-limited motion)
     max_jerk_mps3: float = 2.0  # Maximum jerk (rate of change of acceleration) in m/s^3
@@ -44,25 +47,16 @@ class PathExecutionConfig:
     # Normalization / trajectory representation options
     # These are forwarded into NormalizerParams for all planners.
     normalizer_return_poses: bool = True  # Whether normalized planners return poses alongside positions (7D).
-    # Note: returns identity quaternions at the moment!
+    # TODO: returns identity quaternions at the moment!
 
-    # TODO: is this redundant?
+
     normalizer_force_goal: bool = True    # Force exact goal as final waypoint when collision-free. (instead of the nearest planned point)
 
-
-    update_frequency: float = 100.0  # Hz - target loop frequency / simulation update rate
 
 
     # Path planning general parameters (apply to all algorithms)
     grid_resolution: float = 0.020  # 20mm. Grid cell size used for A* (and bounds for others)
-
-    safety_margin: float = 0.075     # Obstacle safety margin in meters.
-    top_pad_multiplier: float = 0.3  # Fraction of safety margin applied on the top (+Z) face only.
-
-    # Workspace limits used by planners (A*, RRT, PRM)
-    workspace_min_bounds: Tuple[float, float, float] = (0.34, -0.36, 0.0)
-    workspace_max_bounds: Tuple[float, float, float] = (0.85, 0.36, 0.78)
-    workspace_padding: float = 0.10  # Extra space around obstacles/start/goal when auto-sizing
+    safety_margin: float = 0.06    # Obstacle safety margin in meters.
 
     # Algorithm dimensionality
     # Use full 3D planning vs X-Z plane only
@@ -73,22 +67,25 @@ class PathExecutionConfig:
     # Inverse-kinematics controller
     ik_command_type: Literal["position", "pose"] = "pose"
     ik_use_relative_mode: bool = True
-    ik_method: Literal["pinv", "svd", "trans", "dls"] = "dls" #svd
+    ik_method: Literal["pinv", "svd", "trans", "dls"] = "dls"
+    ik_velocity_mode: bool = True
+    ik_velocity_error_gain: float = 100.0 #  Note: hw/sim_dt dependent!
+    ik_use_rotational_velocity: bool = True
 
-    # Method/weighting parameters (values are passed through to the IK implementation)
-    # Explicit defaults (overrides controller fallbacks)
+    # Method/weighting parameters for IK
     ik_params: Dict[str, Union[float, List[float]]] = field(default_factory=lambda: {
         "k_val": 1.15,
+        # For SVD
         "min_singular_value": 1e-5,
-        # NOTE: 'lambda_val' is only used when ik_method == 'dls' (adaptive damping base)
-        "lambda_val": 0.01,
-        "position_weight": 1.0, #2.0
-        "rotation_weight": 1.2,
-        "joint_weights" : [1.0, 1.0, 1.0, 0.8],#[0.8, 1.3, 1.0, 0.6],
+        # for DLS
+        "lambda_val": 0.01, # base (min) value if adaptive damping is used
+        "position_weight": 1.0,
+        "rotation_weight": 1.1,  # 1.2 for delta position control
+        "joint_weights" : [1.0, 1.0, 0.8, 1.0], # [1.0, 1.0, 1.0, 0.8] for delta position control
     })
 
     # Relative-mode gains (applied to per-step delta pose when relative mode is enabled)
-    relative_pos_gain: float = 1.0
+    relative_pos_gain: float = 1.0  # 1.0/3.0 irl/sim. Position delta control
 
     relative_rot_gain: float = 1.0
 
@@ -96,6 +93,7 @@ class PathExecutionConfig:
     # Any combination of ["roll", "pitch", "yaw"].
     # For excavator: roll is locked (hardware), yaw follows slew automatically.
     # User controls position (X,Y,Z) and pitch only.
+    # TODO: CheckDOF for automatic correct settings
     ignore_axes: List[str] = field(default_factory=lambda: ["roll", "yaw"])
 
     # Use reduced Jacobian (removes uncontrollable DOFs like roll)
@@ -114,7 +112,7 @@ class PathExecutionConfig:
     orientation_tolerance: float = 0.0872665  # Orientation tolerance in radians (~5 deg)
 
     # Optional progress feedback
-    progress_update_interval: float = 2.0  # How often to print progress (seconds)
+    progress_update_interval: int = 1  # How often to print progress (seconds)
 
 
 # Default configuration instances for quick access

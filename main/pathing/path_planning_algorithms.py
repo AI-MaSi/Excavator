@@ -1346,11 +1346,14 @@ def create_astar_plane_trajectory(
     pos_w = np.asarray(wall_obstacle["pos"], dtype=np.float32)
     rot_w = np.asarray(wall_obstacle.get("rot", [1, 0, 0, 0]), dtype=np.float32)
 
-    # Use obstacle size directly (no tool_radius expansion)
-    # ObstacleChecker will apply safety_margin like in 3D A*
+    # Use obstacle size in plane frame.
     size_p = size_w.astype(np.float32).copy()
-    # Keep an epsilon-thin but non-zero Yp thickness so the 2D checker is stable
+    # Keep plane-normal thickness minimal but non-zero so 2D planning stays stable.
     size_p[1] = max(size_p[1], 1e-3)
+    # Inflate only in-plane axes (X/Z). We avoid inflating the plane-normal axis
+    # so the start/goal are not marked colliding solely due to margin padding.
+    size_p[0] += 2.0 * safety_margin
+    size_p[2] += 2.0 * safety_margin
 
     # Transform position to plane frame
     pos_p = world_to_plane(pos_w)
@@ -1375,10 +1378,15 @@ def create_astar_plane_trajectory(
     g_p = world_to_plane(g_w)
     g_p[1] = 0.0
 
-    # Calculate bounds in plane frame (pad generously)
-    pts = np.stack([s_p, g_p, pos_p], axis=0)
-    bmin = np.min(pts, axis=0) - np.array([0.20, 0.05, 0.20], dtype=np.float32)
-    bmax = np.max(pts, axis=0) + np.array([0.20, 0.05, 0.20], dtype=np.float32)
+    # Calculate bounds in plane frame (pad generously). Include obstacle extents so inflated
+    # geometry fits inside the search grid.
+    half_size = size_p * 0.5
+    obs_min = pos_p - half_size
+    obs_max = pos_p + half_size
+    pts = np.stack([s_p, g_p, obs_min, obs_max], axis=0)
+    pad = np.array([0.20, 0.05, 0.20], dtype=np.float32)
+    bmin = np.min(pts, axis=0) - pad
+    bmax = np.max(pts, axis=0) + pad
 
     # Create grid configuration in plane frame
     grid_cfg = GridConfig(
@@ -1389,7 +1397,8 @@ def create_astar_plane_trajectory(
     )
 
     # Create obstacle checker and planner
-    obs_checker = ObstacleChecker(wall_plane, safety_margin=float(safety_margin))
+    # Safety margin already baked into size_p for X/Z; keep checker margin at 0.
+    obs_checker = ObstacleChecker(wall_plane, safety_margin=0.0)
     planner = AStar3D(grid_cfg, obs_checker, use_3d=False, verbose=verbose)
 
     logger.info(f"Planar A* starting on start→goal plane")

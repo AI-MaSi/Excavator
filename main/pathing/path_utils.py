@@ -588,9 +588,9 @@ def basis_start_goal_plane(start_w: np.ndarray, goal_w: np.ndarray) -> Tuple[np.
 def calculate_workspace_bounds(obstacle_data: List[Dict[str, Any]],
                                start_pos: Tuple[float, float, float],
                                goal_pos: Tuple[float, float, float],
-                               padding: Optional[float] = None,
-                               min_bounds: Optional[Tuple[float, float, float]] = None,
-                               max_bounds: Optional[Tuple[float, float, float]] = None) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+                               padding: float = 0.1,
+                               min_bounds: Tuple[float, float, float] = (0.34, -0.36, 0.0),
+                               max_bounds: Tuple[float, float, float] = (0.85, 0.36, 0.78)) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     """
     Calculate workspace bounds based on obstacles, start, and goal positions.
 
@@ -600,49 +600,13 @@ def calculate_workspace_bounds(obstacle_data: List[Dict[str, Any]],
         obstacle_data: List of obstacle dictionaries with "pos" keys
         start_pos: Start position (x, y, z)
         goal_pos: Goal position (x, y, z)
-        padding: Extra space around obstacles/points (falls back to config/default)
-        min_bounds: Minimum workspace bounds (enforced, falls back to config/default)
-        max_bounds: Maximum workspace bounds (enforced, falls back to config/default)
+        padding: Extra space around obstacles/points
+        min_bounds: Minimum workspace bounds (enforced)
+        max_bounds: Maximum workspace bounds (enforced)
 
     Returns:
         (bounds_min, bounds_max) as tuples
     """
-    # Pull defaults from configuration_files/pathing_config.py or error loudly if missing
-    if padding is None or min_bounds is None or max_bounds is None:
-        cfg = None
-        # Try packaged path first
-        try:
-            from configuration_files.pathing_config import DEFAULT_CONFIG  # type: ignore
-            cfg = DEFAULT_CONFIG
-        except Exception:
-            try:
-                from pathing_config import DEFAULT_CONFIG  # type: ignore
-                cfg = DEFAULT_CONFIG
-            except Exception as exc:
-                raise RuntimeError(
-                    "Workspace bounds require configuration. "
-                    "Set workspace_padding/min/max in configuration_files/pathing_config.py "
-                    "or pass explicit values into calculate_workspace_bounds."
-                ) from exc
-
-        if padding is None:
-            padding = getattr(cfg, "workspace_padding", None)
-        if min_bounds is None:
-            min_bounds = tuple(getattr(cfg, "workspace_min_bounds", ()))
-        if max_bounds is None:
-            max_bounds = tuple(getattr(cfg, "workspace_max_bounds", ()))
-
-    # Enforce presence after config lookup
-    if padding is None or min_bounds is None or max_bounds is None:
-        raise RuntimeError(
-            "Workspace bounds are not fully specified. "
-            "Ensure padding, min_bounds, and max_bounds are provided via arguments or config."
-        )
-
-    padding = float(padding)
-    min_bounds_arr = np.asarray(min_bounds, dtype=np.float32)
-    max_bounds_arr = np.asarray(max_bounds, dtype=np.float32)
-
     if len(obstacle_data) > 0:
         all_positions = [obs["pos"] for obs in obstacle_data] + [list(start_pos), list(goal_pos)]
         all_positions = np.array(all_positions)
@@ -651,8 +615,8 @@ def calculate_workspace_bounds(obstacle_data: List[Dict[str, Any]],
         bounds_max_calc = np.max(all_positions, axis=0) + padding
 
         # Ensure minimum workspace size
-        bounds_min_calc = np.minimum(bounds_min_calc, min_bounds_arr)
-        bounds_max_calc = np.maximum(bounds_max_calc, max_bounds_arr)
+        bounds_min_calc = np.minimum(bounds_min_calc, min_bounds)
+        bounds_max_calc = np.maximum(bounds_max_calc, max_bounds)
 
         return tuple(bounds_min_calc), tuple(bounds_max_calc)
     else:
@@ -680,9 +644,7 @@ class GridConfig:
 class ObstacleChecker:
     """Handles obstacle collision detection for path planning."""
 
-    def __init__(self, obstacle_data: List[Dict[str, Any]],
-                 safety_margin: float = 0.02,
-                 top_pad_multiplier: Optional[float] = None):
+    def __init__(self, obstacle_data: List[Dict[str, Any]], safety_margin: float = 0.02):
         """
         Initialize obstacle checker.
 
@@ -691,42 +653,24 @@ class ObstacleChecker:
                 - "size": np.array([x, y, z]) - obstacle dimensions
                 - "pos" or "position": np.array([x, y, z]) - obstacle center position
                 - "rot" or "rotation": np.array([w, x, y, z]) - quaternion rotation
-            safety_margin: Additional clearance around obstacles (applied here as padding)
-            top_pad_multiplier: Scale factor for padding on the top (+Z) face only.
-                If None, pulled from configuration_files/pathing_config.DEFAULT_CONFIG when available,
-                otherwise defaults to 1.0 (symmetric padding).
+            safety_margin: Additional clearance around obstacles
         """
-        self.original_obstacles = []
         self.obstacles = []
-        self.safety_margin = float(safety_margin)
+        self.safety_margin = safety_margin
 
-        if top_pad_multiplier is None:
-            cfg = None
-            try:
-                from configuration_files.pathing_config import DEFAULT_CONFIG  # type: ignore
-                cfg = DEFAULT_CONFIG
-            except Exception:
-                try:
-                    from pathing_config import DEFAULT_CONFIG  # type: ignore
-                    cfg = DEFAULT_CONFIG
-                except Exception:
-                    cfg = None
-
-            if cfg is not None:
-                top_pad_multiplier = getattr(cfg, "top_pad_multiplier", None)
-
-        self.top_pad_multiplier = 1.0 if top_pad_multiplier is None else float(top_pad_multiplier)
-
-        # Normalize and inflate obstacle data
+        # Normalize obstacle data format
         for obs in obstacle_data:
+            size = np.asarray(obs.get("size", [0.1, 0.1, 0.1]), dtype=np.float32)
+            # Apply symmetric padding once up front (allow slight negative for debugging but clamp)
+            size = size + self.safety_margin * 2
+            size = np.maximum(size, 1e-4)
+
             normalized = {
-                "size": np.asarray(obs.get("size", [0.1, 0.1, 0.1]), dtype=np.float32),
+                "size": size,
                 "pos": np.asarray(obs.get("pos", obs.get("position", [0, 0, 0])), dtype=np.float32),
                 "rot": np.asarray(obs.get("rot", obs.get("rotation", [1, 0, 0, 0])), dtype=np.float32),
             }
-            self.original_obstacles.append(normalized)
-            inflated = self._inflate_obstacle(normalized)
-            self.obstacles.append(inflated)
+            self.obstacles.append(normalized)
 
         # Pre-compute axis-aligned bounding boxes for efficiency
         self._compute_aabbs()
@@ -736,46 +680,19 @@ class ObstacleChecker:
         self.aabbs = []
 
         for obs in self.obstacles:
-            pos = obs["pos"]
             size = obs["size"]
+            pos = obs["pos"]
+
+            # Compute oriented bounding box corners (handles rotated obstacles)
             corners = self._get_box_corners(size, pos, obs["rot"])
             min_bounds = np.min(corners, axis=0)
             max_bounds = np.max(corners, axis=0)
+
             self.aabbs.append({
                 "min": min_bounds,
                 "max": max_bounds,
                 "detailed": obs  # Keep reference for detailed collision checking
             })
-
-    def _inflate_obstacle(self, obs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Build a padded collision box using safety_margin and top_pad_multiplier.
-
-        Padding is applied in world +Z for asymmetry; for symmetric padding
-        top_pad_multiplier should be 1.0.
-        """
-        size = obs["size"]
-        pos = obs["pos"]
-        rot = obs["rot"]
-
-        bottom_pad = self.safety_margin
-        top_pad = self.safety_margin * self.top_pad_multiplier
-
-        inflated_size = np.array([
-            size[0] + 2 * self.safety_margin,
-            size[1] + 2 * self.safety_margin,
-            size[2] + bottom_pad + top_pad
-        ], dtype=np.float32)
-
-        # Shift center so reduced top padding sits mostly below the original box.
-        center_shift = np.array([0.0, 0.0, (top_pad - bottom_pad) / 2.0], dtype=np.float32)
-        inflated_pos = pos + center_shift
-
-        return {
-            "size": inflated_size,
-            "pos": inflated_pos,
-            "rot": rot,
-        }
 
     def _get_box_corners(self, size: np.ndarray, position: np.ndarray,
                         quaternion: np.ndarray) -> np.ndarray:

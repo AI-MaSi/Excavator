@@ -217,7 +217,7 @@ class ADCConfig:
 
 
 class SimpleADC:
-    def __init__(self, custom_config: ADCConfig = None, filter_alpha: float = 0.5, log_level: str = "INFO"):
+    def __init__(self, custom_config: ADCConfig = None, filter_alpha: float = 1.0, log_level: str = "INFO"):
         """
         Initialize ADC with built-in or custom configuration.
 

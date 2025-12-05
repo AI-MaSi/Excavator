@@ -35,7 +35,7 @@ pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 5.0
+    kp: 4.5 #5.0
     ki: 0.250
     kd: 0.75
 

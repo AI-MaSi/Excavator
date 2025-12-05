@@ -257,24 +257,37 @@ class MotionProcessor:
         target_pos: np.ndarray,
         target_rot_deg: float,
         dt: float
-    ) -> Tuple[np.ndarray, float]:
-        """Smooth a single target pose given an explicit dt."""
+    ) -> Tuple[np.ndarray, float, np.ndarray, float]:
+        """Smooth a single target pose given an explicit dt.
+
+        Returns:
+            smoothed_position, smoothed_rotation_deg, linear_velocity_vector (m/s), rotational_velocity_dps
+        """
         target_pos = np.array(target_pos, dtype=np.float32)
 
         if not self.state.is_initialized:
             self.reset(position=target_pos, rotation_deg=target_rot_deg)
-            return target_pos.copy(), float(target_rot_deg)
+            return target_pos.copy(), float(target_rot_deg), np.zeros(3, dtype=np.float32), 0.0
 
         dt = max(0.001, min(float(dt), 0.1))
 
         if not self.enable_smoothing:
             self.state.current_position = target_pos.copy()
             self.state.current_rotation_deg = float(target_rot_deg)
-            return target_pos.copy(), float(target_rot_deg)
+            return target_pos.copy(), float(target_rot_deg), np.zeros(3, dtype=np.float32), 0.0
 
+        prev_pos = self.state.current_position.copy()
         smoothed_pos = self._process_linear_motion(target_pos, dt)
+        lin_vel_vec = (smoothed_pos - prev_pos) / dt
+
+        prev_rot = self.state.current_rotation_deg
         smoothed_rot = self._process_rotational_motion(target_rot_deg, dt)
-        return smoothed_pos, smoothed_rot
+        rot_vel_dps = (smoothed_rot - prev_rot) / dt if dt > 0 else 0.0
+
+        # Use the internally tracked rotational velocity when smoothing is enabled
+        # (captures the signed direction from the S-curve generator).
+        rot_vel_dps = self.state.current_rot_velocity_dps if self.enable_smoothing else rot_vel_dps
+        return smoothed_pos, smoothed_rot, lin_vel_vec.astype(np.float32), float(rot_vel_dps)
 
     def _process_linear_motion(self, target_pos: np.ndarray, dt: float) -> np.ndarray:
         delta = target_pos - self.state.current_position
@@ -415,6 +428,9 @@ class ExcavatorController:
             # New settings for diff_ik_V2
             _use_reduced = getattr(_DEFAULT_CONFIG, 'use_reduced_jacobian', True)
             _joint_limits_rel = getattr(_DEFAULT_CONFIG, 'joint_limits_relative', None)
+            _ik_velocity_mode = bool(getattr(_DEFAULT_CONFIG, 'ik_velocity_mode', False))
+            _ik_velocity_error_gain = float(getattr(_DEFAULT_CONFIG, 'ik_velocity_error_gain', 1.0))
+            _ik_use_rot_vel = bool(getattr(_DEFAULT_CONFIG, 'ik_use_rotational_velocity', True))
         except AttributeError as e:
             raise RuntimeError(f"Missing required IK configuration in pathing_config.py: {e}")
 
@@ -451,11 +467,20 @@ class ExcavatorController:
             use_reduced_jacobian=bool(_use_reduced),
             enable_velocity_limiting=enable_vel_limit,
             max_joint_velocities=max_joint_velocities,
-            joint_limits=joint_limits
+            joint_limits=joint_limits,
+            velocity_mode=_ik_velocity_mode,
+            velocity_error_gain=_ik_velocity_error_gain,
+            use_rotational_velocity=_ik_use_rot_vel,
         )
         # Pass verbose flag if IK controller supports it, else use DEBUG level check
         ik_verbose = self.logger.level <= logging.DEBUG
-        self.ik_controller = diff_ik.IKController(self.ik_config, self.robot_config, verbose=ik_verbose)
+        ik_default_dt = 1.0 / float(self.config.control_frequency)
+        self.ik_controller = diff_ik.IKController(
+            self.ik_config,
+            self.robot_config,
+            verbose=ik_verbose,
+            default_dt=ik_default_dt
+        )
 
         # Relative IK control parameters (pulling toward target)
         try:
@@ -493,6 +518,8 @@ class ExcavatorController:
                 max_output=self.config.output_limits[1],
             )
             self.joint_pids.append(pid)
+        # Keep original PID gains for scheduling (primarily slew)
+        self._base_pid_gains = joint_configs
 
         # Motion processor for jerk-limited pose commands (aligned with IK loop)
         self.motion_processor = MotionProcessor(
@@ -519,6 +546,8 @@ class ExcavatorController:
         self._current_projected_quats = None  # Cache processed quaternions
         self._current_linear_velocity = 0.0
         self._current_rot_velocity_degps = 0.0
+        self._target_linear_velocity = np.zeros(3, dtype=np.float32)
+        self._target_rot_velocity_dps = 0.0
         self._outputs_zeroed = False  # Track whether we've already sent a zero/neutral command
         # Debug telemetry (data capture for detailed logging/analysis)
         self._last_pi_outputs = None
@@ -905,7 +934,7 @@ class ExcavatorController:
                 with self._lock:
                     has_target = self._target_position is not None
                 if has_target:
-                    self._compute_control_commands()
+                    self._compute_control_commands(loop_dt)
                 else:
                     # Only send a neutral command once when there is no target
                     if not self._outputs_zeroed:
@@ -1034,7 +1063,7 @@ class ExcavatorController:
             rot_velocity_dps=rot_vel
         )
 
-        smoothed_pos, smoothed_rot = self.motion_processor.process_target(
+        smoothed_pos, smoothed_rot, lin_vel_vec, rot_vel_dps = self.motion_processor.process_target(
             target_pos=raw_pos,
             target_rot_deg=raw_rot,
             dt=loop_dt
@@ -1046,8 +1075,10 @@ class ExcavatorController:
         with self._lock:
             self._target_position = smoothed_pos.astype(np.float32)
             self._target_orientation = smoothed_quat
+            self._target_linear_velocity = lin_vel_vec.astype(np.float32)
+            self._target_rot_velocity_dps = float(rot_vel_dps)
 
-    def _compute_control_commands(self) -> None:
+    def _compute_control_commands(self, loop_dt: float) -> None:
         """Compute and send control commands based on current state and target."""
         # Track IK/FK timing
         if self._enable_perf_tracking:
@@ -1065,6 +1096,8 @@ class ExcavatorController:
                 projected_quats = self._current_projected_quats  # Use cached quaternions
                 raw_quats = self._current_raw_quats
                 current_ee_quat_full = self._current_ee_quat_full
+                target_lin_vel = self._target_linear_velocity.copy()
+                target_rot_vel_dps = float(self._target_rot_velocity_dps)
 
             # Extract current joint angles using V2 helper (relative angles)
             if raw_quats is None:
@@ -1105,11 +1138,27 @@ class ExcavatorController:
                     pose_command = np.concatenate([target_pos, target_quat])
                     self.ik_controller.set_command(pose_command)
 
+            desired_vel = None
+            if getattr(self.ik_config, "velocity_mode", False):
+                if self.ik_config.command_type == "position":
+                    desired_vel = target_lin_vel
+                else:
+                    if getattr(self.ik_config, "use_rotational_velocity", True):
+                        rot_vel_rad_s = np.radians(target_rot_vel_dps)
+                        desired_vel = np.concatenate([
+                            target_lin_vel,
+                            np.array([0.0, rot_vel_rad_s, 0.0], dtype=np.float32)
+                        ])
+                    else:
+                        desired_vel = np.concatenate([target_lin_vel, np.zeros(3, dtype=np.float32)])
+
             target_joint_angles = self.ik_controller.compute(
                 ee_pos=current_pos,
                 ee_quat=current_ee_quat_full,  # Full orientation incl. slew yaw
                 joint_angles=current_joint_angles,
-                joint_quats=raw_quats  # Pass raw IMU quats; V2 handles offsets/propagation
+                joint_quats=raw_quats,  # Pass raw IMU quats; V2 handles offsets/propagation
+                desired_ee_velocity=desired_vel,
+                dt=loop_dt,
             )
 
             # DEBUG: Periodic IK output check (every ~1 second at 50Hz)
@@ -1144,6 +1193,28 @@ class ExcavatorController:
 
         # Inner Loop: Joint-space PID control
         pi_outputs = []
+        # TODO: integrate this properly
+        # Adaptive slew gain scheduling based on FK X-distance (reach)
+        slew_pid = self.joint_pids[0]
+        base_slew = self._base_pid_gains[0]
+        x_dist = abs(current_pos[0])
+        sched_start = 0.35  # no change below this reach
+        sched_end = 1.0     # hit min_scale by this reach (keeps user-facing simplicity)
+        min_scale = 0.7
+        if x_dist <= sched_start:
+            scale = 1.0
+        elif x_dist >= sched_end:
+            scale = min_scale
+        else:
+            span = max(1e-6, sched_end - sched_start)
+            frac = (x_dist - sched_start) / span
+            scale = 1.0 - frac * (1.0 - min_scale)
+        # Match damping: scale D by sqrt(scale) to roughly preserve damping ratio
+        slew_pid.kp = base_slew["kp"] * scale
+        slew_pid.kd = base_slew["kd"] * np.sqrt(scale)
+        if self.logger.level <= logging.DEBUG and self._debug_counter % 50 == 0:
+            print(f"slew gains kp={slew_pid.kp:.3f} kd={slew_pid.kd:.3f} scale={scale:.3f} x={x_dist:.3f}")
+
         for pid, target_angle, current_angle in zip(
                 self.joint_pids, target_joint_angles, current_joint_angles
         ):

@@ -160,6 +160,8 @@ class HardwareDataLogger:
         self.current_waypoint_index: int = 0
         self.current_progress: float = 0.0
         self._prev_pos: np.ndarray | None = None
+        self.path_config: PathExecutionConfig | None = None
+        self.env_config: EnvironmentConfig | None = None
 
         logger.info(
             "[HW DataLogger] Initialized for algorithm '%s' at %s",
@@ -168,7 +170,11 @@ class HardwareDataLogger:
         )
 
     def start_trajectory_tracking(
-        self, calculation_time: float, total_distance_planned: float, path_config: PathExecutionConfig | None = None
+        self,
+        calculation_time: float,
+        total_distance_planned: float,
+        path_config: PathExecutionConfig | None = None,
+        env_config: EnvironmentConfig | None = None,
     ) -> None:
         self.trajectory_log.clear()
         self.execution_start_time = time.time()
@@ -180,6 +186,12 @@ class HardwareDataLogger:
         self.at_threshold_time = None
         self._prev_pos = None
         self.path_config = path_config
+        self.env_config = env_config
+
+    def mark_threshold_reached(self) -> None:
+        """Mark the time when the robot first reached within target threshold."""
+        if self.at_threshold_time is None:
+            self.at_threshold_time = time.time()
 
     def log_step(
         self,
@@ -229,11 +241,6 @@ class HardwareDataLogger:
                 np.linalg.norm(actual_pos - self._prev_pos)
             )
         self._prev_pos = actual_pos.copy()
-
-    def mark_threshold_reached(self) -> None:
-        """Mark the time when the robot first reached within target threshold."""
-        if self.at_threshold_time is None:
-            self.at_threshold_time = time.time()
 
     def save(self) -> None:
         """Save trajectory samples + metrics CSVs."""
@@ -292,6 +299,7 @@ class HardwareDataLogger:
         metrics = {
             "trajectory_id": self.trajectory_counter,
             "algorithm": self.algorithm_logging_name,
+            "data_source": "real",  # Mark as real hardware data
             "calculation_time_s": self.calculation_time,
             "execution_time_s": self.execution_time,
             "at_threshold_time_s": at_threshold_time_s,
@@ -306,6 +314,13 @@ class HardwareDataLogger:
                 if self.total_distance_planned > 0.0
                 else 0.0
             ),
+            # Relative-mode gains (filled in below if applicable)
+            "relative_pos_gain": None,
+            "relative_rot_gain": None,
+            # Velocity-mode toggle (filled in below if applicable)
+            "ik_velocity_mode": None,
+            "ik_velocity_error_gain": None,
+            "ik_use_rotational_velocity": None,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
@@ -326,9 +341,41 @@ class HardwareDataLogger:
             metrics["orientation_tolerance"] = self.path_config.orientation_tolerance
 
             # IK configuration
+            metrics["ik_velocity_mode"] = getattr(
+                self.path_config, "ik_velocity_mode", None
+            )
+            metrics["ik_velocity_error_gain"] = getattr(
+                self.path_config, "ik_velocity_error_gain", None
+            )
+            metrics["ik_use_rotational_velocity"] = getattr(
+                self.path_config, "ik_use_rotational_velocity", None
+            )
             metrics["ik_method"] = self.path_config.ik_method
             metrics["ik_command_type"] = self.path_config.ik_command_type
             metrics["ik_use_relative_mode"] = self.path_config.ik_use_relative_mode
+            # Only log gains when relative mode is active; keep columns but set None otherwise
+            if getattr(self.path_config, "ik_use_relative_mode", False):
+                metrics["relative_pos_gain"] = getattr(
+                    self.path_config, "relative_pos_gain", None
+                )
+                metrics["relative_rot_gain"] = getattr(
+                    self.path_config, "relative_rot_gain", None
+                )
+
+        # Add obstacle configuration if available
+        if self.env_config is not None:
+            metrics["wall_size_x"] = self.env_config.wall_size[0]
+            metrics["wall_size_y"] = self.env_config.wall_size[1]
+            metrics["wall_size_z"] = self.env_config.wall_size[2]
+
+            metrics["wall_pos_x"] = self.env_config.wall_pos[0]
+            metrics["wall_pos_y"] = self.env_config.wall_pos[1]
+            metrics["wall_pos_z"] = self.env_config.wall_pos[2]
+
+            metrics["wall_rot_w"] = self.env_config.wall_rot[0]
+            metrics["wall_rot_x"] = self.env_config.wall_rot[1]
+            metrics["wall_rot_y"] = self.env_config.wall_rot[2]
+            metrics["wall_rot_z"] = self.env_config.wall_rot[3]
         metrics_df = pd.DataFrame([metrics])
         metrics_path = os.path.join(self.log_dir, "metrics.csv")
 
@@ -590,6 +637,7 @@ def _execute_on_hardware(
     path_config: PathExecutionConfig,
     data_logger: HardwareDataLogger | None,
     enable_debug: bool,
+    env_config: EnvironmentConfig | None = None,
 ) -> None:
     """Execute a planned path on the real hardware with continuous motion."""
     path = trajectory.positions
@@ -615,6 +663,7 @@ def _execute_on_hardware(
             calculation_time=trajectory.calculation_time_s,
             total_distance_planned=trajectory.total_distance_m,
             path_config=path_config,
+            env_config=env_config,
         )
 
     update_frequency = float(path_config.update_frequency)
@@ -1125,6 +1174,7 @@ def main(argv: List[str] | None = None) -> int:
                 path_config=path_config,
                 data_logger=data_logger,
                 enable_debug=bool(args.debug),
+                env_config=env_config,
             )
 
             # Pause controller after execution completes

@@ -78,13 +78,13 @@ CHANNEL_CONFIGS:
         output_channel: 5
         affects_pump: False
         toggleable: False
-        center: 1558
+        center: 1555 #1558
         direction: -1
         pulse_min: 1509
         pulse_max: 1604  #1604
         deadzone: 1.0
-        deadband_us_pos: 45.5
-        deadband_us_neg: 45
+        deadband_us_pos: 45.5  # 45.0
+        deadband_us_neg: 45.5       # 44.5
         dither_enable: False
         dither_amp_us: 15.0
         dither_hz: 16.0

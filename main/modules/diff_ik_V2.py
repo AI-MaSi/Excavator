@@ -96,8 +96,17 @@ class IKControllerConfig:
     ik_method: Literal["pinv", "svd", "trans", "dls"]
     """Method for computing Jacobian inverse."""
 
+    use_rotational_velocity: bool
+    """Whether to accept rotational velocity components in velocity_mode."""
+
     use_relative_mode: bool = False
     """Whether commands are relative to current pose."""
+
+    velocity_mode: bool = False
+    """When True, interpret commands as desired EE velocities and integrate joint rates."""
+
+    velocity_error_gain: float = 1.0
+    """Proportional gain applied to pose error when in velocity_mode."""
 
     ik_params: Optional[Dict[str, float]] = None
     """Method-specific parameters."""
@@ -109,7 +118,6 @@ class IKControllerConfig:
     # When True, also zero the corresponding rotation rows in the weighted Jacobian
     # after applying position/rotation weights (hard removal of ignored rotational DOFs).
     # This provides stronger decoupling and stability when an orientation axis is intentionally ignored.
-    # TODO: add to config!
     use_ignore_axes_in_jacobian: bool = True
 
     enable_frame_transform: bool = True
@@ -128,6 +136,12 @@ class IKControllerConfig:
 
     enable_adaptive_damping: bool = True
     """Enable adaptive damping based on Jacobian conditioning."""
+
+    adaptive_damping_scaling: float = 0.5
+    """Scaling factor for adaptive damping: lambda = base * (1 + scaling * log(1 + cond))."""
+
+    adaptive_damping_max_multiplier: float = 10.0
+    """Maximum multiplier for adaptive damping (lambda_max = base * max_multiplier)."""
 
     enable_joint_limit_avoidance: bool = True
     """Enable repulsion forces near joint limits."""
@@ -376,7 +390,14 @@ class CheckDOF:
 class IKController:
     """Differential inverse kinematics controller with numpy+numba optimization."""
 
-    def __init__(self, cfg: IKControllerConfig, robot_config: RobotConfig, verbose: bool = True, log_level: str = "INFO"):
+    def __init__(
+        self,
+        cfg: IKControllerConfig,
+        robot_config: RobotConfig,
+        verbose: bool = True,
+        log_level: str = "INFO",
+        default_dt: float = 0.01,
+    ):
         """Initialize IK controller.
 
         Args:
@@ -384,9 +405,11 @@ class IKController:
             robot_config: Robot kinematic configuration
             verbose: Legacy parameter, maps to DEBUG level if True
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
+            default_dt: Fallback timestep (s) when none is provided to compute()
         """
         self.cfg = cfg
         self.robot_config = robot_config
+        self.default_dt = float(max(1e-4, default_dt))
 
         # Setup logger
         self.logger = logging.getLogger(f"{__name__}.IKController")
@@ -410,6 +433,11 @@ class IKController:
         self.ee_pos_des = np.zeros(3, dtype=np.float32)
         self.ee_quat_des = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Identity
         self._command = np.zeros(self.action_dim, dtype=np.float32)
+
+        # Velocity mode settings
+        self.velocity_mode = bool(getattr(cfg, "velocity_mode", False))
+        self.velocity_error_gain = float(getattr(cfg, "velocity_error_gain", 1.0))
+        self.use_rotational_velocity = bool(cfg.use_rotational_velocity)
 
         # NEW: Velocity limits (default to ~2 degrees per cycle if not specified)
         if cfg.max_joint_velocities is None:
@@ -516,6 +544,41 @@ class IKController:
         
         # Extract only controllable components
         return full_error[self.controllable_dofs]
+
+    def _prepare_desired_velocity(
+        self,
+        desired_ee_velocity: Optional[np.ndarray],
+        required_size: int
+    ) -> np.ndarray:
+        """Align desired EE velocity vector with the reduced task dimension."""
+        if desired_ee_velocity is None:
+            return np.zeros(required_size, dtype=np.float32)
+
+        desired_vec = np.asarray(desired_ee_velocity, dtype=np.float32).flatten()
+
+        # Expand position-only inputs when orientation components are expected
+        if desired_vec.size == 3 and required_size > 3:
+            full_vec = np.concatenate([desired_vec, np.zeros(3, dtype=np.float32)])
+            if self.cfg.use_reduced_jacobian and self.controllable_dofs is not None and required_size != 6:
+                desired_vec = full_vec[self.controllable_dofs][:required_size]
+            else:
+                desired_vec = full_vec[:required_size]
+
+        # Map full 6D inputs into the reduced task space (drops uncontrollable axes)
+        if self.cfg.use_reduced_jacobian and self.controllable_dofs is not None and required_size != 6:
+            if desired_vec.size == 6:
+                desired_vec = desired_vec[self.controllable_dofs][:required_size]
+
+        # Position-only mode: ignore any extra components
+        if required_size == 3 and desired_vec.size > 3:
+            desired_vec = desired_vec[:3]
+
+        if desired_vec.size != required_size:
+            raise ValueError(
+                f"desired_ee_velocity size {desired_vec.size} does not match required size {required_size}"
+            )
+
+        return desired_vec
 
     @property
     def action_dim(self) -> int:
@@ -624,7 +687,16 @@ class IKController:
                 self.ee_pos_des = self._command[0:3].copy()
                 self.ee_quat_des = self._command[3:7].copy()
 
-    def compute(self, ee_pos: np.ndarray, ee_quat: np.ndarray, joint_angles: np.ndarray, joint_quats: np.ndarray) -> np.ndarray:
+    def compute(
+        self,
+        ee_pos: np.ndarray,
+        ee_quat: np.ndarray,
+        joint_angles: np.ndarray,
+        joint_quats: np.ndarray,
+        desired_ee_velocity: Optional[np.ndarray] = None,
+        dt: Optional[float] = None,
+        current_joint_velocities: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """
         # Outer Loop: Task-space IK control
         Compute target joint angles for desired end-effector pose.
@@ -634,6 +706,9 @@ class IKController:
             ee_quat: Current end-effector quaternion [w, x, y, z]
             joint_angles: Current RELATIVE joint angles in radians (for limit checking)
             joint_quats: Current joint quaternions from IMUs (absolute, with mounting offsets applied)
+            desired_ee_velocity: Optional desired EE twist (position 3D or pose 6D) for velocity mode
+            dt: Optional timestep (seconds). Defaults to self.default_dt.
+            current_joint_velocities: Optional measured joint velocities (rad/s) for future adaptive use
 
         Returns:
             Target joint angles (relative)
@@ -644,6 +719,8 @@ class IKController:
         ee_pos = np.asarray(ee_pos, dtype=np.float32)
         ee_quat = np.asarray(ee_quat, dtype=np.float32)
         joint_angles = np.asarray(joint_angles, dtype=np.float32)
+        dt_val = self.default_dt if dt is None else float(dt)
+        dt_val = float(np.clip(dt_val, 1e-4, 1.0))
 
         # Require joint quaternions (no implicit fallback construction from angles)
         if joint_quats is None:
@@ -685,19 +762,20 @@ class IKController:
         # NEW: Compute adaptive damping based on condition number
         adaptive_lambda = self._compute_adaptive_damping(jacobian)
 
+        # Initialize error containers for downstream logging/anti-windup
+        position_error = np.zeros(3, dtype=np.float32)
+        axis_angle_error = np.zeros(3, dtype=np.float32)
+
         # Compute pose error and solve IK
         if self.cfg.command_type == "position":
             position_error = target_pos - current_pos
-            
+
             # NEW: Apply weighting to Jacobian rows instead of error vector
             pos_weight = self.cfg.ik_params.get("position_weight")
-            
+
             # Extract position rows (always [0:3] even in reduced Jacobian)
-            jacobian_pos = pos_weight * jacobian[0:3, :]
-            
-            delta_joint_angles = self._compute_delta_joint_angles(
-                position_error, jacobian_pos, adaptive_lambda
-            )
+            jacobian_weighted = pos_weight * jacobian[0:3, :]
+            reduced_error = position_error
         else:
             # Transform both current and target orientations to robot's local frame if enabled
             # This makes pitch/roll errors relative to robot heading, not global frame
@@ -757,6 +835,7 @@ class IKController:
                     weighted_jacobian_rows.append(row)
                 
                 jacobian_weighted = np.vstack(weighted_jacobian_rows).astype(np.float32)
+                reduced_error = pose_error
             else:
                 # Full Jacobian case
                 pos_weight = self.cfg.ik_params.get("position_weight")
@@ -776,10 +855,17 @@ class IKController:
                     if "yaw" in self.cfg.ignore_axes:
                         jacobian_weighted[5, :] = 0.0
 
-                pose_error = np.concatenate([position_error, axis_angle_error])
+                reduced_error = np.concatenate([position_error, axis_angle_error])
 
+        # Choose task vector based on mode (position vs velocity)
+        if self.velocity_mode:
+            desired_vec = self._prepare_desired_velocity(desired_ee_velocity, reduced_error.size)
+            task_vec = desired_vec + (self.velocity_error_gain * reduced_error)
+            joint_rate_cmd = self._compute_delta_joint_angles(task_vec, jacobian_weighted, adaptive_lambda)
+            delta_joint_angles = joint_rate_cmd * dt_val
+        else:
             delta_joint_angles = self._compute_delta_joint_angles(
-                pose_error, jacobian_weighted, adaptive_lambda
+                reduced_error, jacobian_weighted, adaptive_lambda
             )
 
         # DEBUG: Log raw IK output before any limiting
@@ -829,8 +915,8 @@ class IKController:
 
         # Base damping and adaptive scaling
         base_lambda = self.cfg.ik_params.get("lambda_val", 0.01)
-        adaptive_lambda = base_lambda * (1.0 + 0.5 * np.log(1.0 + cond))
-        lam = float(np.clip(adaptive_lambda, base_lambda, base_lambda * 10.0))
+        adaptive_lambda = base_lambda * (1.0 + self.cfg.adaptive_damping_scaling * np.log(1.0 + cond))
+        lam = float(np.clip(adaptive_lambda, base_lambda, base_lambda * self.cfg.adaptive_damping_max_multiplier))
         self.last_adaptive_lambda = float(lam)
         return lam
 
@@ -1479,7 +1565,7 @@ def create_excavator_config(boom_length: float = 0.468, arm_length: float = 0.25
     imu_offsets = [
         create_imu_offset_quat(0.0),     # Slew joint - no IMU offset needed for encoder
         create_imu_offset_quat(+13.85),  # Boom IMU/joint
-        create_imu_offset_quat(-0.61),   # Arm IMU/joint
+        create_imu_offset_quat(+0.61),   # -0.61 Arm IMU/joint
         create_imu_offset_quat(0.0)      # Bucket IMU/joint - no offset
     ]
 
