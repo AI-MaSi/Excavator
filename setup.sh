@@ -83,6 +83,7 @@ pip3 install --break-system-packages --quiet \
     pyserial \
     adafruit-blinka \
     adafruit-circuitpython-ssd1306 \
+    adafruit-extended-bus \
     2>/dev/null
 
 echo "  OK: Python packages installed"
