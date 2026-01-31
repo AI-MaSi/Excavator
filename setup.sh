@@ -77,6 +77,7 @@ echo "[3/5] Installing Python packages..."
 
 pip3 install --break-system-packages --quiet \
     numpy \
+    scipy \
     pandas \
     numba \
     pyyaml \
@@ -87,7 +88,7 @@ pip3 install --break-system-packages --quiet \
     2>/dev/null
 
 echo "  OK: Python packages installed"
-echo "      numpy, pandas, numba, pyyaml, pyserial"
+echo "      numpy, scipy, pandas, numba, pyyaml, pyserial"
 echo "      adafruit-blinka, ssd1306"
 
 # --- OLED systemd service ---

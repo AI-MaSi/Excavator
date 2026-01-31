@@ -606,7 +606,11 @@ class HardwareInterface:
             try:
                 # Sample configured channels
                 for ch in self._adc_channel_plan:
-                    voltage = self.adc.read_channel(ch['board'], ch['channel'])
+                    if ch['is_slew']:
+                        # Slew encoder: 2x oversample to reduce quantization noise
+                        voltage = self.adc.read_channel_fast(ch['board'], ch['channel'], oversample=2)
+                    else:
+                        voltage = self.adc.read_channel(ch['board'], ch['channel'])
                     if ch['is_slew']:
                         slew_data = self.encoder_tracker.update(voltage)
                         with self._adc_lock:

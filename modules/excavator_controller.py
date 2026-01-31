@@ -32,12 +32,15 @@ from .perf_tracker import ControlLoopPerfTracker
 # Load settings
 _here = os.path.dirname(os.path.abspath(__file__))
 _cfg_dir = os.path.abspath(os.path.join(_here, os.pardir, 'configuration_files'))
-_cfg_file = os.path.join(_cfg_dir, 'pathing_config.py')
 if _cfg_dir not in sys.path:
     sys.path.append(_cfg_dir)
-if not os.path.isfile(_cfg_file):
-    raise ImportError("configuration_files/pathing_config.py not found (copy required for IRL)")
-from pathing_config import DEFAULT_CONFIG as _DEFAULT_CONFIG  # type: ignore
+
+# Import pathing config for motion processing parameters only (speed, jerk, etc.)
+_pathing_cfg_file = os.path.join(_cfg_dir, 'pathing_config.py')
+if os.path.isfile(_pathing_cfg_file):
+    from pathing_config import DEFAULT_CONFIG as _PATHING_CONFIG  # type: ignore
+else:
+    _PATHING_CONFIG = None
 
 
 @dataclass
@@ -437,24 +440,31 @@ class ExcavatorController:
         self.robot_config = diff_ik.create_excavator_config()
         diff_ik.warmup_numba_functions()
 
-        # IK controller setup (pull settings from shared config - fail hard if missing)
-        if _DEFAULT_CONFIG is None:
-            raise RuntimeError("ExcavatorController requires configuration_files/pathing_config.py")
+        # IK controller setup (pull settings from control_config.yaml - fail hard if missing)
+        ik_cfg = self._control_config.get('ik', {})
+        if not ik_cfg:
+            raise RuntimeError("Missing 'ik' section in control_config.yaml")
 
         try:
-            _ik_cmd_type = _DEFAULT_CONFIG.ik_command_type
-            _ik_method = _DEFAULT_CONFIG.ik_method
-            _ik_rel = bool(_DEFAULT_CONFIG.ik_use_relative_mode)
-            _ik_params = _DEFAULT_CONFIG.ik_params
-            _ignore_axes = _DEFAULT_CONFIG.ignore_axes
+            _ik_cmd_type = ik_cfg['command_type']
+            _ik_method = ik_cfg['method']
+            _ik_rel = bool(ik_cfg.get('use_relative_mode', False))
+            _ik_params = ik_cfg.get('params', {})
+            _ignore_axes = ik_cfg.get('ignore_axes', [])
             # New settings for diff_ik_V2
-            _use_reduced = getattr(_DEFAULT_CONFIG, 'use_reduced_jacobian', True)
-            _joint_limits_rel = getattr(_DEFAULT_CONFIG, 'joint_limits_relative', None)
-            _ik_velocity_mode = bool(getattr(_DEFAULT_CONFIG, 'ik_velocity_mode', False))
-            _ik_velocity_error_gain = float(getattr(_DEFAULT_CONFIG, 'ik_velocity_error_gain', 1.0))
-            _ik_use_rot_vel = bool(getattr(_DEFAULT_CONFIG, 'ik_use_rotational_velocity', True))
-        except AttributeError as e:
-            raise RuntimeError(f"Missing required IK configuration in pathing_config.py: {e}")
+            _use_reduced = bool(ik_cfg.get('use_reduced_jacobian', True))
+            _joint_limits_rel = ik_cfg.get('joint_limits_relative', None)
+            _ik_velocity_mode = bool(ik_cfg.get('velocity_mode', False))
+            _ik_velocity_error_gain = float(ik_cfg.get('velocity_error_gain', 1.0))
+            _ik_use_rot_vel = bool(ik_cfg.get('use_rotational_velocity', True))
+            # Adaptive damping settings (DLS method)
+            _enable_adaptive_damping = bool(ik_cfg.get('enable_adaptive_damping', True))
+            _adaptive_damping_scaling = float(ik_cfg.get('adaptive_damping_scaling', 0.5))
+            _adaptive_damping_max_mult = float(ik_cfg.get('adaptive_damping_max_multiplier', 10.0))
+            # Joint weight scheduling (dynamic weights based on EE position)
+            _joint_weight_scheduling = ik_cfg.get('joint_weight_scheduling', None)
+        except KeyError as e:
+            raise RuntimeError(f"Missing required IK configuration in control_config.yaml: {e}")
 
         # IK config uses ignore_axes for orientation filtering
         # Prepare optional IK V2 extras from control_config
@@ -492,6 +502,12 @@ class ExcavatorController:
             velocity_mode=_ik_velocity_mode,
             velocity_error_gain=_ik_velocity_error_gain,
             use_rotational_velocity=_ik_use_rot_vel,
+            # Adaptive damping (DLS)
+            enable_adaptive_damping=_enable_adaptive_damping,
+            adaptive_damping_scaling=_adaptive_damping_scaling,
+            adaptive_damping_max_multiplier=_adaptive_damping_max_mult,
+            # Joint weight scheduling
+            joint_weight_scheduling=_joint_weight_scheduling,
         )
         # Pass verbose flag if IK controller supports it, else use DEBUG level check
         ik_verbose = self.logger.level <= logging.DEBUG
@@ -505,10 +521,10 @@ class ExcavatorController:
 
         # Relative IK control parameters (pulling toward target)
         try:
-            self._relative_pos_gain = float(_DEFAULT_CONFIG.relative_pos_gain)
-            self._relative_rot_gain = float(_DEFAULT_CONFIG.relative_rot_gain)
-        except AttributeError as e:
-            raise RuntimeError(f"Missing required relative control gains in pathing_config.py: {e}")
+            self._relative_pos_gain = float(ik_cfg.get('relative_pos_gain', 1.0))
+            self._relative_rot_gain = float(ik_cfg.get('relative_rot_gain', 1.0))
+        except (KeyError, TypeError) as e:
+            raise RuntimeError(f"Missing required relative control gains in control_config.yaml: {e}")
 
         # Load PID gains from control_config.yaml
         if not isinstance(self._control_config, dict) or 'pid' not in self._control_config:
@@ -538,16 +554,28 @@ class ExcavatorController:
                 max_output=self.config.output_limits[1],
             )
             self.joint_pids.append(pid)
-        # Keep original PID gains for scheduling (primarily slew)
-        self._base_pid_gains = joint_configs
 
         # Motion processor for jerk-limited pose commands (aligned with IK loop)
+        # Load motion parameters from pathing_config if available, otherwise use defaults
+        if _PATHING_CONFIG is not None:
+            _speed_mps = float(_PATHING_CONFIG.speed_mps)
+            _max_accel = float(_PATHING_CONFIG.max_accel_mps2)
+            _max_decel = float(_PATHING_CONFIG.max_decel_mps2)
+            _max_jerk = float(_PATHING_CONFIG.max_jerk_mps3)
+            _enable_jerk = bool(getattr(_PATHING_CONFIG, 'enable_jerk', True))
+        else:
+            # Sensible defaults if pathing_config not available
+            _speed_mps = 0.02
+            _max_accel = 0.5
+            _max_decel = 0.5
+            _max_jerk = 2.0
+            _enable_jerk = True
         self.motion_processor = MotionProcessor(
-            max_velocity=float(_DEFAULT_CONFIG.speed_mps),
-            max_acceleration=float(_DEFAULT_CONFIG.max_accel_mps2),
-            max_deceleration=float(_DEFAULT_CONFIG.max_decel_mps2),
-            max_jerk=float(_DEFAULT_CONFIG.max_jerk_mps3),
-            enable_smoothing=bool(getattr(_DEFAULT_CONFIG, 'enable_jerk', True)),
+            max_velocity=_speed_mps,
+            max_acceleration=_max_accel,
+            max_deceleration=_max_decel,
+            max_jerk=_max_jerk,
+            enable_smoothing=_enable_jerk,
         )
 
         # Thread control
@@ -1182,28 +1210,6 @@ class ExcavatorController:
 
         # Inner Loop: Joint-space PID control
         pi_outputs = []
-        # TODO: integrate this properly
-        # Adaptive slew gain scheduling based on FK X-distance (reach)
-        slew_pid = self.joint_pids[0]
-        base_slew = self._base_pid_gains[0]
-        x_dist = abs(current_pos[0])
-        sched_start = 0.35  # no change below this reach
-        sched_end = 1.0     # hit min_scale by this reach (keeps user-facing simplicity)
-        min_scale = 0.7
-        if x_dist <= sched_start:
-            scale = 1.0
-        elif x_dist >= sched_end:
-            scale = min_scale
-        else:
-            span = max(1e-6, sched_end - sched_start)
-            frac = (x_dist - sched_start) / span
-            scale = 1.0 - frac * (1.0 - min_scale)
-        # Match damping: scale D by sqrt(scale) to roughly preserve damping ratio
-        slew_pid.kp = base_slew["kp"] * scale
-        slew_pid.kd = base_slew["kd"] * np.sqrt(scale)
-        if self.logger.level <= logging.DEBUG and self._debug_counter % 50 == 0:
-            print(f"slew gains kp={slew_pid.kp:.3f} kd={slew_pid.kd:.3f} scale={scale:.3f} x={x_dist:.3f}")
-
         for pid, target_angle, current_angle in zip(
                 self.joint_pids, target_joint_angles, current_joint_angles
         ):

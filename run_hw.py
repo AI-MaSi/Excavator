@@ -8,10 +8,12 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from configuration_files.pathing_config import (
     DEFAULT_CONFIG,
@@ -19,6 +21,19 @@ from configuration_files.pathing_config import (
     EnvironmentConfig,
     PathExecutionConfig,
 )
+
+
+def _load_control_config() -> Dict[str, Any]:
+    """Load control configuration YAML file for IK metrics logging."""
+    config_path = Path(__file__).parent / "configuration_files" / "control_config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        with config_path.open('r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 from pathing.path_planning_algorithms import (
     AStarParams,
     RRTParams,
@@ -33,8 +48,11 @@ from pathing.normalized_planners import (
     create_astar_3d_trajectory_normalized,
     create_astar_plane_trajectory_normalized,
     create_rrt_trajectory_normalized,
+    create_rrt_plane_trajectory_normalized,
     create_rrt_star_trajectory_normalized,
+    create_rrt_star_plane_trajectory_normalized,
     create_prm_trajectory_normalized,
+    create_prm_plane_trajectory_normalized,
 )
 from pathing.path_utils import (
     precompute_cumulative_distances,
@@ -45,6 +63,7 @@ from pathing.path_utils import (
 from modules.hardware_interface import HardwareInterface
 from modules.excavator_controller import ExcavatorController
 from modules.quaternion_math import quat_from_y_deg
+from modules.rt_utils import apply_rt_to_thread, reset_to_normal, SCHED_FIFO
 
 
 logger = logging.getLogger("run_hw_v2")
@@ -318,27 +337,20 @@ class HardwareDataLogger:
             metrics["final_target_tolerance"] = self.path_config.final_target_tolerance
             metrics["orientation_tolerance"] = self.path_config.orientation_tolerance
 
-            # IK configuration
-            metrics["ik_velocity_mode"] = getattr(
-                self.path_config, "ik_velocity_mode", None
-            )
-            metrics["ik_velocity_error_gain"] = getattr(
-                self.path_config, "ik_velocity_error_gain", None
-            )
-            metrics["ik_use_rotational_velocity"] = getattr(
-                self.path_config, "ik_use_rotational_velocity", None
-            )
-            metrics["ik_method"] = self.path_config.ik_method
-            metrics["ik_command_type"] = self.path_config.ik_command_type
-            metrics["ik_use_relative_mode"] = self.path_config.ik_use_relative_mode
+        # IK configuration (loaded from control_config.yaml)
+        ctrl_cfg = _load_control_config()
+        ik_cfg = ctrl_cfg.get('ik', {})
+        if ik_cfg:
+            metrics["ik_velocity_mode"] = ik_cfg.get("velocity_mode")
+            metrics["ik_velocity_error_gain"] = ik_cfg.get("velocity_error_gain")
+            metrics["ik_use_rotational_velocity"] = ik_cfg.get("use_rotational_velocity")
+            metrics["ik_method"] = ik_cfg.get("method")
+            metrics["ik_command_type"] = ik_cfg.get("command_type")
+            metrics["ik_use_relative_mode"] = ik_cfg.get("use_relative_mode")
             # Only log gains when relative mode is active; keep columns but set None otherwise
-            if getattr(self.path_config, "ik_use_relative_mode", False):
-                metrics["relative_pos_gain"] = getattr(
-                    self.path_config, "relative_pos_gain", None
-                )
-                metrics["relative_rot_gain"] = getattr(
-                    self.path_config, "relative_rot_gain", None
-                )
+            if ik_cfg.get("use_relative_mode", False):
+                metrics["relative_pos_gain"] = ik_cfg.get("relative_pos_gain")
+                metrics["relative_rot_gain"] = ik_cfg.get("relative_rot_gain")
 
         # Add obstacle configuration if available
         if self.env_config is not None:
@@ -438,6 +450,19 @@ def _plan_trajectory(
         )
         algo_name = "RRT"
 
+    elif algorithm == "rrt_plane":
+        rrt_params = RRTParams(max_acceptable_cost=0.768)
+        result = create_rrt_plane_trajectory_normalized(
+            start_pos=tuple(start_pos_world),
+            goal_pos=tuple(target_pos_world),
+            obstacle_data=obstacles,
+            grid_resolution=path_config.grid_resolution,
+            safety_margin=path_config.safety_margin,
+            rrt_params=rrt_params,
+            normalizer_params=normalizer_params,
+        )
+        algo_name = "RRT Plane"
+
     elif algorithm == "rrt_star":
         rrt_star_params = RRTStarParams(max_acceptable_cost=0.768)
         result = create_rrt_star_trajectory_normalized(
@@ -452,6 +477,19 @@ def _plan_trajectory(
         )
         algo_name = "RRT*"
 
+    elif algorithm == "rrt_star_plane":
+        rrt_star_params = RRTStarParams(max_acceptable_cost=0.768)
+        result = create_rrt_star_plane_trajectory_normalized(
+            start_pos=tuple(start_pos_world),
+            goal_pos=tuple(target_pos_world),
+            obstacle_data=obstacles,
+            grid_resolution=path_config.grid_resolution,
+            safety_margin=path_config.safety_margin,
+            rrt_params=rrt_star_params,
+            normalizer_params=normalizer_params,
+        )
+        algo_name = "RRT* Plane"
+
     elif algorithm == "prm":
         prm_params = PRMParams()
         result = create_prm_trajectory_normalized(
@@ -465,6 +503,19 @@ def _plan_trajectory(
             normalizer_params=normalizer_params,
         )
         algo_name = "PRM"
+
+    elif algorithm == "prm_plane":
+        prm_params = PRMParams()
+        result = create_prm_plane_trajectory_normalized(
+            start_pos=tuple(start_pos_world),
+            goal_pos=tuple(target_pos_world),
+            obstacle_data=obstacles,
+            grid_resolution=path_config.grid_resolution,
+            safety_margin=path_config.safety_margin,
+            prm_params=prm_params,
+            normalizer_params=normalizer_params,
+        )
+        algo_name = "PRM Plane"
 
     else:
         raise ValueError(f"Unsupported algorithm '{algorithm}'")
@@ -985,8 +1036,11 @@ def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
             "a_star",
             "a_star_plane",
             "rrt",
+            "rrt_plane",
             "rrt_star",
+            "rrt_star_plane",
             "prm",
+            "prm_plane",
         ],
         help="Path planning algorithm to use.",
     )
@@ -1010,6 +1064,24 @@ def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Toggle between raw A/B targets every 10s (no path planning).",
     )
+    parser.add_argument(
+        "--rt-priority",
+        type=int,
+        default=75,
+        help="RT priority for control loop (default: 75, 0=disable RT)",
+    )
+    parser.add_argument(
+        "--imu-priority",
+        type=int,
+        default=70,
+        help="RT priority for IMU thread (default: 70, 0=normal)",
+    )
+    parser.add_argument(
+        "--adc-priority",
+        type=int,
+        default=70,
+        help="RT priority for ADC thread (default: 70, 0=normal)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1029,6 +1101,10 @@ def main(argv: List[str] | None = None) -> int:
         "ENABLED" if args.debug else "DISABLED",
         "ENABLED" if args.log_data else "DISABLED",
     )
+    logger.info(
+        "RT priorities: Control=%d, IMU=%d, ADC=%d",
+        args.rt_priority, args.imu_priority, args.adc_priority,
+    )
 
     # Points A and B (base/world frame, shared with sim)
     point_a = np.asarray(env_config.point_a_pos, dtype=np.float32)
@@ -1046,8 +1122,11 @@ def main(argv: List[str] | None = None) -> int:
     logger.info("Initializing hardware interface...")
     hardware = HardwareInterface(
         perf_enabled=bool(args.debug),
+        cleanup_disable_osc=False,
         adc_channels=["Slew encoder rot"],
         adc_sample_hz=100.0,
+        imu_rt_priority=args.imu_priority,
+        adc_rt_priority=args.adc_priority,
     )
     logger.info("Initializing excavator controller...")
     controller = ExcavatorController(
@@ -1059,8 +1138,15 @@ def main(argv: List[str] | None = None) -> int:
     controller.start()
     logger.info("Control loop started.")
 
-    # Brief wait for controller initialization
-    time.sleep(2.0)
+    # Wait for controller initialization and numba JIT warmup
+    logger.info("Waiting 5.0s for IK/numba warmup...")
+    time.sleep(5.0)
+
+    # Apply RT priority to main thread after warmup
+    if args.rt_priority > 0:
+        logger.info("Applying RT priority SCHED_FIFO-%d to main thread...", args.rt_priority)
+        if not apply_rt_to_thread(priority=args.rt_priority, policy=SCHED_FIFO, quiet=True):
+            logger.warning("Failed to apply RT priority (run as root for RT scheduling)")
 
     # Pause controller before first planning cycle
     logger.info("Pausing controller before first path planning...")
@@ -1227,6 +1313,9 @@ def main(argv: List[str] | None = None) -> int:
             logger.info("Controller stopped successfully")
         except Exception:
             logger.exception("Error while stopping controller", exc_info=True)
+
+        # Reset RT priority
+        reset_to_normal(quiet=True)
 
         logger.info("="*60)
         logger.info("Done.")

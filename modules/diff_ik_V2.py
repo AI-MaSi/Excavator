@@ -154,6 +154,13 @@ class IKControllerConfig:
     For excavators: removes roll axis (only position + pitch/yaw are controllable).
     Automatically extracts controllable rows based on joint rotation axes."""
 
+    joint_weight_scheduling: Optional[Dict[str, Any]] = None
+    """Dynamic joint weight scheduling based on EE position.
+    Structure: {'enabled': bool, 'joint0': {'r_min': float, 'r_max': float,
+                'r_nominal': float, 'exponent': float}, ...}
+    Formula: scale = (r_nominal / clamp(r, r_min, r_max))^exponent
+    where r = sqrt(x² + y²) is horizontal radial distance from base."""
+
     def __post_init__(self):
         # Validate inputs
         if self.command_type not in ["position", "pose"]:
@@ -458,6 +465,28 @@ class IKController:
         # Debug/telemetry values (for external logging when enabled)
         self.last_adaptive_lambda: float = 0.0
         self.last_condition_number: float = 0.0
+        self.last_slew_weight_scale: float = 1.0  # For telemetry
+
+        # Joint weight scheduling config
+        self._weight_scheduling_enabled = False
+        self._weight_scheduling_config: Dict[int, Dict[str, float]] = {}
+        if cfg.joint_weight_scheduling and cfg.joint_weight_scheduling.get('enabled', False):
+            self._weight_scheduling_enabled = True
+            # Parse per-joint configs (e.g., 'joint0', 'joint1', ...)
+            for key, val in cfg.joint_weight_scheduling.items():
+                if key.startswith('joint') and isinstance(val, dict):
+                    joint_idx = int(key[5:])  # Extract index from 'jointN'
+                    self._weight_scheduling_config[joint_idx] = {
+                        'r_min': float(val.get('r_min', 0.2)),
+                        'r_max': float(val.get('r_max', 0.8)),
+                        'r_nominal': float(val.get('r_nominal', 0.4)),
+                        'exponent': float(val.get('exponent', 2.0)),
+                    }
+            if self._weight_scheduling_config:
+                self.logger.info(
+                    "Joint weight scheduling enabled for joints: %s",
+                    list(self._weight_scheduling_config.keys())
+                )
 
         # NEW: Compute controllable DOF mask for reduced Jacobian
         if cfg.use_reduced_jacobian:
@@ -507,6 +536,60 @@ class IKController:
             controllable.append(5)  # Yaw
         
         return controllable
+
+    def _compute_scheduled_joint_weights(self, ee_pos: np.ndarray) -> List[float]:
+        """Compute dynamically scheduled joint weights based on EE position.
+
+        Uses radial distance r = sqrt(x² + y²) from slew axis to scale joint weights.
+        Formula: scale = (r_nominal / clamp(r, r_min, r_max))^exponent
+
+        Args:
+            ee_pos: Current end-effector position [x, y, z] in base frame
+
+        Returns:
+            List of scaled joint weights
+        """
+        # Start with base weights from config
+        base_weights = self.cfg.ik_params.get("joint_weights", None)
+        if base_weights is None:
+            base_weights = [1.0] * self.robot_config.num_joints
+        weights = list(base_weights)
+
+        if not self._weight_scheduling_enabled:
+            return weights
+
+        # Compute horizontal radial distance from slew axis
+        r = float(np.sqrt(ee_pos[0]**2 + ee_pos[1]**2))
+
+        # Apply scheduling for each configured joint
+        for joint_idx, cfg in self._weight_scheduling_config.items():
+            if joint_idx >= len(weights):
+                continue
+
+            r_min = cfg['r_min']
+            r_max = cfg['r_max']
+            r_nominal = cfg['r_nominal']
+            exponent = cfg['exponent']
+
+            # Clamp r to valid range
+            r_clamped = float(np.clip(r, r_min, r_max))
+
+            # Compute scale: (r_nominal / r_clamped)^exponent
+            # At r_nominal: scale = 1.0
+            # At r < r_nominal: scale > 1.0 (more movement allowed)
+            # At r > r_nominal: scale < 1.0 (less movement allowed)
+            if r_clamped > 1e-6:
+                scale = (r_nominal / r_clamped) ** exponent
+            else:
+                scale = 1.0
+
+            weights[joint_idx] = base_weights[joint_idx] * scale
+
+            # Store for telemetry (only slew for now)
+            if joint_idx == 0:
+                self.last_slew_weight_scale = scale
+
+        return weights
 
     def _get_reduced_jacobian(self, jacobian_full: np.ndarray) -> np.ndarray:
         """Extract reduced Jacobian containing only controllable DOF rows.
@@ -762,6 +845,9 @@ class IKController:
         # NEW: Compute adaptive damping based on condition number
         adaptive_lambda = self._compute_adaptive_damping(jacobian)
 
+        # Compute scheduled joint weights based on EE position
+        scheduled_weights = self._compute_scheduled_joint_weights(ee_pos)
+
         # Initialize error containers for downstream logging/anti-windup
         position_error = np.zeros(3, dtype=np.float32)
         axis_angle_error = np.zeros(3, dtype=np.float32)
@@ -861,11 +947,13 @@ class IKController:
         if self.velocity_mode:
             desired_vec = self._prepare_desired_velocity(desired_ee_velocity, reduced_error.size)
             task_vec = desired_vec + (self.velocity_error_gain * reduced_error)
-            joint_rate_cmd = self._compute_delta_joint_angles(task_vec, jacobian_weighted, adaptive_lambda)
+            joint_rate_cmd = self._compute_delta_joint_angles(
+                task_vec, jacobian_weighted, adaptive_lambda, scheduled_weights
+            )
             delta_joint_angles = joint_rate_cmd * dt_val
         else:
             delta_joint_angles = self._compute_delta_joint_angles(
-                reduced_error, jacobian_weighted, adaptive_lambda
+                reduced_error, jacobian_weighted, adaptive_lambda, scheduled_weights
             )
 
         # DEBUG: Log raw IK output before any limiting
@@ -1016,17 +1104,21 @@ class IKController:
         return delta_joint_angles
 
     def _compute_delta_joint_angles(
-        self, delta_pose: np.ndarray, jacobian: np.ndarray, adaptive_lambda: float
+        self, delta_pose: np.ndarray, jacobian: np.ndarray, adaptive_lambda: float,
+        scheduled_weights: Optional[List[float]] = None
     ) -> np.ndarray:
         """Compute joint angle changes using specified IK method."""
 
         delta_pose = np.asarray(delta_pose, dtype=np.float32)
         jacobian = np.asarray(jacobian, dtype=np.float32)
-        
-        # Get joint weights (higher = more preferred/more movement)
-        joint_weights = self.cfg.ik_params.get("joint_weights", None)
-        if joint_weights is None:
-            joint_weights = [1.0] * jacobian.shape[1]
+
+        # Use scheduled weights if provided, otherwise fall back to config
+        if scheduled_weights is not None:
+            joint_weights = scheduled_weights
+        else:
+            joint_weights = self.cfg.ik_params.get("joint_weights", None)
+            if joint_weights is None:
+                joint_weights = [1.0] * jacobian.shape[1]
 
         # Build weight matrix W (diagonal of multipliers)
         w_mat = self._build_weight_matrix(joint_weights)

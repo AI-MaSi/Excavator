@@ -327,22 +327,42 @@ class SimpleADC:
             raise ValueError("Channel must be between 1 and 8")
 
         try:
-            # Read raw voltage
             raw_voltage = adc.read_voltage(channel)
+            key = (board_name, channel)
 
             # Apply EMA filter
-            key = (board_name, channel)
             if key not in self.filtered_values:
-                # First reading - initialize filter
                 self.filtered_values[key] = raw_voltage
             else:
-                # EMA: filtered = alpha * new + (1 - alpha) * old
                 self.filtered_values[key] = (self.filter_alpha * raw_voltage +
                                             (1 - self.filter_alpha) * self.filtered_values[key])
 
             return round(self.filtered_values[key], 2)
         except Exception as e:
             raise Exception(f"Error reading {board_name} channel {channel}: {e}")
+
+    def read_channel_fast(self, board_name: str, channel: int, oversample: int = 2) -> float:
+        """Read single channel multiple times and return simple average.
+
+        Bypasses median/EMA filtering. Use for high-rate single-channel reads
+        where oversampling provides noise reduction.
+
+        :param board_name: Name of the ADC board
+        :param channel: Channel number (1-8)
+        :param oversample: Number of samples to average (default 2)
+        :return: Averaged voltage reading
+        """
+        if not self.initialized:
+            raise RuntimeError("ADC not initialized!")
+
+        adc = self.adcs.get(board_name)
+        if not adc:
+            raise ValueError(f"ADC board {board_name} not found")
+
+        total = 0.0
+        for _ in range(oversample):
+            total += adc.read_voltage(channel)
+        return total / oversample
 
     def get_board_info(self) -> Dict[str, Dict]:
         """Get information about initialized ADC boards."""
