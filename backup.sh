@@ -1,7 +1,7 @@
 #!/bin/bash
 # Dated backup script - excludes pycache and temp files
 
-BACKUP_DIR="/home/joel/backups"
+BACKUP_DIR="$HOME/backups"
 DATE=$(date +%Y-%m-%d_%H%M)
 DEST="${BACKUP_DIR}/${DATE}_backup"
 
@@ -12,6 +12,6 @@ rsync -a \
     --exclude='*.pyc' \
     --exclude='.lgd*' \
     --exclude='.pytest_cache' \
-    /home/joel/masi_main/ "$DEST/"
+    "$(pwd)/" "$DEST/"
 
 echo "Backup created: $DEST"
