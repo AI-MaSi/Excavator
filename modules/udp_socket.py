@@ -1,8 +1,12 @@
+import hashlib
+import hmac
 import socket
 import struct
 import threading
 import time
 from typing import Optional, List, Tuple
+
+HMAC_DIGEST_SIZE = 32  # SHA-256
 
 
 class UDPSocket:
@@ -13,7 +17,7 @@ class UDPSocket:
     - Configurable timeout for safety
     """
 
-    def __init__(self, local_id=0, max_age_seconds=0.5, data_format: str = 'b'):
+    def __init__(self, local_id=0, max_age_seconds=0.5, data_format: str = 'b', hmac_key: Optional[str] = None):
         self.socket = None
         self.remote_addr = None
         self.local_id = local_id
@@ -38,6 +42,14 @@ class UDPSocket:
         # Pre-computed format strings (filled after handshake)
         self.send_format = None
         self.recv_format = None
+
+        # HMAC authentication (optional)
+        self._hmac_key = hmac_key.encode('utf-8') if isinstance(hmac_key, str) else hmac_key
+        self.packets_rejected = 0
+
+    def set_hmac(self, key: str):
+        """Set HMAC key for packet authentication. Must be called on both sides with the same key."""
+        self._hmac_key = key.encode('utf-8') if isinstance(key, str) else key
 
     def setup(self, host, port, num_inputs, num_outputs, is_server=False, data_format: Optional[str] = None):
         """Set up UDP socket with heartbeat protocol."""
@@ -205,6 +217,8 @@ class UDPSocket:
 
         # Pack timestamp + data and send
         data = struct.pack(self.send_format, timestamp_ms, *clamped)
+        if self._hmac_key:
+            data += hmac.new(self._hmac_key, data, hashlib.sha256).digest()
         self.socket.sendto(data, self.remote_addr)
         return True
 
@@ -237,6 +251,7 @@ class UDPSocket:
             return {
                 'packets_received': self.packets_received,
                 'packets_expired': self.packets_expired,
+                'packets_rejected': self.packets_rejected,
                 'data_age_seconds': age,
                 'time_since_last_packet': time_since_last,
                 'is_connected': age < self.max_age_seconds,
@@ -260,7 +275,8 @@ class UDPSocket:
 
     def _receive_loop(self):
         """Background thread to continuously receive data with timestamps."""
-        expected_size = struct.calcsize(self.recv_format)
+        payload_size = struct.calcsize(self.recv_format)
+        expected_size = payload_size + (HMAC_DIGEST_SIZE if self._hmac_key else 0)
 
         while self.running:
             try:
@@ -270,6 +286,15 @@ class UDPSocket:
                     self.remote_addr = addr
 
                 if len(data) == expected_size:
+                    if self._hmac_key:
+                        payload = data[:payload_size]
+                        received_mac = data[payload_size:]
+                        expected_mac = hmac.new(self._hmac_key, payload, hashlib.sha256).digest()
+                        if not hmac.compare_digest(received_mac, expected_mac):
+                            self.packets_rejected += 1
+                            continue
+                        data = payload
+
                     # Unpack timestamp and values
                     unpacked = struct.unpack(self.recv_format, data)
                     timestamp_ms = unpacked[0]
