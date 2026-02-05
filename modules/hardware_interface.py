@@ -15,7 +15,9 @@ import time
 import numpy as np
 import logging
 from typing import List, Optional, Dict, Any
+from pathlib import Path
 import threading
+import yaml
 
 from .PCA9685_controller import PWMController
 from .usb_serial_reader import USBSerialReader
@@ -23,6 +25,22 @@ from .ADC import SimpleADC
 from .quaternion_math import quat_from_axis_angle, wrap_to_pi
 from .perf_tracker import IntervalTracker
 from .rt_utils import apply_rt_to_thread, SCHED_FIFO
+
+
+def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+    """Load control configuration YAML file."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            # Try relative to this module's parent directory
+            p = Path(__file__).parent.parent / path
+        if not p.exists():
+            return {}
+        with p.open('r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 class ReadyState:
@@ -157,11 +175,13 @@ class HardwareInterface:
                  watchdog_toggle_hz: float = 0.0,
                  cleanup_disable_osc: bool = True,
                  perf_enabled: bool = False,
-                 imu_expected_hz: float = 120.0,
-                 imu_lpf_enabled: bool = True,
-                 imu_lpf_alpha: float = 0.995,
-                 imu_qmode: str = "FULL",
-                 adc_sample_hz: float = 100.0,
+                 imu_expected_hz: Optional[float] = None,
+                 imu_gyro_dps: Optional[int] = None,
+                 imu_ahrs_gain: Optional[float] = None,
+                 imu_accel_rejection: Optional[float] = None,
+                 imu_recovery_s: Optional[float] = None,
+                 imu_offset_s: Optional[float] = None,
+                 adc_sample_hz: float = 200.0,
                  adc_channels: Optional[List[Any]] = None,
                  log_level: str = "INFO",
                  enable_pwm: bool = True,
@@ -228,10 +248,14 @@ class HardwareInterface:
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
         self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name, is_slew}
 
-        # IMU filter settings (sent via handshake)
-        self._imu_lpf_enabled = bool(imu_lpf_enabled)
-        self._imu_lpf_alpha = float(imu_lpf_alpha)
-        self._imu_qmode = str(imu_qmode)
+        # IMU AHRS settings - load from config file, with constructor overrides
+        _cfg = _load_control_config()
+        _imu_cfg = _cfg.get('imu', {})
+        self._imu_gyro_dps = int(imu_gyro_dps if imu_gyro_dps is not None else _imu_cfg.get('gyro_dps', 500))
+        self._imu_ahrs_gain = float(imu_ahrs_gain if imu_ahrs_gain is not None else _imu_cfg.get('ahrs_gain', 0.5))
+        self._imu_accel_rejection = float(imu_accel_rejection if imu_accel_rejection is not None else _imu_cfg.get('accel_rejection', 10.0))
+        self._imu_recovery_s = float(imu_recovery_s if imu_recovery_s is not None else _imu_cfg.get('recovery_s', 1.0))
+        self._imu_offset_s = float(imu_offset_s if imu_offset_s is not None else _imu_cfg.get('offset_s', 1.0))
 
         # Initialize PWM controller
         # Use tri-state: PENDING -> READY or FAULT
@@ -293,9 +317,11 @@ class HardwareInterface:
         self._imu_lock = threading.Lock()
         self._imu_expected_hz = None
         self.usb_reader = None
-        # IMU target sample rate (constructor arg, no config fallback)
+        # IMU target sample rate (from config or constructor override)
         if self._enable_imu:
-            self._imu_expected_hz = float(imu_expected_hz)
+            _cfg = _load_control_config()
+            _imu_cfg = _cfg.get('imu', {})
+            self._imu_expected_hz = float(imu_expected_hz if imu_expected_hz is not None else _imu_cfg.get('sample_rate', 200))
         # Debug telemetry (gated): when enabled, keep latest IMU gyro data for logging
         self._debug_telemetry_enabled = False
         self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
@@ -371,14 +397,17 @@ class HardwareInterface:
                 # Data format: CSV with [w,x,y,z,gx,gy,gz] per IMU
                 self.usb_reader = USBSerialReader(baud_rate=115200, timeout=1.0, simulation_mode=False)
 
-                # Send handshake to configure the device
-                # Request expected sample rate and filter settings
-                self.usb_reader.send_handshake_config(
+                # Send config and wait for acknowledgment
+                self.usb_reader.send_config(
                     sample_rate=int(self._imu_expected_hz),
-                    lpf_enabled=int(self._imu_lpf_enabled),
-                    lpf_alpha=self._imu_lpf_alpha,
-                    qmode=self._imu_qmode,
+                    gyro_dps=self._imu_gyro_dps,
+                    gain=self._imu_ahrs_gain,
+                    accel_rejection=self._imu_accel_rejection,
+                    recovery_s=self._imu_recovery_s,
+                    offset_s=self._imu_offset_s,
                 )
+                if not self.usb_reader.wait_for_cfg_ok(timeout_s=5.0):
+                    self.logger.warning("IMU config acknowledgment not received")
 
                 # Start background thread for IMU reading
                 self.imu_thread = threading.Thread(
@@ -607,8 +636,8 @@ class HardwareInterface:
                 # Sample configured channels
                 for ch in self._adc_channel_plan:
                     if ch['is_slew']:
-                        # Slew encoder: 2x oversample to reduce quantization noise
-                        voltage = self.adc.read_channel_fast(ch['board'], ch['channel'], oversample=2)
+                        # Slew encoder: 1x oversample for 200Hz support (4.16ms vs 8.32ms)
+                        voltage = self.adc.read_channel_fast(ch['board'], ch['channel'], oversample=1)
                     else:
                         voltage = self.adc.read_channel(ch['board'], ch['channel'])
                     if ch['is_slew']:

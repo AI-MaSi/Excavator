@@ -1,0 +1,30 @@
+TODO: Add DTR disconnect detection
+======================================
+
+When Python closes the serial port, DTR drops. Monitor this to reset
+the Pico back to config-waiting state without power cycling.
+
+Changes needed:
+
+1. update_loop() in main.c - Add DTR check, return bool on disconnect:
+   ```c
+   // Inside while(true), after tud_task():
+   if (!(tud_cdc_get_line_state() & 0x01)) {  // DTR dropped
+       return false;
+   }
+   ```
+
+2. main() in main.c - Wrap in outer loop:
+   ```c
+   while (1) {
+       wait_for_settings();
+       // ... existing setup ...
+       if (!update_loop(...)) {
+           // Disconnected - re-enable console and restart
+           cdc_console_enable(true);
+           continue;
+       }
+   }
+   ```
+
+~10 lines total. No Python changes needed.

@@ -3,7 +3,21 @@
 
 rates:
   # Controller (IK) loop frequency in Hz
-  control_hz: 100.0
+  control_hz: 200.0
+
+imu:
+  # IMU sampling rate (Hz) - Pico AHRS loop frequency
+  sample_rate: 200
+  # Gyroscope full-scale range (125/250/500/1000/2000 dps)
+  gyro_dps: 500
+  # AHRS filter gain (higher = faster response, more noise)
+  ahrs_gain: 0.5
+  # Accelerometer rejection threshold (degrees) - reject accel when orientation deviates
+  accel_rejection: 10.0
+  # Recovery period (seconds) - time before re-enabling accel after rejection
+  recovery_s: 1.0
+  # Gyro offset tracking timeout (seconds)
+  offset_s: 1.0
 
 pid:
   # PID controller gains for each joint

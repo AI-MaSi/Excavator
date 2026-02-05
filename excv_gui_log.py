@@ -243,7 +243,7 @@ def main():
         log_level=hw_log_level,
         cleanup_disable_osc=False,
         adc_channels=["Slew encoder rot"],
-        adc_sample_hz=100.0,  # 100Hz with 2x oversample for noise reduction
+        adc_sample_hz=200.0,  # 200Hz for 200Hz control loop
         imu_rt_priority=args.imu_priority,
         adc_rt_priority=args.adc_priority,
     )
