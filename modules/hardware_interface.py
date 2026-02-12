@@ -164,7 +164,7 @@ class HardwareInterface:
     """
     
     def __init__(self,
-                 config_file: str = "configuration_files/servo_config.yaml",
+                 config_file: str = "configuration_files/servo_config_200.yaml",
                  pump_variable: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
@@ -192,7 +192,8 @@ class HardwareInterface:
                  imu_rt_priority: int = 0,
                  adc_rt_priority: int = 0,
                  imu_cpu_core: Optional[int] = None,
-                 adc_cpu_core: Optional[int] = None):
+                 adc_cpu_core: Optional[int] = None,
+                 pwm_frequency: Optional[int] = None):
         """
         Initialize real hardware interface.
 
@@ -223,6 +224,7 @@ class HardwareInterface:
             adc_sample_hz: Target ADC sampling frequency for the background thread
             adc_channels: List of ADC channels to sample in the background thread.
                            Accepts sensor names from ADCConfig or (board, channel) tuples.
+            pwm_frequency: PCA9685 PWM signal frequency in Hz (None = use default 50Hz).
         """
         # Setup logger first
         self.logger = logging.getLogger(f"{__name__}.HardwareInterface")
@@ -275,6 +277,7 @@ class HardwareInterface:
                     watchdog_toggle_hz=watchdog_toggle_hz,
                     cleanup_disable_osc=cleanup_disable_osc,
                     perf_enabled=perf_enabled,
+                    pwm_frequency=pwm_frequency,
                 )
                 self._pwm_state = ReadyState.READY
                 self.logger.info("PWM controller initialized")

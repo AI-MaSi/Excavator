@@ -41,12 +41,12 @@ class ExcavatorGUI3D:
 
     # Workspace limits in meters (adjust based on excavator reach)
     WORKSPACE_LIMITS = {
-        'x_min': 0.1,
-        'x_max': 0.7,
-        'y_min': -0.30,
-        'y_max': 0.30,
-        'z_min': -0.3,
-        'z_max': 0.4,
+        'x_min': 0.350,
+        'x_max': 0.680,
+        'y_min': -0.150,
+        'y_max': 0.150,
+        'z_min': -0.300,
+        'z_max': 0.150,
     }
 
     # Defaults
@@ -71,12 +71,29 @@ class ExcavatorGUI3D:
     CONTROL_FLAG_DIRECT = 1 << 3
 
     # Hz monitoring
-    HZ_UPDATE_INTERVAL = 0.5      # Update Hz display every 0.5 s
+    HZ_UPDATE_INTERVAL = 0.1      # Update Hz display every 100ms
 
     # Keyboard step sizes (user wanted these defaults)
     KEY_STEP_POS = 0.001          # meters per tick
     KEY_STEP_ROT = 0.1            # degrees per tick
-    FAST_MULTIPLIER = 5.0         # when Shift is held
+    FAST_MULTIPLIER = 5.0         # when Shift is held (keyboard)
+    GAMEPAD_POS_MULTIPLIER = 2.5  # position gain for gamepad sticks
+
+    # --- Gamepad axis mappings (axis_name, sign) ---
+    # Change sign to reverse direction, change axis_name to remap sticks.
+    # IK mode: left stick = XZ movement, right stick X = Y, triggers = rotation
+    GAMEPAD_IK = {
+        'dx': ('LeftJoystickX',  +1),
+        'dz': ('LeftJoystickY',  +1),
+        'dy': ('RightJoystickX', -1),
+    }
+    # Direct mode: normalized valve commands [-1, 1]
+    GAMEPAD_DIRECT = {
+        'slew':   ('LeftJoystickX',  -1),
+        'boom':   ('RightJoystickY', +1),
+        'arm':    ('LeftJoystickY',  -1),
+        'bucket': ('RightJoystickX', -1),
+    }
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -85,6 +102,7 @@ class ExcavatorGUI3D:
         # Redraw throttling
         self._last_redraw_time = 0.0
         self._redraw_interval = 1.0 / 30.0  # seconds, limit redraws to ~30 FPS
+        self._mouse_dragging = False  # pause auto-redraws while user rotates plot
 
         # Current pose
         self.current_x = self.DEFAULT_X
@@ -125,7 +143,7 @@ class ExcavatorGUI3D:
 
         # Xbox controller (optional, works even if not plugged in)
         try:
-            self._controller = XboxController(max_reconnect=None, deadzone=25.0)
+            self._controller = XboxController(max_reconnect=None, deadzone=20.0, padding=5.0)
         except Exception as e:
             print(f"[GUI] Gamepad not available: {e}")
             self._controller = None
@@ -157,6 +175,8 @@ class ExcavatorGUI3D:
         canvas_widget = self.canvas.get_tk_widget()
         canvas_widget.grid(row=1, column=0, columnspan=3, sticky=(tk.N, tk.S, tk.E, tk.W))
         canvas_widget.bind("<Configure>", self._on_canvas_resize)
+        canvas_widget.bind("<ButtonPress>", lambda e: setattr(self, '_mouse_dragging', True))
+        canvas_widget.bind("<ButtonRelease>", self._on_mouse_release)
 
         # Pose labels
         info = ttk.LabelFrame(main, text="Current Pose", padding="8")
@@ -181,7 +201,7 @@ class ExcavatorGUI3D:
         self.pos_step_spin = tk.Spinbox(
             settings,
             from_=0.001,
-            to=0.100,
+            to=0.025,
             increment=0.001,
             textvariable=self.pos_step_var,
             width=8,
@@ -196,7 +216,7 @@ class ExcavatorGUI3D:
         self.rot_step_spin = tk.Spinbox(
             settings,
             from_=0.1,
-            to=20.0,
+            to=1.0,
             increment=0.1,
             textvariable=self.rot_step_var,
             width=8,
@@ -415,8 +435,14 @@ class ExcavatorGUI3D:
             color='red',
         )
 
+    def _on_mouse_release(self, event):
+        self._mouse_dragging = False
+        self._request_redraw()  # catch up after drag ends
+
     def _request_redraw(self):
-        """Request a scene redraw, throttled to a maximum rate."""
+        """Request a scene redraw, throttled to a maximum rate. Skipped during mouse drag."""
+        if self._mouse_dragging:
+            return
         now = time.time()
         if now - self._last_redraw_time >= self._redraw_interval:
             self._last_redraw_time = now
@@ -520,11 +546,14 @@ class ExcavatorGUI3D:
         if self._controller is not None:
             state = self._controller.read()
             if state['LeftBumper']:
-                fast_dp = self.step_pos * self.FAST_MULTIPLIER
+                fast_dp = self.step_pos * self.GAMEPAD_POS_MULTIPLIER
                 fast_dr = self.step_rot * self.FAST_MULTIPLIER
-                ctrl_dx = state['LeftJoystickX'] * fast_dp
-                ctrl_dz = -state['LeftJoystickY'] * fast_dp
-                ctrl_dy = state['RightJoystickX'] * fast_dp
+                ax, sx = self.GAMEPAD_IK['dx']
+                az, sz = self.GAMEPAD_IK['dz']
+                ay, sy = self.GAMEPAD_IK['dy']
+                ctrl_dx = sx * state[ax] * fast_dp
+                ctrl_dz = sz * state[az] * fast_dp
+                ctrl_dy = sy * state[ay] * fast_dp
                 ctrl_drot = (state['RightTrigger'] - state['LeftTrigger']) * fast_dr
 
         # Per-axis: pick whichever source has larger abs (keyboard overrides small joystick)
@@ -578,10 +607,14 @@ class ExcavatorGUI3D:
         if self._controller is not None:
             state = self._controller.read()
             if state['LeftBumper']:
-                gp_slew = state['LeftJoystickX']
-                gp_boom = -state['LeftJoystickY']
-                gp_arm = state['RightJoystickY']
-                gp_bucket = state['RightJoystickX']
+                a_sl, s_sl = self.GAMEPAD_DIRECT['slew']
+                a_bm, s_bm = self.GAMEPAD_DIRECT['boom']
+                a_ar, s_ar = self.GAMEPAD_DIRECT['arm']
+                a_bk, s_bk = self.GAMEPAD_DIRECT['bucket']
+                gp_slew = s_sl * state[a_sl]
+                gp_boom = s_bm * state[a_bm]
+                gp_arm = s_ar * state[a_ar]
+                gp_bucket = s_bk * state[a_bk]
                 # Per-axis: pick whichever source has larger magnitude
                 if abs(gp_slew) > abs(slew):
                     slew = gp_slew
@@ -664,7 +697,9 @@ class ExcavatorGUI3D:
             val = float(self.pos_step_var.get())
             if val <= 0:
                 raise ValueError
+            val = min(val, 0.025)
             self.step_pos = val
+            self.pos_step_var.set(f"{val:.3f}")
         except ValueError:
             messagebox.showerror("Invalid value", "Move step must be a positive number.")
             self.pos_step_var.set(f"{self.step_pos:.3f}")

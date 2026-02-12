@@ -1,0 +1,11 @@
+sus.txt
+.vscode
+build
+pico_sdk_import.cmake
+sandbox.py
+/tmp*
+pico-sdk
+ISM330DHCX-PID/
+build_and_run_mount.sh
+sandbox*
+.venv

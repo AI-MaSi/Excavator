@@ -9,22 +9,22 @@ imu:
   # IMU sampling rate (Hz) - Pico AHRS loop frequency
   sample_rate: 200
   # Gyroscope full-scale range (125/250/500/1000/2000 dps)
-  gyro_dps: 500
+  gyro_dps: 500 # 500
   # AHRS filter gain (higher = faster response, more noise)
-  ahrs_gain: 0.5
+  ahrs_gain: 0.75 # 0.5
   # Accelerometer rejection threshold (degrees) - reject accel when orientation deviates
-  accel_rejection: 10.0
+  accel_rejection: 10.0 #10.0
   # Recovery period (seconds) - time before re-enabling accel after rejection
-  recovery_s: 1.0
+  recovery_s: 0.5 #1.0
   # Gyro offset tracking timeout (seconds)
-  offset_s: 1.0
+  offset_s: 0.5 # 1.0
 
 pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 5.0 #5.0
-    ki: 0.5
+    kp: 2.0 #5.0
+    ki: 0.250 #0.5
     kd: 0.0
 
   # Joint 1: Boom (lift arm)
@@ -92,7 +92,7 @@ ik:
     # General
     position_weight: 1.0
     rotation_weight: 1.1  #1.1,  1.2 for delta position control
-    joint_weights: [1.0, 1.0, 0.8, 1.0]  # [1.0, 1.0, 0.8, 1.0], [1.0, 1.0, 1.0, 0.8] for delta position control
+    joint_weights: [0.9, 1.0, 0.8, 1.0]  # [1.0, 1.0, 0.8, 1.0], [1.0, 1.0, 1.0, 0.8] for delta position control
 
 
   # Adaptive damping (DLS method only)

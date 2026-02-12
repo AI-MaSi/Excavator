@@ -1,7 +1,14 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from modules.udp_socket import UDPSocket
 import threading
+import sys
+from pathlib import Path
+
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.append(str(_ROOT_DIR))
+
+from modules.udp_socket import UDPSocket  # same module used by excv_gui_log.py
 
 
 class ControllerGUI:

@@ -5,6 +5,9 @@
 # Gaps waste I2C bandwidth. Current layout: ch 2-6 = 21 bytes per write.
 # With gaps (e.g. ch 2-5 + ch 9) would need 33 bytes or multiple transactions.
 
+# PCA9685 output signal frequency (Hz). Pulse widths and deadbands are tuned for this rate.
+pwm_frequency: 200
+
 CHANNEL_CONFIGS:
 
     pump:
@@ -35,7 +38,7 @@ CHANNEL_CONFIGS:
         dither_taper: False # taper dither near limits instead of expanding clamp
 
         ramp_enable: True    # linear slew limit on pulse changes
-        ramp_limit: 750.0    # max rate in us/s; lower = smoother, less overshoot
+        ramp_limit: 1000.0    # 750 max rate in us/s; lower = smoother, less overshoot
         ramp_skip_deadband: False  # if True, deadband jump is instant (slew only for usable range)
 
         gamma: 1.0          # curve shaping; <1 = more sensitive near center
@@ -58,7 +61,7 @@ CHANNEL_CONFIGS:
         dither_hz: 11.0
         dither_taper: False
         ramp_enable: True
-        ramp_limit: 750.0 # 900
+        ramp_limit: 1000.0 # 900
         ramp_skip_deadband: False
         gamma: 1.0
 
@@ -78,7 +81,7 @@ CHANNEL_CONFIGS:
         dither_hz: 11.0
         dither_taper: False
         ramp_enable: True
-        ramp_limit: 750.0
+        ramp_limit: 1000.0
         ramp_skip_deadband: False
         gamma: 1.0
 
@@ -86,13 +89,13 @@ CHANNEL_CONFIGS:
         output_channel: 5
         affects_pump: False
         toggleable: False
-        center: 1590                #1585
+        center: 1581                #1585
         direction: -1
         pulse_min: 1520
         pulse_max: 1640             #CW
         deadzone: 0.0
-        deadband_us_pos: 43.0       #41
-        deadband_us_neg: 46.0       #48
+        deadband_us_pos: 48.0       #41
+        deadband_us_neg: 45.0       #48
         dither_enable: False
         dither_amp_us: 10.0
         dither_hz: 50.0

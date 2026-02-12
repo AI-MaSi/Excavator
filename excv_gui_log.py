@@ -40,16 +40,9 @@ from modules.diff_ik_V2 import (
     compute_jacobian,
     get_pose,
 )
-# Load IRL pathing config exclusively from configuration_files
 import yaml
 _here = os.path.dirname(os.path.abspath(__file__))
 _cfg_dir = os.path.abspath(os.path.join(_here, 'configuration_files'))
-_cfg_file = os.path.join(_cfg_dir, 'pathing_config.py')
-if _cfg_dir not in sys.path:
-    sys.path.append(_cfg_dir)
-if not os.path.isfile(_cfg_file):
-    raise ImportError("configuration_files/pathing_config.py not found (copy required for IRL)")
-from pathing_config import DEFAULT_CONFIG
 
 
 def _load_control_config():
@@ -176,6 +169,31 @@ def encode_joint_positions_to_bytes(joint_positions):
     return result_bytes
 
 
+def decode_bytes_to_direct_commands(bytes_list):
+    """
+    Decode 9 bytes as direct valve commands (same packet layout, all 4 int16
+    fields carry normalized [-1, 1] values scaled by SCALE_POS).
+
+    Returns:
+        List of 4 floats [slew, boom, arm, bucket] in range [-1, 1].
+    """
+    SCALE_POS = 13107.0
+
+    def to_unsigned_byte(b):
+        return b if b >= 0 else b + 256
+
+    bytes_unsigned = [to_unsigned_byte(b) for b in bytes_list]
+
+    raw_ints = []
+    for i in range(0, 8, 2):
+        val = (bytes_unsigned[i] << 8) | bytes_unsigned[i + 1]
+        if val >= 32768:
+            val -= 65536
+        raw_ints.append(val)
+
+    return [v / SCALE_POS for v in raw_ints]
+
+
 def main():
     """Receive position commands and control excavator"""
     # CLI args for log level and performance debug
@@ -218,9 +236,9 @@ def main():
         app_logger.info(f"RT priorities: Control={args.rt_priority}, IMU={args.imu_priority}, ADC={args.adc_priority}")
         app_logger.info("ADC: Slew encoder @ 100Hz with 2x oversample")
 
-    # Setup UDP server to receive 9 bytes (position + rotation + control flags) and send 30 bytes (joint positions + EE)
+    # Setup UDP server to receive 9 bytes and send 32 bytes (5 positions + EE rot_y)
     server = UDPSocket(local_id=2, max_age_seconds=0.5)
-    server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=30, is_server=True)
+    server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=32, is_server=True)
 
     if not DEBUG_PERF:
         app_logger.info("\nWaiting for GUI connection...")
@@ -241,6 +259,7 @@ def main():
     hw_log_level = "WARNING" if DEBUG_PERF else args.log_level.upper()
     hardware = HardwareInterface(
         log_level=hw_log_level,
+        pump_variable=True,
         cleanup_disable_osc=False,
         adc_channels=["Slew encoder rot"],
         adc_sample_hz=200.0,  # 200Hz for 200Hz control loop
@@ -344,12 +363,18 @@ def main():
     FLAG_RELOAD = 1 << 0
     FLAG_PAUSE = 1 << 1
     FLAG_RESUME = 1 << 2
+    FLAG_DIRECT = 1 << 3
 
     # Edge detection for control flags
     reload_prev = False
     pause_prev = False
     resume_prev = False
     is_paused = False
+
+    # Direct control mode state
+    is_direct_mode = False
+    direct_prev = False
+    last_direct_commands = [0, 0, 0, 0]
 
     # Jacobian debug state (populated when DEBUG_JAC)
     prev_joint_angles = None  # radians per joint
@@ -364,8 +389,7 @@ def main():
     dbg_joint_deg = None
     dbg_dq_deg = None
 
-    # Target loop timing from pathing_config (DEFAULT_CONFIG)
-    target_hz = getattr(DEFAULT_CONFIG, "update_frequency", 100.0)
+    target_hz = 100.0
     try:
         target_dt = 1.0 / max(1e-3, float(target_hz))
     except Exception:
@@ -386,9 +410,8 @@ def main():
                     position, rotation_y, control_flags = decode_bytes_to_position(data)
                     x, y, z = position
 
-                    # Back-compat: older clients used 127 for reload flag only.
-                    if control_flags > 7:
-                        control_flags = FLAG_RELOAD if control_flags != 0 else 0
+                    # Mask to valid flag bits (4 bits: reload, pause, resume, direct)
+                    control_flags &= 0x0F
 
                     reload_now = bool(control_flags & FLAG_RELOAD)
                     pause_now = bool(control_flags & FLAG_PAUSE)
@@ -430,13 +453,39 @@ def main():
                             if not DEBUG_PERF:
                                 app_logger.error(f"Resume failed: {e}")
 
+                    # Handle direct mode flag (edge detection)
+                    direct_now = bool(control_flags & FLAG_DIRECT)
+                    if direct_now and not direct_prev:
+                        try:
+                            controller.enter_direct_mode()
+                            is_direct_mode = True
+                            if not DEBUG_PERF:
+                                app_logger.info("Entered direct control mode")
+                        except Exception as e:
+                            if not DEBUG_PERF:
+                                app_logger.error(f"Enter direct mode failed: {e}")
+                    elif not direct_now and direct_prev:
+                        try:
+                            controller.exit_direct_mode()
+                            is_direct_mode = False
+                            if not DEBUG_PERF:
+                                app_logger.info("Exited direct control mode")
+                        except Exception as e:
+                            if not DEBUG_PERF:
+                                app_logger.error(f"Exit direct mode failed: {e}")
+
                     reload_prev = reload_now
                     pause_prev = pause_now
                     resume_prev = resume_now
+                    direct_prev = direct_now
 
-                    # Store target; actual command is rate-limited below
-                    last_position = position
-                    last_rotation = rotation_y
+                    if is_direct_mode:
+                        # Decode as direct valve commands
+                        last_direct_commands = decode_bytes_to_direct_commands(data)
+                    else:
+                        # Store target; actual command is rate-limited below
+                        last_position = position
+                        last_rotation = rotation_y
                     packets_received += 1
 
                 except Exception as e:
@@ -444,17 +493,26 @@ def main():
                         app_logger.error(f"Decode error: {e}")
                     continue
 
-            # Send latest target directly; controller handles smoothing internally
+            # Send commands to controller (direct or IK mode)
             try:
                 now_t = time.perf_counter()
                 dt = max(0.0, min(now_t - last_time, 0.2))
                 last_time = now_t
 
-                if last_position is not None and not is_paused:
-                    controller.give_pose(
-                        np.array(last_position, dtype=np.float32),
-                        float(last_rotation),
-                    )
+                if not is_paused:
+                    if is_direct_mode:
+                        slew_v, boom_v, arm_v, bucket_v = last_direct_commands
+                        controller.give_direct_commands({
+                            'rotate': slew_v,
+                            'lift_boom': boom_v,
+                            'tilt_boom': arm_v,
+                            'scoop': bucket_v,
+                        })
+                    elif last_position is not None:
+                        controller.give_pose(
+                            np.array(last_position, dtype=np.float32),
+                            float(last_rotation),
+                        )
             except Exception:
                 pass
 
@@ -474,8 +532,10 @@ def main():
                     # Compute forward kinematics to get joint positions
                     joint_positions = get_joint_positions(full_quats, robot_config)
 
-                    # Get actual end-effector position (with ee_offset applied)
-                    ee_position, _ = get_pose(full_quats, robot_config)
+                    # Get actual end-effector position and orientation
+                    ee_position, ee_quat = get_pose(full_quats, robot_config)
+                    y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    ee_rot_y_deg = float(np.degrees(extract_axis_rotation(ee_quat, y_axis)))
 
                     # Jacobian-level diagnostics (optional)
                     if DEBUG_JAC:
@@ -521,9 +581,18 @@ def main():
                             # Keep running even if diagnostics fail
                             pass
 
-                    # Encode and send back to GUI (30 bytes: 4 joint positions + 1 EE position)
+                    # Encode and send back to GUI (32 bytes: 5 positions + EE rot_y)
                     all_positions = list(joint_positions) + [ee_position]
                     encoded_joints = encode_joint_positions_to_bytes(all_positions)
+                    # Append EE rot_y as int16 (2 bytes) using SCALE_ROT
+                    SCALE_ROT = 182.0
+                    rot_int = max(-32768, min(32767, int(round(ee_rot_y_deg * SCALE_ROT))))
+                    if rot_int < 0:
+                        rot_int = (1 << 16) + rot_int
+                    rh = (rot_int >> 8) & 0xFF
+                    rl = rot_int & 0xFF
+                    to_sb = lambda b: b if b < 128 else b - 256
+                    encoded_joints.extend([to_sb(rh), to_sb(rl)])
                     server.send(encoded_joints)
 
                     # Track network timing

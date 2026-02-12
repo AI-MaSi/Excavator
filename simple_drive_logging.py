@@ -36,7 +36,7 @@ DATA_COLLECTION_ENABLED = False
 TARGET_DURATION_MINUTES = 60  # Target: 60 minutes of driving
 AUTO_SAVE_INTERVAL_MINUTES = 10  # Auto-save every N minutes (0 = disabled)
 SAMPLING_FREQUENCY = 100  # Hz (logging rate)
-PWM_UPDATE_FREQUENCY = 200  # Hz (PWM update rate - higher for smoother ramps)
+PWM_UPDATE_FREQUENCY = 100  # Hz (PWM update rate - higher for smoother ramps)
 PRESSURE_SAMPLING_FREQUENCY = 20  # Hz (ADC hardware limit, when enabled)
 ENABLE_PRESSURE_LOGGING = True  # Enable pressure sensor logging (ADC)
 STATUS_PRINT_INTERVAL = 5.0  # seconds
@@ -52,7 +52,7 @@ server = UDPSocket(local_id=2)
 server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
 
 hardware = HardwareInterface(
-    config_file="configuration_files/servo_config.yaml",
+    config_file="configuration_files/servo_config_200.yaml",
     pump_variable=False,
     toggle_channels=True,
     input_rate_threshold=5,

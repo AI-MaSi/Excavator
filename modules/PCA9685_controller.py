@@ -217,7 +217,7 @@ class PumpConfig:
 
 class PWMConstants:
     """Hardware and timing constants."""
-    PWM_FREQUENCY_DEFAULT = 200  # 50 Hz standard, now 2x input ish.
+    PWM_FREQUENCY_DEFAULT = 50  # Standard servo frequency
     MAX_CHANNELS = 16
     DUTY_CYCLE_MAX = 65535
     RAMP_DT_MAX = 0.05
@@ -225,6 +225,10 @@ class PWMConstants:
     # Validation limits
     PULSE_MIN = 0
     PULSE_MAX = 4095
+    PWM_FREQ_MIN = 30
+    PWM_FREQ_MAX = 1000
+    PWM_FREQ_WARN_LOW = 50
+    PWM_FREQ_WARN_HIGH = 200
     PUMP_IDLE_MIN = -1.0
     PUMP_IDLE_MAX = 0.6
     PUMP_MULTIPLIER_MAX = 1.0
@@ -242,7 +246,7 @@ class PWMController:
                  default_unset_to_zero: bool = True, log_level: str = "INFO",
                  stale_timeout_s: float = 0.0, watchdog_channel: Optional[int] = None,
                  watchdog_toggle_hz: float = 0.0, perf_enabled: bool = False,
-                 cleanup_disable_osc: bool = True):
+                 cleanup_disable_osc: bool = True, pwm_frequency: Optional[int] = None):
         """Initialize PWM controller.
 
         Args:
@@ -258,6 +262,7 @@ class PWMController:
             perf_enabled: Enable performance tracking (loop time, jitter, headroom)
             cleanup_disable_osc: If True, stop PCA9685 oscillator on cleanup (outputs go LOW).
                                  If False, keep oscillator running (outputs stay at center).
+            pwm_frequency: PWM frequency in Hz (default: from PWMConstants.PWM_FREQUENCY_DEFAULT)
         """
         # Setup logger
         self.logger = logging.getLogger(f"{__name__}.PWMController")
@@ -309,11 +314,12 @@ class PWMController:
 
         # Hardware init - direct I2C, no Adafruit dependency
         i2c = busio.I2C(board.SCL, board.SDA)
+        freq = pwm_frequency if pwm_frequency is not None else self._config_pwm_frequency
         self._direct_writer = DirectPWMWriter(
             i2c,
             min_channel=min_ch,
             max_channel=max_ch,
-            frequency=PWMConstants.PWM_FREQUENCY_DEFAULT
+            frequency=freq
         )
         self._pwm_period_us = 1e6 / float(self._direct_writer.frequency)
         self.logger.info(f"DirectPWMWriter using channels {min_ch}-{max_ch} "
@@ -350,6 +356,7 @@ class PWMController:
         with open(config_path, 'r') as f:
             raw_config = yaml.safe_load(f)
         self.channel_configs, self.pump_config = self._parse_config(raw_config)
+        self._config_pwm_frequency = raw_config.get('pwm_frequency', None)
         self._validate_config()
 
     def _parse_config(self, raw_config: Dict) -> tuple[Dict[str, ChannelConfig], Optional[PumpConfig]]:
@@ -489,6 +496,22 @@ class PWMController:
     def _validate_config(self):
         errors = []
         used_outputs = {}
+
+        # PWM frequency validation
+        if self._config_pwm_frequency is None:
+            errors.append("pwm_frequency: missing from servo config (required)")
+        elif not isinstance(self._config_pwm_frequency, (int, float)):
+            errors.append(f"pwm_frequency: must be a number (got {type(self._config_pwm_frequency).__name__})")
+        else:
+            freq = int(self._config_pwm_frequency)
+            if not PWMConstants.PWM_FREQ_MIN <= freq <= PWMConstants.PWM_FREQ_MAX:
+                errors.append(f"pwm_frequency: {freq} Hz out of range "
+                              f"({PWMConstants.PWM_FREQ_MIN}-{PWMConstants.PWM_FREQ_MAX} Hz)")
+            elif freq < PWMConstants.PWM_FREQ_WARN_LOW or freq > PWMConstants.PWM_FREQ_WARN_HIGH:
+                self.logger.warning(f"pwm_frequency={freq} Hz is outside typical range "
+                                    f"({PWMConstants.PWM_FREQ_WARN_LOW}-{PWMConstants.PWM_FREQ_WARN_HIGH} Hz) "
+                                    f"- pulse tuning may not behave as expected")
+                time.sleep(2)
 
         for name, config in self.channel_configs.items():
             if config.direction not in [-1, 1]:

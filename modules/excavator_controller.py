@@ -598,6 +598,12 @@ class ExcavatorController:
         self._target_linear_velocity = np.zeros(3, dtype=np.float32)
         self._target_rot_velocity_dps = 0.0
         self._outputs_zeroed = False  # Track whether we've already sent a zero/neutral command
+
+        # Direct control mode (bypasses IK/PID, sends normalized commands straight to valves)
+        self._direct_mode = False
+        self._direct_commands = {}  # joint name -> float [-1, 1]
+        self._direct_lock = threading.Lock()
+
         # Debug telemetry (data capture for detailed logging/analysis)
         self._last_pi_outputs = None
         self._last_named_commands = None
@@ -648,7 +654,7 @@ class ExcavatorController:
         except Exception:
             pass
 
-    def pause(self, timeout_s: float = 0.5) -> None:
+    def pause(self, timeout_s: float = 0.5, reset_pump: bool = True) -> None:
         """Pause the control loop and clear any pending IK target."""
         if self._control_thread is None or not self._control_thread.is_alive():
             self.logger.warning("Controller not running - cannot pause")
@@ -668,7 +674,7 @@ class ExcavatorController:
         # This guarantees actuators hold still during path planning. Reset pump too
         # so hydraulics are depressurized while idle.
         try:
-            self.hardware.reset(reset_pump=True)
+            self.hardware.reset(reset_pump=reset_pump)
         except Exception:
             pass
         self._outputs_zeroed = True
@@ -906,6 +912,71 @@ class ExcavatorController:
         """Return last named PWM command dict or empty dict if none."""
         return {} if self._last_named_commands is None else dict(self._last_named_commands)
 
+    # -------------- Direct control mode (bypass IK/PID) --------------
+
+    def enter_direct_mode(self) -> None:
+        """Switch to direct valve control, bypassing IK and PID."""
+        with self._direct_lock:
+            self._direct_commands = {}
+        for pid in self.joint_pids:
+            pid.reset()
+        self._direct_mode = True
+        self._outputs_zeroed = False
+        self.logger.info("Entered direct control mode")
+
+    def exit_direct_mode(self) -> None:
+        """Switch back to IK mode, syncing targets to current measured pose."""
+        self._direct_mode = False
+        with self._direct_lock:
+            self._direct_commands = {}
+
+        # Reset PIDs to avoid residual terms
+        for pid in self.joint_pids:
+            pid.reset()
+
+        # Reset IK internal command buffers
+        try:
+            self.ik_controller.reset()
+        except Exception:
+            pass
+
+        # Sync smoother and IK target to current measured EE so there's no jump
+        self._update_current_state()
+        self.motion_processor.reset(
+            position=self._current_position,
+            rotation_deg=self._current_orientation_y_deg
+        )
+        # Set raw target to current pose so give_pose() starts from reality
+        self.give_pose(self._current_position, self._current_orientation_y_deg)
+
+        self._outputs_zeroed = False
+        self.logger.info("Exited direct control mode (synced to measured pose)")
+
+    def give_direct_commands(self, commands: dict) -> None:
+        """Set normalized [-1, 1] valve commands for direct mode.
+
+        Args:
+            commands: dict of joint name -> float, e.g.
+                      {'rotate': 0.3, 'lift_boom': -0.5, 'tilt_boom': 0.0, 'scoop': 0.0}
+        """
+        with self._direct_lock:
+            self._direct_commands = dict(commands)
+        self._outputs_zeroed = False
+
+    def _send_direct_commands(self) -> None:
+        """Read current direct commands and send them to hardware."""
+        with self._direct_lock:
+            cmds = dict(self._direct_commands)
+
+        if not cmds:
+            if not self._outputs_zeroed:
+                self.hardware.reset(reset_pump=False)
+                self._outputs_zeroed = True
+            return
+
+        self.hardware.send_named_pwm_commands(cmds)
+        self._outputs_zeroed = False
+
     def get_ik_debug_info(self) -> dict:
         """Return IK telemetry such as adaptive damping and condition number."""
         return {
@@ -982,18 +1053,24 @@ class ExcavatorController:
                 self._update_current_state()
                 self._perf_tracker.stage_end('sensor')
 
-                # Refresh smoothed target using latest feedback + loop timing
-                self._refresh_smoothed_target(loop_dt)
-
-                with self._lock:
-                    has_target = self._target_position is not None
-                if has_target:
-                    self._compute_control_commands(loop_dt)
+                if self._direct_mode:
+                    # Direct mode: bypass smoothing, IK, and PID
+                    self._perf_tracker.stage_start('pwm')
+                    self._send_direct_commands()
+                    self._perf_tracker.stage_end('pwm')
                 else:
-                    # Only send a neutral command once when there is no target
-                    if not self._outputs_zeroed:
-                        self.hardware.reset(reset_pump=False)
-                        self._outputs_zeroed = True
+                    # IK mode: smooth -> IK -> PID -> PWM
+                    self._refresh_smoothed_target(loop_dt)
+
+                    with self._lock:
+                        has_target = self._target_position is not None
+                    if has_target:
+                        self._compute_control_commands(loop_dt)
+                    else:
+                        # Only send a neutral command once when there is no target
+                        if not self._outputs_zeroed:
+                            self.hardware.reset(reset_pump=False)
+                            self._outputs_zeroed = True
 
             except Exception as e:
                 self.logger.error(f"Control loop error: {e}")
