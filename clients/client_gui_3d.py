@@ -33,6 +33,7 @@ if str(_ROOT_DIR) not in sys.path:
     sys.path.append(str(_ROOT_DIR))
 
 from modules.udp_socket import UDPSocket  # same module used by excv_gui_log.py
+from modules.gamepad import XboxController
 
 
 class ExcavatorGUI3D:
@@ -59,7 +60,7 @@ class ExcavatorGUI3D:
     UDP_LOCAL_ID = 3              # server uses 2, GUI uses 3
     UDP_SEND_RATE_HZ = 20.0
     UDP_NUM_BYTES_SEND = 9        # x,y,z,rot_y (2 bytes each) + control flags
-    UDP_NUM_BYTES_RECV = 30       # 5 positions * (x,y,z) * 2 bytes
+    UDP_NUM_BYTES_RECV = 32       # 5 positions * 6 bytes + 2 bytes rot_y
 
     # Encoding scales (same as decode_bytes_to_position / encode_joint_positions_to_bytes)
     SCALE_POS = 13107.0           # meters <-> int16
@@ -67,6 +68,7 @@ class ExcavatorGUI3D:
     CONTROL_FLAG_RELOAD = 1 << 0
     CONTROL_FLAG_PAUSE = 1 << 1
     CONTROL_FLAG_RESUME = 1 << 2
+    CONTROL_FLAG_DIRECT = 1 << 3
 
     # Hz monitoring
     HZ_UPDATE_INTERVAL = 0.5      # Update Hz display every 0.5 s
@@ -108,13 +110,25 @@ class ExcavatorGUI3D:
         self.pause_flag = 0   # one-shot
         self.resume_flag = 0  # one-shot
 
+        # Direct control mode
+        self.direct_mode = False
+        self.direct_commands = [0.0, 0.0, 0.0, 0.0]  # [slew, boom, arm, bucket]
+
         # Received joint positions for visualization (list of [x,y,z] in meters)
         self.joint_positions: Optional[List[List[float]]] = None
+        self.received_rot_y: float = 0.0  # EE rotation from FK (degrees)
 
         # Hz monitoring
         self.send_hz_actual = 0.0
         self.send_count_window = 0
         self.send_time_window_start = 0.0
+
+        # Xbox controller (optional, works even if not plugged in)
+        try:
+            self._controller = XboxController(max_reconnect=None, deadzone=25.0)
+        except Exception as e:
+            print(f"[GUI] Gamepad not available: {e}")
+            self._controller = None
 
         # Build UI
         self._create_widgets()
@@ -224,6 +238,7 @@ class ExcavatorGUI3D:
         self.reload_btn = ttk.Button(btns, text="Reload", command=self._trigger_reload, state=tk.DISABLED)
         self.pause_btn = ttk.Button(btns, text="Pause", command=self._trigger_pause, state=tk.DISABLED)
         self.resume_btn = ttk.Button(btns, text="Resume", command=self._trigger_resume, state=tk.DISABLED)
+        self.direct_btn = ttk.Button(btns, text="Direct Mode", command=self._toggle_direct_mode, state=tk.DISABLED)
         self.copy_btn = ttk.Button(btns, text="Copy Position", command=self._copy_command)
         self.reset_btn = ttk.Button(btns, text="Reset (0.6, 0.0, 0°)", command=self._reset_position)
 
@@ -232,8 +247,9 @@ class ExcavatorGUI3D:
         self.reload_btn.grid(row=0, column=2, padx=(0, 4))
         self.pause_btn.grid(row=0, column=3, padx=(0, 4))
         self.resume_btn.grid(row=0, column=4, padx=(0, 4))
-        self.copy_btn.grid(row=0, column=5, padx=(0, 4))
-        self.reset_btn.grid(row=0, column=6, padx=(0, 4))
+        self.direct_btn.grid(row=0, column=5, padx=(0, 4))
+        self.copy_btn.grid(row=0, column=6, padx=(0, 4))
+        self.reset_btn.grid(row=0, column=7, padx=(0, 4))
 
         # UDP info
         udp = ttk.LabelFrame(main, text="UDP Streaming Control", padding="8")
@@ -264,7 +280,7 @@ class ExcavatorGUI3D:
         # Hint label
         hint = ttk.Label(
             main,
-            text="Keyboard: A/D=X−/X+, W/S=Z+/Z−, Q/E=Y−/Y+, R/F=Rot+, Rot−, Shift=fast",
+            text="IK: A/D=X, W/S=Z, Q/E=Y, R/F=Rot | Direct: A/D=Slew, W/S=Boom, Q/E=Arm, R/F=Bucket | Shift=fast",
             font=('Courier', 9),
         )
         hint.grid(row=6, column=0, columnspan=3, pady=(6, 0), sticky=tk.W)
@@ -472,29 +488,56 @@ class ExcavatorGUI3D:
         self.root.after(33, self._schedule_tick)  # ~30 Hz
 
     def _tick(self):
+        if self.direct_mode:
+            self._tick_direct()
+            return
+
         mult = self.FAST_MULTIPLIER if 'shift' in self.keys_down else 1.0
         dp = self.step_pos * mult
         dr = self.step_rot * mult
 
-        moved = False
+        # Keyboard deltas
+        kbd_dx = kbd_dy = kbd_dz = kbd_drot = 0.0
         if 'a' in self.keys_down:
-            self.current_x -= dp; moved = True
+            kbd_dx -= dp
         if 'd' in self.keys_down:
-            self.current_x += dp; moved = True
+            kbd_dx += dp
         if 'w' in self.keys_down:
-            self.current_z += dp; moved = True
+            kbd_dz += dp
         if 's' in self.keys_down:
-            self.current_z -= dp; moved = True
+            kbd_dz -= dp
         if 'q' in self.keys_down:
-            self.current_y -= dp; moved = True
+            kbd_dy -= dp
         if 'e' in self.keys_down:
-            self.current_y += dp; moved = True
+            kbd_dy += dp
         if 'r' in self.keys_down:
-            self.current_rot_y += dr; moved = True
+            kbd_drot += dr
         if 'f' in self.keys_down:
-            self.current_rot_y -= dr; moved = True
+            kbd_drot -= dr
 
-        if moved:
+        # Controller deltas (only when left bumper held as safety)
+        ctrl_dx = ctrl_dy = ctrl_dz = ctrl_drot = 0.0
+        if self._controller is not None:
+            state = self._controller.read()
+            if state['LeftBumper']:
+                fast_dp = self.step_pos * self.FAST_MULTIPLIER
+                fast_dr = self.step_rot * self.FAST_MULTIPLIER
+                ctrl_dx = state['LeftJoystickX'] * fast_dp
+                ctrl_dz = -state['LeftJoystickY'] * fast_dp
+                ctrl_dy = state['RightJoystickX'] * fast_dp
+                ctrl_drot = (state['RightTrigger'] - state['LeftTrigger']) * fast_dr
+
+        # Per-axis: pick whichever source has larger abs (keyboard overrides small joystick)
+        dx = kbd_dx if abs(kbd_dx) >= abs(ctrl_dx) else ctrl_dx
+        dy = kbd_dy if abs(kbd_dy) >= abs(ctrl_dy) else ctrl_dy
+        dz = kbd_dz if abs(kbd_dz) >= abs(ctrl_dz) else ctrl_dz
+        drot = kbd_drot if abs(kbd_drot) >= abs(ctrl_drot) else ctrl_drot
+
+        if dx or dy or dz or drot:
+            self.current_x += dx
+            self.current_y += dy
+            self.current_z += dz
+            self.current_rot_y += drot
             self._clamp_pose()
             self._request_redraw()
 
@@ -507,6 +550,108 @@ class ExcavatorGUI3D:
             self.current_rot_y = 45.0
         elif self.current_rot_y < -45.0:
             self.current_rot_y = -45.0
+
+    def _tick_direct(self):
+        """Handle input in direct control mode - send normalized valve commands."""
+        mag = 1.0 if 'shift' in self.keys_down else 0.5
+        slew = boom = arm = bucket = 0.0
+
+        # Keyboard: A/D=slew, W/S=boom, Q/E=arm, R/F=bucket
+        if 'a' in self.keys_down:
+            slew -= mag
+        if 'd' in self.keys_down:
+            slew += mag
+        if 'w' in self.keys_down:
+            boom += mag
+        if 's' in self.keys_down:
+            boom -= mag
+        if 'q' in self.keys_down:
+            arm -= mag
+        if 'e' in self.keys_down:
+            arm += mag
+        if 'r' in self.keys_down:
+            bucket += mag
+        if 'f' in self.keys_down:
+            bucket -= mag
+
+        # Gamepad: LeftBumper held -> analog direct control
+        if self._controller is not None:
+            state = self._controller.read()
+            if state['LeftBumper']:
+                gp_slew = state['LeftJoystickX']
+                gp_boom = -state['LeftJoystickY']
+                gp_arm = state['RightJoystickY']
+                gp_bucket = state['RightJoystickX']
+                # Per-axis: pick whichever source has larger magnitude
+                if abs(gp_slew) > abs(slew):
+                    slew = gp_slew
+                if abs(gp_boom) > abs(boom):
+                    boom = gp_boom
+                if abs(gp_arm) > abs(arm):
+                    arm = gp_arm
+                if abs(gp_bucket) > abs(bucket):
+                    bucket = gp_bucket
+
+        self.direct_commands = [
+            max(-1.0, min(1.0, slew)),
+            max(-1.0, min(1.0, boom)),
+            max(-1.0, min(1.0, arm)),
+            max(-1.0, min(1.0, bucket)),
+        ]
+
+        # Sync IK target to received EE pose for smooth handoff back to IK
+        if self.joint_positions and len(self.joint_positions) >= 5:
+            ee = self.joint_positions[4]
+            self.current_x = ee[0]
+            self.current_y = ee[1]
+            self.current_z = ee[2]
+            self.current_rot_y = self.received_rot_y
+
+        self._request_redraw()
+
+    def _toggle_direct_mode(self):
+        """Toggle direct control mode on/off."""
+        self.direct_mode = not self.direct_mode
+        if self.direct_mode:
+            self.direct_commands = [0.0, 0.0, 0.0, 0.0]
+            self.direct_btn.config(text="IK Mode")
+            self.status_label.config(text="Status: DIRECT MODE")
+            print("Direct mode ON")
+        else:
+            self.direct_commands = [0.0, 0.0, 0.0, 0.0]
+            self.direct_btn.config(text="Direct Mode")
+            if self.udp_streaming:
+                self.status_label.config(text="Status: Streaming")
+            print("Direct mode OFF (IK mode)")
+
+    def _encode_direct_to_bytes(self, commands: list, control_flags: int) -> list:
+        """Encode 4 direct valve commands [-1,1] into 9 signed bytes.
+
+        Uses SCALE_POS for all 4 slots (same packet layout as pose,
+        but values represent normalized valve commands).
+        """
+        def clamp_int16(v: int) -> int:
+            return max(-32768, min(32767, v))
+
+        def split_int16(value: int) -> tuple:
+            if value < 0:
+                value = (1 << 16) + value
+            high = (value >> 8) & 0xFF
+            low = value & 0xFF
+            return high, low
+
+        def to_signed_byte(b: int) -> int:
+            return b if b < 128 else b - 256
+
+        result = []
+        for v in commands:
+            v_int = clamp_int16(int(round(v * self.SCALE_POS)))
+            high, low = split_int16(v_int)
+            result.extend([to_signed_byte(high), to_signed_byte(low)])
+
+        control_byte = int(control_flags) & 0xFF
+        result.append(to_signed_byte(control_byte))
+        return result
 
     def _update_labels(self):
         self.x_label.config(text=f"X: {self.current_x:6.3f} m")
@@ -584,7 +729,7 @@ class ExcavatorGUI3D:
         z_high, z_low = split_int16(z_int)
         rot_high, rot_low = split_int16(rot_int)
 
-        control_byte = int(control_flags) & 0x7F
+        control_byte = int(control_flags) & 0xFF
 
         return [
             to_signed_byte(x_high), to_signed_byte(x_low),
@@ -600,7 +745,7 @@ class ExcavatorGUI3D:
 
         Must match encode_joint_positions_to_bytes in excv_gui_log.py.
         """
-        if len(data) != self.UDP_NUM_BYTES_RECV:
+        if len(data) < 30:
             return None
 
         positions: List[List[float]] = []
@@ -684,6 +829,7 @@ class ExcavatorGUI3D:
         self.reload_btn.config(state=tk.DISABLED)
         self.pause_btn.config(state=tk.DISABLED)
         self.resume_btn.config(state=tk.DISABLED)
+        self.direct_btn.config(state=tk.DISABLED)
         self.status_label.config(text="Status: Disconnected")
 
     def _toggle_streaming(self):
@@ -713,6 +859,7 @@ class ExcavatorGUI3D:
         self.reload_btn.config(state=tk.NORMAL)
         self.pause_btn.config(state=tk.NORMAL)
         self.resume_btn.config(state=tk.NORMAL)
+        self.direct_btn.config(state=tk.NORMAL)
         self.status_label.config(text="Status: Streaming")
 
     def _stop_streaming(self):
@@ -729,6 +876,12 @@ class ExcavatorGUI3D:
         self.reload_btn.config(state=tk.DISABLED)
         self.pause_btn.config(state=tk.DISABLED)
         self.resume_btn.config(state=tk.DISABLED)
+        self.direct_btn.config(state=tk.DISABLED)
+        # Reset direct mode on stop
+        if self.direct_mode:
+            self.direct_mode = False
+            self.direct_commands = [0.0, 0.0, 0.0, 0.0]
+            self.direct_btn.config(text="Direct Mode")
         self.send_hz_actual = 0.0
         self.hz_label.config(text="Send Hz: 0.0")
         if self.udp_connected:
@@ -745,9 +898,16 @@ class ExcavatorGUI3D:
                     continue
                 data = self.udp.get_latest()
                 if data and len(data) == self.UDP_NUM_BYTES_RECV:
-                    joints = self._decode_joint_positions_from_bytes(data)
+                    joints = self._decode_joint_positions_from_bytes(data[:30])
                     if joints is not None:
                         self.joint_positions = joints
+                        # Decode EE rot_y from bytes 30-31
+                        def _to_unsigned(b):
+                            return b if b >= 0 else b + 256
+                        rot_int = (_to_unsigned(data[30]) << 8) | _to_unsigned(data[31])
+                        if rot_int >= 32768:
+                            rot_int -= 65536
+                        self.received_rot_y = rot_int / self.SCALE_ROT
                         self.root.after(0, self._request_redraw)
                         self.recv_label.config(text="Recv: OK")
                 else:
@@ -777,15 +937,21 @@ class ExcavatorGUI3D:
                     if self.resume_flag:
                         control_flags |= self.CONTROL_FLAG_RESUME
 
-                    payload = self._encode_pose_to_bytes(
-                        self.current_x, self.current_y, self.current_z,
-                        self.current_rot_y, control_flags
-                    )
+                    if self.direct_mode:
+                        control_flags |= self.CONTROL_FLAG_DIRECT
+                        payload = self._encode_direct_to_bytes(
+                            self.direct_commands, control_flags
+                        )
+                    else:
+                        payload = self._encode_pose_to_bytes(
+                            self.current_x, self.current_y, self.current_z,
+                            self.current_rot_y, control_flags
+                        )
                     self.udp.send(payload)
                     self.send_count_window += 1
 
                     # reset one-shot flags after one send
-                    if control_flags:
+                    if self.reload_flag or self.pause_flag or self.resume_flag:
                         self.reload_flag = 0
                         self.pause_flag = 0
                         self.resume_flag = 0
