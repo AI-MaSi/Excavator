@@ -320,6 +320,64 @@ def downsample_by_points(path: np.ndarray, max_points: int) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def rdp_simplify(path: np.ndarray, epsilon: float = 0.01) -> np.ndarray:
+    """Ramer-Douglas-Peucker simplification on 3D path.
+
+    Args:
+        path: [N, 3] waypoints.
+        epsilon: Max perpendicular distance tolerance (meters).
+
+    Returns:
+        [M, 3] simplified path (M <= N), always includes first and last point.
+    """
+    pts = np.asarray(path, dtype=np.float64)
+    n = len(pts)
+    if n <= 2:
+        return pts.astype(np.float32)
+
+    # Boolean mask of points to keep
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = True
+    keep[-1] = True
+
+    # Stack-based iterative approach
+    stack = [(0, n - 1)]
+    while stack:
+        start_i, end_i = stack.pop()
+        if end_i - start_i < 2:
+            continue
+
+        a = pts[start_i]
+        b = pts[end_i]
+        ab = b - a
+        ab_len2 = np.dot(ab, ab)
+
+        max_dist = 0.0
+        max_idx = start_i
+
+        for i in range(start_i + 1, end_i):
+            if ab_len2 < 1e-20:
+                # Degenerate segment — use distance to endpoint
+                dist = np.linalg.norm(pts[i] - a)
+            else:
+                # Perpendicular distance from point to line segment
+                t = np.dot(pts[i] - a, ab) / ab_len2
+                t = max(0.0, min(1.0, t))
+                proj = a + t * ab
+                dist = np.linalg.norm(pts[i] - proj)
+
+            if dist > max_dist:
+                max_dist = dist
+                max_idx = i
+
+        if max_dist > epsilon:
+            keep[max_idx] = True
+            stack.append((start_i, max_idx))
+            stack.append((max_idx, end_i))
+
+    return pts[keep].astype(np.float32)
+
+
 def _identity_quaternions(n: int) -> np.ndarray:
     """Return an array of n identity quaternions [w,x,y,z] as float32."""
     if n <= 0:
@@ -641,10 +699,65 @@ class GridConfig:
 # Obstacle Checking
 # ============================================================================
 
+
+def make_obstacle_data(data: dict) -> dict:
+    """Normalize an obstacle dict into the format expected by ObstacleChecker.
+
+    Accepts data from either source:
+        - CuboidCfg RigidObjects: has "size" (authored cuboid dimensions)
+        - Raw USD prim reads: has "scale" (unit cube scaled = effective size)
+
+    Also tolerates the "position"/"rotation" aliases that ObstacleChecker
+    already handles internally.
+
+    Returns:
+        Dict with canonical keys: "size", "pos", "rot".
+    """
+    size = data.get("size") or data.get("scale")
+    if size is None:
+        raise ValueError("Obstacle data must contain 'size' or 'scale' key.")
+    pos = data.get("pos") or data.get("position")
+    if pos is None:
+        raise ValueError("Obstacle data must contain 'pos' or 'position' key.")
+    rot = data.get("rot") or data.get("rotation", [1, 0, 0, 0])
+    return {"size": list(size), "pos": list(pos), "rot": list(rot)}
+
+
+def compute_line_sample_count(
+    start: Tuple[float, float, float],
+    end: Tuple[float, float, float],
+    *,
+    spacing_m: float,
+    min_samples: int = 2,
+) -> int:
+    """Compute segment sample count from a max allowed spacing.
+
+    Returns the number of subsegments used to sample the line, so the actual
+    spacing between consecutive sample points is at most ``spacing_m``.
+    """
+    if spacing_m <= 0.0:
+        raise ValueError("spacing_m must be positive")
+
+    start_array = np.asarray(start, dtype=np.float32)
+    end_array = np.asarray(end, dtype=np.float32)
+    segment_length = float(np.linalg.norm(end_array - start_array))
+    if segment_length <= 1e-9:
+        return 1
+
+    required_samples = int(np.ceil(segment_length / float(spacing_m)))
+    return max(int(min_samples), required_samples)
+
+
 class ObstacleChecker:
     """Handles obstacle collision detection for path planning."""
 
-    def __init__(self, obstacle_data: List[Dict[str, Any]], safety_margin: float = 0.02):
+    def __init__(
+        self,
+        obstacle_data: List[Dict[str, Any]],
+        safety_margin: float = 0.02,
+        line_check_spacing_m: float = 0.01,
+        min_line_samples: int = 2,
+    ):
         """
         Initialize obstacle checker.
 
@@ -654,9 +767,19 @@ class ObstacleChecker:
                 - "pos" or "position": np.array([x, y, z]) - obstacle center position
                 - "rot" or "rotation": np.array([w, x, y, z]) - quaternion rotation
             safety_margin: Additional clearance around obstacles
+            line_check_spacing_m: Maximum spacing between consecutive collision
+                samples along a candidate line segment.
+            min_line_samples: Minimum number of line subsegments to sample.
         """
         self.obstacles = []
         self.safety_margin = safety_margin
+        self.line_check_spacing_m = float(line_check_spacing_m)
+        self.min_line_samples = int(min_line_samples)
+
+        if self.line_check_spacing_m <= 0.0:
+            raise ValueError("line_check_spacing_m must be positive")
+        if self.min_line_samples < 1:
+            raise ValueError("min_line_samples must be at least 1")
 
         # Normalize obstacle data format
         for obs in obstacle_data:
@@ -748,15 +871,32 @@ class ObstacleChecker:
 
         return np.all(np.abs(local_point) <= half_size)
 
+    def _resolve_line_sample_count(
+        self,
+        start: Tuple[float, float, float],
+        end: Tuple[float, float, float],
+        num_samples: Optional[int] = None,
+    ) -> int:
+        """Resolve how many subsegments to sample for a line collision check."""
+        if num_samples is not None:
+            return max(1, int(num_samples))
+        return compute_line_sample_count(
+            start,
+            end,
+            spacing_m=self.line_check_spacing_m,
+            min_samples=self.min_line_samples,
+        )
+
     def is_line_collision_free(self, start: Tuple[float, float, float],
-                              end: Tuple[float, float, float],
-                              num_samples: int = 10) -> bool:
+                               end: Tuple[float, float, float],
+                               num_samples: Optional[int] = None) -> bool:
         """Check if a line segment is collision-free by sampling points."""
         start_array = np.array(start)
         end_array = np.array(end)
+        resolved_samples = self._resolve_line_sample_count(start, end, num_samples=num_samples)
 
-        for i in range(num_samples + 1):
-            t = i / num_samples
+        for i in range(resolved_samples + 1):
+            t = i / resolved_samples
             sample_point = start_array + t * (end_array - start_array)
             if not self.is_point_collision_free(tuple(sample_point)):
                 return False

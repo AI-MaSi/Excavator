@@ -11,15 +11,18 @@ This keeps the core algorithms focused on geometry/search, and
 collects the execution-shaping logic in one place.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, Any, List, Tuple, Optional
 
 import logging
 import numpy as np
 
 from .path_utils import standardize_path, ObstacleChecker
+from .radial_planner import plan_radial
 from .path_planning_algorithms import (
     AStarParams,
+    LINE_CHECK_MIN_SAMPLES,
+    LINE_CHECK_SPACING_M,
     RRTParams,
     RRTStarParams,
     PRMParams,
@@ -31,6 +34,7 @@ from .path_planning_algorithms import (
     create_rrt_trajectory,
     create_prm_trajectory,
     create_prm_plane_trajectory,
+    get_last_plan_stats,
 )
 
 
@@ -83,343 +87,61 @@ def force_goal_as_final_waypoint(
     if np.linalg.norm(last - goal) < 1e-4:
         return pts
 
-    checker = ObstacleChecker(obstacle_data or [], safety_margin=safety_margin)
+    checker = ObstacleChecker(
+        obstacle_data or [],
+        safety_margin=safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
     if checker.is_line_collision_free(tuple(last.tolist()), tuple(goal.tolist())):
         pts = np.vstack([pts, goal.astype(np.float32)])
 
     return pts
 
 
-def create_astar_3d_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
+# ── Algorithm registry ────────────────────────────────────────────────────
+# Maps algorithm name -> (raw_planner_fn, params_kwarg_name, default_params_class)
+
+_ALGORITHM_REGISTRY: Dict[str, tuple] = {
+    "a_star":           (create_astar_3d_trajectory,        "astar_params",     AStarParams),
+    "a_star_plane":     (create_astar_plane_trajectory,     "astar_params",     AStarParams),
+    "rrt":              (create_rrt_trajectory,              "rrt_params",       RRTParams),
+    "rrt_plane":        (create_rrt_plane_trajectory,        "rrt_params",       RRTParams),
+    "rrt_star":         (create_rrt_star_trajectory,         "rrt_star_params",  RRTStarParams),
+    "rrt_star_plane":   (create_rrt_star_plane_trajectory,   "rrt_star_params",  RRTStarParams),
+    "prm":              (create_prm_trajectory,              "prm_params",       PRMParams),
+    "prm_plane":        (create_prm_plane_trajectory,        "prm_params",       PRMParams),
+}
+
+# Algorithms whose raw functions accept a `use_3d` parameter (3D variants only)
+_ACCEPTS_USE_3D = {"rrt", "rrt_star", "prm"}
+# Algorithms whose raw functions accept a `verbose` parameter
+_ACCEPTS_VERBOSE = {"a_star", "a_star_plane"}
+
+SUPPORTED_ALGORITHMS = tuple(_ALGORITHM_REGISTRY.keys())
+
+
+def _plan_and_normalize(
+    raw_fn,
+    raw_kwargs: dict,
     goal_pos: Tuple[float, float, float],
     obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    *,
-    astar_params: AStarParams,
+    safety_margin: float,
     normalizer_params: NormalizerParams,
-    verbose: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """Create an A* path and normalize it to constant-speed execution."""
-
-    raw = create_astar_3d_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        max_iterations=astar_params.max_iterations,
-        verbose=verbose,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
+    """Run a raw planner, append goal if requested, then normalize to constant speed."""
+    raw = raw_fn(**raw_kwargs)
+    planning_stats = get_last_plan_stats()
+    raw = force_goal_as_final_waypoint(raw, goal_pos, obstacle_data, safety_margin, normalizer_params.force_goal)
+    result = standardize_path(
         raw,
         speed_mps=normalizer_params.speed_mps,
         dt=normalizer_params.dt,
         return_poses=normalizer_params.return_poses,
     )
-
-
-def create_astar_plane_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    *,
-    astar_params: AStarParams,
-    normalizer_params: NormalizerParams,
-    verbose: bool = False,
-) -> Dict[str, np.ndarray]:
-    """Planar (X-Z) A* normalized to constant-speed execution."""
-
-    raw = create_astar_plane_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        max_iterations=astar_params.max_iterations,
-        verbose=verbose,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
-
-
-def create_rrt_star_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    use_3d: bool = True,
-    *,
-    rrt_params: RRTStarParams,
-    normalizer_params: NormalizerParams,
-) -> Dict[str, np.ndarray]:
-    """Create an RRT* path and normalize it to constant-speed execution."""
-
-    raw = create_rrt_star_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        max_iterations=rrt_params.max_iterations,
-        max_acceptable_cost=rrt_params.max_acceptable_cost,
-        max_step_size=rrt_params.max_step_size,
-        goal_bias=rrt_params.goal_bias,
-        rewire_radius=rrt_params.rewire_radius,
-        goal_tolerance=rrt_params.goal_tolerance,
-        minimum_iterations=rrt_params.minimum_iterations,
-        cost_improvement_patience=rrt_params.cost_improvement_patience,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
-
-
-def create_rrt_plane_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    *,
-    rrt_params: RRTParams,
-    normalizer_params: NormalizerParams,
-) -> Dict[str, np.ndarray]:
-    """Planar RRT normalized to constant-speed execution."""
-
-    raw = create_rrt_plane_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        max_iterations=rrt_params.max_iterations,
-        max_acceptable_cost=rrt_params.max_acceptable_cost,
-        max_step_size=rrt_params.max_step_size,
-        goal_bias=rrt_params.goal_bias,
-        goal_tolerance=rrt_params.goal_tolerance,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
-
-
-def create_rrt_star_plane_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    *,
-    rrt_params: RRTStarParams,
-    normalizer_params: NormalizerParams,
-) -> Dict[str, np.ndarray]:
-    """Planar RRT* normalized to constant-speed execution."""
-
-    raw = create_rrt_star_plane_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        max_iterations=rrt_params.max_iterations,
-        max_acceptable_cost=rrt_params.max_acceptable_cost,
-        max_step_size=rrt_params.max_step_size,
-        goal_bias=rrt_params.goal_bias,
-        rewire_radius=rrt_params.rewire_radius,
-        goal_tolerance=rrt_params.goal_tolerance,
-        minimum_iterations=rrt_params.minimum_iterations,
-        cost_improvement_patience=rrt_params.cost_improvement_patience,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
-
-
-def create_rrt_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    use_3d: bool = True,
-    *,
-    rrt_params: RRTParams,
-    normalizer_params: NormalizerParams,
-) -> Dict[str, np.ndarray]:
-    """Create an RRT path and normalize it to constant-speed execution."""
-
-    raw = create_rrt_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        max_iterations=rrt_params.max_iterations,
-        max_acceptable_cost=rrt_params.max_acceptable_cost,
-        max_step_size=rrt_params.max_step_size,
-        goal_bias=rrt_params.goal_bias,
-        goal_tolerance=rrt_params.goal_tolerance,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
-
-
-def create_prm_plane_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    *,
-    prm_params: PRMParams,
-    normalizer_params: NormalizerParams,
-) -> Dict[str, np.ndarray]:
-    """Planar PRM normalized to constant-speed execution."""
-
-    raw = create_prm_plane_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        num_samples=prm_params.num_samples,
-        connection_radius=prm_params.connection_radius,
-        max_connections_per_node=prm_params.max_connections_per_node,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
-
-
-def create_prm_trajectory_normalized(
-    start_pos: Tuple[float, float, float],
-    goal_pos: Tuple[float, float, float],
-    obstacle_data: List[Dict[str, Any]],
-    grid_resolution: float = 0.01,
-    safety_margin: float = 0.02,
-    use_3d: bool = True,
-    *,
-    prm_params: PRMParams,
-    normalizer_params: NormalizerParams,
-) -> Dict[str, np.ndarray]:
-    """Create a PRM path and normalize it to constant-speed execution."""
-
-    raw = create_prm_trajectory(
-        start_pos=start_pos,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        grid_resolution=grid_resolution,
-        safety_margin=safety_margin,
-        use_3d=use_3d,
-        num_samples=prm_params.num_samples,
-        connection_radius=prm_params.connection_radius,
-        max_connections_per_node=prm_params.max_connections_per_node,
-    )
-
-    raw = force_goal_as_final_waypoint(
-        path=raw,
-        goal_pos=goal_pos,
-        obstacle_data=obstacle_data,
-        safety_margin=safety_margin,
-        force_goal=normalizer_params.force_goal,
-    )
-
-    return standardize_path(
-        raw,
-        speed_mps=normalizer_params.speed_mps,
-        dt=normalizer_params.dt,
-        return_poses=normalizer_params.return_poses,
-    )
+    if planning_stats:
+        result["planning_stats"] = planning_stats
+    return result
 
 
 def plan_to_target(
@@ -441,124 +163,101 @@ def plan_to_target(
     """Plan a normalized path from an arbitrary start pose to a target.
 
     This is intended for feeding the *current* robot EE position directly
-    into the planners (e.g. ee→A, ee→B instead of A→B, B→A).
+    into the planners (e.g. ee->A, ee->B instead of A->B, B->A).
 
     The underlying planners operate in position space only. Orientation in
     the returned trajectory is currently set to identity (no rotation).
     This matches the current demos where pitch is kept at 0 and other
     orientation axes are ignored / not actuated.
     """
-
-    if algorithm == "a_star":
-        if astar_params is None:
-            astar_params = AStarParams()
-        return create_astar_3d_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            astar_params=astar_params,
-            normalizer_params=normalizer_params,
-            verbose=verbose,
+    if algorithm not in _ALGORITHM_REGISTRY:
+        raise ValueError(
+            f"Unsupported algorithm '{algorithm}'. Expected one of: {', '.join(repr(k) for k in SUPPORTED_ALGORITHMS)}."
         )
 
-    if algorithm == "a_star_plane":
-        if astar_params is None:
-            astar_params = AStarParams()
-        return create_astar_plane_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            astar_params=astar_params,
-            normalizer_params=normalizer_params,
-            verbose=verbose,
-        )
+    raw_fn, params_key, default_params_cls = _ALGORITHM_REGISTRY[algorithm]
 
-    if algorithm == "rrt":
-        if rrt_params is None:
-            rrt_params = RRTParams()
-        return create_rrt_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            use_3d=use_3d,
-            rrt_params=rrt_params,
-            normalizer_params=normalizer_params,
-        )
+    # Resolve the algorithm-specific params (use provided or default)
+    params_map = {
+        "astar_params": astar_params,
+        "rrt_params": rrt_params,
+        "rrt_star_params": rrt_star_params,
+        "prm_params": prm_params,
+    }
+    params = params_map.get(params_key)
+    if params is None:
+        params = default_params_cls()
 
-    if algorithm == "rrt_plane":
-        if rrt_params is None:
-            rrt_params = RRTParams()
-        return create_rrt_plane_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            rrt_params=rrt_params,
-            normalizer_params=normalizer_params,
-        )
+    # Build raw planner kwargs: common args + unpacked algo params
+    raw_kwargs = {
+        "start_pos": tuple(start_pos_world),
+        "goal_pos": tuple(target_pos_world),
+        "obstacle_data": obstacle_data,
+        "grid_resolution": grid_resolution,
+        "safety_margin": safety_margin,
+        **asdict(params),
+    }
+    if algorithm in _ACCEPTS_USE_3D:
+        raw_kwargs["use_3d"] = use_3d
+    if algorithm in _ACCEPTS_VERBOSE:
+        raw_kwargs["verbose"] = verbose
 
-    if algorithm == "rrt_star":
-        if rrt_star_params is None:
-            rrt_star_params = RRTStarParams()
-        return create_rrt_star_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            use_3d=use_3d,
-            rrt_params=rrt_star_params,
-            normalizer_params=normalizer_params,
-        )
+    return _plan_and_normalize(
+        raw_fn, raw_kwargs,
+        goal_pos=tuple(target_pos_world),
+        obstacle_data=obstacle_data,
+        safety_margin=safety_margin,
+        normalizer_params=normalizer_params,
+    )
 
-    if algorithm == "rrt_star_plane":
-        if rrt_star_params is None:
-            rrt_star_params = RRTStarParams()
-        return create_rrt_star_plane_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            rrt_params=rrt_star_params,
-            normalizer_params=normalizer_params,
-        )
 
-    if algorithm == "prm":
-        if prm_params is None:
-            prm_params = PRMParams()
-        return create_prm_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            use_3d=use_3d,
-            prm_params=prm_params,
-            normalizer_params=normalizer_params,
-        )
+# ── Radial-first wrappers ─────────────────────────────────────────────────
 
-    if algorithm == "prm_plane":
-        if prm_params is None:
-            prm_params = PRMParams()
-        return create_prm_plane_trajectory_normalized(
-            start_pos=tuple(start_pos_world),
-            goal_pos=tuple(target_pos_world),
-            obstacle_data=obstacle_data,
-            grid_resolution=grid_resolution,
-            safety_margin=safety_margin,
-            prm_params=prm_params,
-            normalizer_params=normalizer_params,
-        )
+# Algorithms that can be used as the raw avoidance backend inside radial-first planning
+RADIAL_AVOIDANCE_ALGORITHMS = tuple(f"radial_avoid_{k}" for k in _ALGORITHM_REGISTRY)
 
-    raise ValueError(
-        f"Unsupported algorithm '{algorithm}'. Expected one of: "
-        "'a_star', 'a_star_plane', 'rrt', 'rrt_plane', 'rrt_star', 'rrt_star_plane', 'prm', 'prm_plane'."
+
+def plan_radial_to_target(
+    start_pos_world: Tuple[float, float, float],
+    target_pos_world: Tuple[float, float, float],
+    obstacle_data: List[Dict[str, Any]],
+    *,
+    fallback_algorithm: str,
+    grid_resolution: float,
+    safety_margin: float,
+    normalizer_params: NormalizerParams,
+    astar_params: Optional[AStarParams] = None,
+    rrt_params: Optional[RRTParams] = None,
+    rrt_star_params: Optional[RRTStarParams] = None,
+    prm_params: Optional[PRMParams] = None,
+    use_3d: bool = True,
+    verbose: bool = False,
+    execute_raw: bool = False,
+    rdp_epsilon: float = 0.005,
+    radial_compensation_alpha: float = 0.8,
+    smoothing_samples: int = 120,
+) -> Dict[str, np.ndarray]:
+    """Plan a radial-first path with radial compensation and smoothing around obstacles.
+
+    Thin wrapper around :func:`plan_radial` that matches the
+    ``plan_to_target`` call convention.
+    """
+    return plan_radial(
+        start_pos=tuple(start_pos_world),
+        goal_pos=tuple(target_pos_world),
+        obstacle_data=obstacle_data,
+        fallback_algorithm=fallback_algorithm,
+        grid_resolution=grid_resolution,
+        safety_margin=safety_margin,
+        normalizer_params=normalizer_params,
+        astar_params=astar_params,
+        rrt_params=rrt_params,
+        rrt_star_params=rrt_star_params,
+        prm_params=prm_params,
+        use_3d=use_3d,
+        verbose=verbose,
+        execute_raw=execute_raw,
+        rdp_epsilon=rdp_epsilon,
+        radial_compensation_alpha=radial_compensation_alpha,
+        smoothing_samples=smoothing_samples,
     )

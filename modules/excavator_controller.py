@@ -24,10 +24,24 @@ import os
 import yaml
 
 # Import project modules
-from . import diff_ik_V2 as diff_ik
+from . import reachability as reachability_module
 from .pid import PIDController
-from .quaternion_math import quat_from_axis_angle
+from .differential_ik_cfg import IKControllerConfig, load_excavator_robot_config
+from .differential_ik import (
+    IKController, extract_axis_rotation,
+    joint_angles_to_absolute_quaternions, get_pose_from_joint_angles,
+)
+from .excavator_ik_utils import (
+    canonical_joint_angles_from_imus, gravity_pitch_from_quat,
+    compute_relative_joint_angles, warmup_numba_functions,
+)
+from .quaternion_math import (
+    quat_from_axis_angle, quat_multiply, quat_conjugate, quat_normalize,
+    compute_pose_error,
+)
+from .reachability import ReachabilityResult
 from .perf_tracker import ControlLoopPerfTracker
+from .rt_utils import apply_rt_to_thread, SCHED_FIFO
 
 # Load settings
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +55,15 @@ if os.path.isfile(_pathing_cfg_file):
     from pathing_config import DEFAULT_CONFIG as _PATHING_CONFIG  # type: ignore
 else:
     _PATHING_CONFIG = None
+
+# Module-level constants and pure helpers used in the hot control loop.
+# Defining them here avoids per-tick allocation / nested-function overhead.
+_Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+
+def _angle_error(target: float, current: float) -> float:
+    """Wrap-aware angle difference in radians."""
+    return float(np.arctan2(np.sin(target - current), np.cos(target - current)))
 
 
 @dataclass
@@ -370,7 +393,9 @@ class MotionProcessor:
 
 class ExcavatorController:
     def __init__(self, hardware_interface, config: Optional[ControllerConfig] = None,
-                 enable_perf_tracking: bool = False, log_level: str = "INFO"):
+                 enable_perf_tracking: bool = False, log_level: str = "INFO",
+                 rt_priority: int = 0, rt_lock_memory: bool = False,
+                 rt_cpu_core: Optional[int] = None):
         """Initialize the excavator controller.
 
         Args:
@@ -378,16 +403,22 @@ class ExcavatorController:
             config: Optional controller configuration
             enable_perf_tracking: Enable performance statistics tracking
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR" (default: "INFO")
+            rt_priority: RT priority for the controller loop thread (0 = normal).
+            rt_lock_memory: Whether to call mlockall() from the controller thread.
+            rt_cpu_core: Optional CPU core to pin the controller loop thread to.
         """
         self.hardware = hardware_interface
         self._enable_perf_tracking = enable_perf_tracking
+        self._rt_priority = int(rt_priority)
+        self._rt_lock_memory = bool(rt_lock_memory)
+        self._rt_cpu_core = rt_cpu_core
 
         # Setup logger for this controller instance
         self.logger = logging.getLogger(f"{__name__}.ExcavatorController")
         self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-        # Add console handler if no handlers exist
-        if not self.logger.handlers:
+        # Only add a fallback handler when no root handler exists (standalone use).
+        if not logging.root.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
             handler.setFormatter(formatter)
@@ -433,12 +464,14 @@ class ExcavatorController:
         else:
             self.config = config
 
-        # Store control config reference for later use (PID, velocity limits, etc.)
-        self._control_config = _load_control_config() if config is None else {}
+        # Store full control config reference for later use (PID, IK, velocity limits, etc.)
+        self._control_config = _load_control_config()
+        if not isinstance(self._control_config, dict) or not self._control_config:
+            raise RuntimeError("Controller configuration requires control_config.yaml")
 
         # Robot configuration
-        self.robot_config = diff_ik.create_excavator_config()
-        diff_ik.warmup_numba_functions()
+        self.robot_config = load_excavator_robot_config()
+        warmup_numba_functions()
 
         # IK controller setup (pull settings from control_config.yaml - fail hard if missing)
         ik_cfg = self._control_config.get('ik', {})
@@ -450,23 +483,20 @@ class ExcavatorController:
             _ik_method = ik_cfg['method']
             _ik_rel = bool(ik_cfg.get('use_relative_mode', False))
             _ik_params = ik_cfg.get('params', {})
-            _ignore_axes = ik_cfg.get('ignore_axes', [])
-            # New settings for diff_ik_V2
-            _use_reduced = bool(ik_cfg.get('use_reduced_jacobian', True))
             _joint_limits_rel = ik_cfg.get('joint_limits_relative', None)
             _ik_velocity_mode = bool(ik_cfg.get('velocity_mode', False))
             _ik_velocity_error_gain = float(ik_cfg.get('velocity_error_gain', 1.0))
             _ik_use_rot_vel = bool(ik_cfg.get('use_rotational_velocity', True))
             # Adaptive damping settings (DLS method)
             _enable_adaptive_damping = bool(ik_cfg.get('enable_adaptive_damping', True))
-            _adaptive_damping_scaling = float(ik_cfg.get('adaptive_damping_scaling', 0.5))
-            _adaptive_damping_max_mult = float(ik_cfg.get('adaptive_damping_max_multiplier', 10.0))
-            # Joint weight scheduling (dynamic weights based on EE position)
-            _joint_weight_scheduling = ik_cfg.get('joint_weight_scheduling', None)
+            _adaptive_damping_max_mult = float(ik_cfg.get('adaptive_damping_max_multiplier', 2.0))
+            _cond_threshold = float(ik_cfg.get('condition_number_threshold', 40.0))
         except KeyError as e:
             raise RuntimeError(f"Missing required IK configuration in control_config.yaml: {e}")
 
-        # IK config uses ignore_axes for orientation filtering
+        # IK config: orientation is handled by target construction (pitch composed
+        # with current slew quaternion in _refresh_smoothed_target). Uncontrollable
+        # axes (roll for this robot) are auto-detected from joint rotation axes.
         # Prepare optional IK V2 extras from control_config
         ctrl_cfg = self._control_config.get('controller', {}) if isinstance(self._control_config, dict) else {}
 
@@ -477,25 +507,51 @@ class ExcavatorController:
         if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == 4:
             max_joint_velocities = [float(v) for v in per_joint_max]
 
-        # Joint limits
+        # Joint velocity estimation mode
+        self._gyro_velocity_mode = str(ctrl_cfg.get('gyro_velocity_mode', 'fd_only')).strip().lower()
+        if self._gyro_velocity_mode not in {'fd_only', 'gyro_only', 'fused'}:
+            raise RuntimeError(
+                "Invalid 'controller.gyro_velocity_mode' in control_config.yaml. "
+                "Expected one of: fd_only, gyro_only, fused"
+        )
+        self._gyro_blend_alpha = float(np.clip(float(ctrl_cfg.get('gyro_blend_alpha', 0.30)), 0.0, 1.0))
+        self._gyro_timeout_s = float(max(0.0, float(ctrl_cfg.get('gyro_timeout_s', 0.08))))
+        self._gyro_max_abs_radps = float(np.radians(max(1e-3, float(ctrl_cfg.get('gyro_max_abs_degps', 180.0)))))
+
+        bias_cfg = ctrl_cfg.get('gyro_bias_comp', {})
+        self._gyro_bias_enabled = bool(bias_cfg.get('enabled', True))
+        self._gyro_bias_stationarity_radps = float(
+            np.radians(max(0.0, float(bias_cfg.get('stationarity_degps', 1.5))))
+        )
+        self._gyro_bias_adaptation_rate = float(
+            np.clip(float(bias_cfg.get('adaptation_rate', 0.01)), 0.0, 1.0)
+        )
+
+        # Slew/yaw now comes from the configured IMU canonical state extractor.
+        self._slew_fusion_enabled = False
+
+        # Joint limits.  Per-joint null/[] is treated as "unbounded" — the
+        # IK final clamp degenerates to a no-op (np.clip with ±inf) and the
+        # joint-limit-avoidance loop skips inf-bounded joints because all of
+        # its boundary comparisons go through NaN. Use this for slew when
+        # continuous rotation past ±π is desired.
         joint_limits = None
         if isinstance(_joint_limits_rel, (list, tuple)) and len(_joint_limits_rel) == 4:
             # Accept degrees or radians; assume degrees if magnitudes > pi
             def _to_rad_pair(p):
+                if p is None or (isinstance(p, (list, tuple)) and len(p) == 0):
+                    return (float("-inf"), float("inf"))
                 a, b = float(p[0]), float(p[1])
                 if max(abs(a), abs(b)) > np.pi + 1e-6:
                     return (np.radians(a), np.radians(b))
                 return (a, b)
             joint_limits = [_to_rad_pair(p) for p in _joint_limits_rel]
 
-        self.ik_config = diff_ik.IKControllerConfig(
+        self.ik_config = IKControllerConfig(
             command_type=_ik_cmd_type,
             ik_method=_ik_method,
             use_relative_mode=_ik_rel,
             ik_params=_ik_params,
-            ignore_axes=_ignore_axes,
-            # IK V2 extensions
-            use_reduced_jacobian=bool(_use_reduced),
             enable_velocity_limiting=enable_vel_limit,
             max_joint_velocities=max_joint_velocities,
             joint_limits=joint_limits,
@@ -504,27 +560,36 @@ class ExcavatorController:
             use_rotational_velocity=_ik_use_rot_vel,
             # Adaptive damping (DLS)
             enable_adaptive_damping=_enable_adaptive_damping,
-            adaptive_damping_scaling=_adaptive_damping_scaling,
             adaptive_damping_max_multiplier=_adaptive_damping_max_mult,
-            # Joint weight scheduling
-            joint_weight_scheduling=_joint_weight_scheduling,
+            condition_number_threshold=_cond_threshold,
         )
         # Pass verbose flag if IK controller supports it, else use DEBUG level check
         ik_verbose = self.logger.level <= logging.DEBUG
         ik_default_dt = 1.0 / float(self.config.control_frequency)
-        self.ik_controller = diff_ik.IKController(
+        self.ik_controller = IKController(
             self.ik_config,
             self.robot_config,
             verbose=ik_verbose,
             default_dt=ik_default_dt
         )
 
-        # Relative IK control parameters (pulling toward target)
-        try:
-            self._relative_pos_gain = float(ik_cfg.get('relative_pos_gain', 1.0))
-            self._relative_rot_gain = float(ik_cfg.get('relative_rot_gain', 1.0))
-        except (KeyError, TypeError) as e:
-            raise RuntimeError(f"Missing required relative control gains in control_config.yaml: {e}")
+        # Cache IK config flags — fixed at init, avoid getattr() on every tick.
+        self._ik_velocity_mode_enabled: bool = bool(getattr(self.ik_config, "velocity_mode", False))
+        self._ik_use_rotational_velocity: bool = bool(getattr(self.ik_config, "use_rotational_velocity", True))
+
+        # Condition number threshold gating — read from ik_config (shared with adaptive damping).
+        self._cond_threshold = self.ik_config.condition_number_threshold
+        self._cond_reject_count = 0
+
+        # Pre-flight reachability check
+        reach_cfg = self._control_config.get('reachability', {}) if isinstance(self._control_config, dict) else {}
+        self._reach_enabled = bool(reach_cfg.get('enabled', True))
+        self._reach_pos_tol = float(reach_cfg.get('pos_tol_m', 0.005))
+        self._reach_max_iters = int(reach_cfg.get('max_iters', 80))
+        self._reach_min_target_delta = float(reach_cfg.get('min_target_delta_m', 0.002))
+        self._last_validated_target = None
+        self._last_validated_rot_deg = None
+        self._last_reachability_result: Optional[ReachabilityResult] = None
 
         # Load PID gains from control_config.yaml
         if not isinstance(self._control_config, dict) or 'pid' not in self._control_config:
@@ -578,6 +643,9 @@ class ExcavatorController:
             enable_smoothing=_enable_jerk,
         )
 
+        # Cache hardware capability flags — hasattr() is non-trivial to call every tick.
+        self._hw_has_try_read_imu_gyro: bool = hasattr(self.hardware, 'try_read_imu_gyro')
+
         # Thread control
         self._control_thread = None
         self._stop_event = threading.Event()
@@ -592,7 +660,11 @@ class ExcavatorController:
         self._target_orientation = None
         self._current_position = np.zeros(3, dtype=np.float32)
         self._current_orientation_y_deg = 0.0
-        self._current_projected_quats = None  # Cache processed quaternions
+        self._current_fk_quats = None  # Canonical absolute link quats [slew, boom, arm, bucket]
+        self._current_sensor_quats = None  # Corrected physical IMU quats in configured role order
+        self._current_joint_angles = None
+        self._current_ee_quat_full = None
+        self._current_projected_quats = None  # Backward-compatible alias for canonical quats
         self._current_linear_velocity = 0.0
         self._current_rot_velocity_degps = 0.0
         self._target_linear_velocity = np.zeros(3, dtype=np.float32)
@@ -610,6 +682,18 @@ class ExcavatorController:
         self._prev_joint_angles = None
         self._prev_joint_time = None
         self._last_joint_vel_radps = None
+        self._last_joint_vel_time: Optional[float] = None
+        self._last_joint_vel_source = 'none'
+        self._gyro_bias_radps = np.zeros(3, dtype=np.float32)
+        # Pre-allocated buffers for hot-path — avoids per-tick GC pressure.
+        self._gyro_joint_rates = np.zeros(3, dtype=np.float32)
+        self._pi_outputs = np.zeros(4, dtype=np.float32)
+        self._named_commands: Dict[str, float] = {
+            'scoop': 0.0, 'lift_boom': 0.0, 'rotate': 0.0, 'tilt_boom': 0.0,
+        }
+        self._last_gyro_wall_t = None
+        self._last_gyro_device_ts_us = None
+        self._gyro_fallback_counter = 0
         self._prev_pose_time = None
         self._prev_pose = None
         self._prev_orientation_deg = None
@@ -624,8 +708,7 @@ class ExcavatorController:
         self.logger.info("Controller initialized")
 
     def start(self) -> None:
-        # TODO: Call self.hardware._check_faults() here to fail fast with clear error
-        # if any hardware subsystem (PWM/IMU/ADC) is in FAULT state
+        self.hardware._check_faults()
         if self._control_thread is not None:
             self.logger.warning("Controller already running!")
             return
@@ -712,20 +795,92 @@ class ExcavatorController:
             while self._pause_ack_event.is_set() and (time.perf_counter() - start) < timeout_s:
                 time.sleep(0.01)
 
-    def give_pose(self, position, rotation_y_deg: float = 0.0) -> None:
+    def give_pose(self, position, rotation_y_deg: float = 0.0) -> Optional[ReachabilityResult]:
+        target_pos = np.array(position, dtype=np.float32)
+        rot_deg = float(rotation_y_deg)
+
+        result: Optional[ReachabilityResult] = None
+        if self._reach_enabled:
+            result = self._evaluate_reachability(target_pos, rot_deg)
+            if not result.reachable:
+                self.logger.warning(
+                    "Rejecting unreachable target %s rot=%.2f deg (closest=%s, "
+                    "pos_err=%.4fm, cond=%.1f, iters=%d)",
+                    np.round(target_pos, 4), rot_deg,
+                    np.round(result.closest_position, 4),
+                    result.pos_error_m, result.final_cond_number, result.iters,
+                )
+                return result
+
         with self._lock:
-            self._raw_target_position = np.array(position, dtype=np.float32)
-            self._raw_target_rotation_deg = float(rotation_y_deg)
+            self._raw_target_position = target_pos
+            self._raw_target_rotation_deg = rot_deg
         # We're about to actively command again
         self._outputs_zeroed = False
+        return result
 
-    def set_relative_control(self, enabled: bool, pos_gain: Optional[float] = None, rot_gain: Optional[float] = None) -> None:
-        """Enable/disable relative IK mode and optionally set gains.
+    def _evaluate_reachability(
+        self, target_pos: np.ndarray, rot_deg: float
+    ) -> ReachabilityResult:
+        """Run (or reuse a cached) reachability check for ``target_pos``."""
+        if (
+            self._last_reachability_result is not None
+            and self._last_validated_target is not None
+            and self._last_validated_rot_deg is not None
+            and self._last_reachability_result.reachable
+            and float(np.linalg.norm(target_pos - self._last_validated_target))
+            <= self._reach_min_target_delta
+            and abs(rot_deg - self._last_validated_rot_deg) <= 0.5
+        ):
+            return self._last_reachability_result
+
+        with self._lock:
+            cached_angles = getattr(self, '_current_joint_angles', None)
+            cached_quats = getattr(self, '_current_fk_quats', None)
+            current_angles = None if cached_angles is None else cached_angles.copy()
+            fk_quats = None if cached_quats is None else cached_quats.copy()
+        if current_angles is None and fk_quats is None:
+            # No state yet — can't simulate; allow command through.
+            self.logger.warning(
+                "Reachability check skipped because current joint state is unavailable; allowing target %s rot=%.2f deg",
+                np.round(target_pos, 4),
+                rot_deg,
+            )
+            return ReachabilityResult(
+                reachable=True,
+                closest_position=target_pos.copy(),
+                pos_error_m=0.0,
+                iters=0,
+                final_cond_number=0.0,
+            )
+
+        if current_angles is None:
+            current_angles = compute_relative_joint_angles(fk_quats, self.robot_config)
+        result = reachability_module.check_reachability(
+            self.ik_controller,
+            self.robot_config,
+            current_joint_angles=current_angles,
+            target_pos=target_pos,
+            target_rot_y_deg=rot_deg,
+            pos_tol=self._reach_pos_tol,
+            max_iters=self._reach_max_iters,
+            cond_threshold=self._cond_threshold,
+            dt=1.0 / float(self.config.control_frequency),
+        )
+        if result.reachable:
+            self._last_validated_target = target_pos.copy()
+            self._last_validated_rot_deg = rot_deg
+            self._last_reachability_result = result
+        return result
+
+    def get_last_reachability_result(self) -> Optional[ReachabilityResult]:
+        return self._last_reachability_result
+
+    def set_relative_control(self, enabled: bool) -> None:
+        """Enable/disable relative IK mode.
 
         Args:
             enabled: Whether to use relative mode (delta pose commands)
-            pos_gain: Fraction of position error to apply each step (optional)
-            rot_gain: Fraction of orientation error (axis-angle) to apply each step (optional)
         """
         self.ik_config.use_relative_mode = bool(enabled)
         # Reset IK internal buffers when toggling modes
@@ -733,10 +888,6 @@ class ExcavatorController:
             self.ik_controller.reset()
         except Exception:
             pass
-        if pos_gain is not None:
-            self._relative_pos_gain = float(pos_gain)
-        if rot_gain is not None:
-            self._relative_rot_gain = float(rot_gain)
 
     def clear_target(self) -> None:
         """Clear the current IK target and reset controller state.
@@ -764,16 +915,56 @@ class ExcavatorController:
             return self._current_position.copy(), self._current_orientation_y_deg
 
     def get_joint_angles(self) -> np.ndarray:
-        """Get current joint angles in degrees (computed from quaternions)."""
-        with self._lock:
-            if self._current_projected_quats is None:
-                return np.zeros(4, dtype=np.float32)
+        """Get current relative joint angles in degrees.
 
-            joint_angles = np.array([
-                diff_ik.extract_axis_rotation(q, axis)
-                for q, axis in zip(self._current_projected_quats, self.robot_config.rotation_axes)
-            ])
-            return np.degrees(joint_angles)
+        Returns angles relative to each joint's parent link, matching what
+        URDF viewers expect for ``setJointValue``.
+        """
+        with self._lock:
+            if self._current_joint_angles is None:
+                return np.zeros(4, dtype=np.float32)
+            joint_angles = self._current_joint_angles.copy()
+
+        return np.degrees(joint_angles)
+
+    def get_absolute_link_angles(self) -> np.ndarray:
+        """Per-sensor absolute pitch in degrees after mounting correction.
+
+        This is the direct inclinometer-style readout for each configured IMU
+        role: base/boom/arm/bucket pitch against gravity. It is not projected
+        through the excavator FK model and is not relative to parent links.
+        """
+        with self._lock:
+            if self._current_sensor_quats is None:
+                return np.zeros(4, dtype=np.float32)
+            quats = self._current_sensor_quats.copy()
+
+        return np.degrees(np.array([
+            gravity_pitch_from_quat(q) for q in quats
+        ], dtype=np.float32))
+
+    def get_fk_quaternions(self) -> Optional[np.ndarray]:
+        """Get latest canonical absolute link quaternions [slew, boom, arm, bucket].
+
+        These are rebuilt from the canonical joint state and are safe to
+        feed into FK/debug visualization. They are not the raw physical IMU quats.
+        """
+        with self._lock:
+            if self._current_fk_quats is None:
+                return None
+            return np.array(self._current_fk_quats, dtype=np.float32, copy=True)
+
+    def get_condition_number(self) -> float:
+        """Get the Jacobian condition number from the last IK solve."""
+        return float(self.ik_controller.last_condition_number)
+
+    def get_yoshikawa_index(self) -> float:
+        """Yoshikawa manipulability index from the last IK solve."""
+        return float(self.ik_controller.last_yoshikawa_index)
+
+    def get_singular_values(self) -> np.ndarray:
+        """Jacobian singular values (4-element float32) from the last IK solve."""
+        return self.ik_controller.last_singular_values.copy()
 
     def get_hardware_status(self) -> dict:
         """Get hardware status including all ADC channels for logging."""
@@ -785,7 +976,7 @@ class ExcavatorController:
         Returns dict with:
         - Loop timing: avg/std/min/max/p95/p99 in ms
         - Compute timing: avg/std/min/max in ms
-        - Headroom and CPU usage
+        - Headroom, loop utilization, and whole-process CPU usage
         - Stage timings (sensor, ik_fk, pwm)
         - IK telemetry (velocity limits, joint velocities)
         - Hardware stats (IMU/ADC/PWM rates)
@@ -806,10 +997,30 @@ class ExcavatorController:
                 'min_compute_time_ms': 0.0,
                 'max_compute_time_ms': 0.0,
                 'std_compute_time_ms': 0.0,
+                'max_step_ms': 0.0,
                 'avg_headroom_ms': 0.0,
                 'cpu_usage_pct': 0.0,
+                'loop_util_pct': 0.0,
+                'process_cpu_pct': 0.0,
                 'actual_hz': 0.0,
                 'violation_pct': 0.0,
+                'violation_count': 0,
+                'compute_overrun_pct': 0.0,
+                'compute_overrun_count': 0,
+                'compute_overrun_count_recent': 0,
+                'compute_overrun_pct_recent': 0.0,
+                'deadline_miss_count': 0,
+                'deadline_miss_pct': 0.0,
+                'deadline_miss_count_recent': 0,
+                'deadline_miss_pct_recent': 0.0,
+                'deadline_miss_1pct_count': 0,
+                'deadline_miss_1pct_pct': 0.0,
+                'deadline_miss_1pct_count_recent': 0,
+                'deadline_miss_1pct_pct_recent': 0.0,
+                'deadline_window_sec': 0.0,
+                'overrun_count_recent': 0,
+                'overrun_pct_recent': 0.0,
+                'overrun_window_sec': 0.0,
                 'sample_count': 0,
                 # Stage timings
                 'avg_sensor_ms': 0.0, 'min_sensor_ms': 0.0, 'max_sensor_ms': 0.0,
@@ -819,6 +1030,13 @@ class ExcavatorController:
                 'ik_vel_lim_enabled': bool(getattr(self.ik_config, 'enable_velocity_limiting', False)),
                 'last_joint_vel_degps': [] if self._last_joint_vel_radps is None else list(np.degrees(self._last_joint_vel_radps)),
                 'effective_vel_cap_degps': [],
+                'gyro_velocity_mode': self._gyro_velocity_mode,
+                'joint_velocity_source': self._last_joint_vel_source,
+                'gyro_fallback_count': int(self._gyro_fallback_counter),
+                'slew_fusion_enabled': False,
+                'slew_fusion_active': False,
+                'slew_fusion_gyro_z_degps': 0.0,
+                'slew_fusion_alpha': 0.0,
             }
         else:
             # Map tracker stats to expected output format
@@ -836,15 +1054,34 @@ class ExcavatorController:
                 'std_loop_time_ms': tracker_stats.get('loop_std_ms', 0.0),
                 'jitter_p95_ms': tracker_stats.get('loop_p95_ms', 0.0),
                 'jitter_p99_ms': tracker_stats.get('loop_p99_ms', 0.0),
+                'max_step_ms': tracker_stats.get('max_step_ms', 0.0),
                 'avg_compute_time_ms': tracker_stats.get('compute_avg_ms', 0.0),
                 'min_compute_time_ms': tracker_stats.get('compute_min_ms', 0.0),
                 'max_compute_time_ms': tracker_stats.get('compute_max_ms', 0.0),
                 'std_compute_time_ms': tracker_stats.get('compute_std_ms', 0.0),
                 'avg_headroom_ms': tracker_stats.get('headroom_avg_ms', 0.0),
                 'cpu_usage_pct': tracker_stats.get('cpu_usage_pct', 0.0),
+                'loop_util_pct': tracker_stats.get('loop_util_pct', tracker_stats.get('cpu_usage_pct', 0.0)),
+                'process_cpu_pct': tracker_stats.get('process_cpu_pct', 0.0),
                 'actual_hz': actual_hz,
                 'violation_pct': tracker_stats.get('violation_pct', 0.0),
                 'violation_count': tracker_stats.get('violation_count', 0),
+                'compute_overrun_pct': tracker_stats.get('compute_overrun_pct', tracker_stats.get('violation_pct', 0.0)),
+                'compute_overrun_count': tracker_stats.get('compute_overrun_count', tracker_stats.get('violation_count', 0)),
+                'compute_overrun_count_recent': tracker_stats.get('compute_overrun_count_recent', 0),
+                'compute_overrun_pct_recent': tracker_stats.get('compute_overrun_pct_recent', 0.0),
+                'deadline_miss_count': tracker_stats.get('deadline_miss_count', 0),
+                'deadline_miss_pct': tracker_stats.get('deadline_miss_pct', 0.0),
+                'deadline_miss_count_recent': tracker_stats.get('deadline_miss_count_recent', tracker_stats.get('overrun_count_recent', 0)),
+                'deadline_miss_pct_recent': tracker_stats.get('deadline_miss_pct_recent', tracker_stats.get('overrun_pct_recent', 0.0)),
+                'deadline_miss_1pct_count': tracker_stats.get('deadline_miss_1pct_count', 0),
+                'deadline_miss_1pct_pct': tracker_stats.get('deadline_miss_1pct_pct', 0.0),
+                'deadline_miss_1pct_count_recent': tracker_stats.get('deadline_miss_1pct_count_recent', 0),
+                'deadline_miss_1pct_pct_recent': tracker_stats.get('deadline_miss_1pct_pct_recent', 0.0),
+                'deadline_window_sec': tracker_stats.get('deadline_window_sec', tracker_stats.get('overrun_window_sec', 0.0)),
+                'overrun_count_recent': tracker_stats.get('overrun_count_recent', 0),
+                'overrun_pct_recent': tracker_stats.get('overrun_pct_recent', 0.0),
+                'overrun_window_sec': tracker_stats.get('overrun_window_sec', 0.0),
                 'sample_count': tracker_stats.get('samples', 0),
                 # Stage timings
                 'avg_sensor_ms': sensor_stats.get('avg_ms', 0.0),
@@ -856,6 +1093,13 @@ class ExcavatorController:
                 'avg_pwm_ms': pwm_stats.get('avg_ms', 0.0),
                 'min_pwm_ms': pwm_stats.get('min_ms', 0.0),
                 'max_pwm_ms': pwm_stats.get('max_ms', 0.0),
+                'gyro_velocity_mode': self._gyro_velocity_mode,
+                'joint_velocity_source': self._last_joint_vel_source,
+                'gyro_fallback_count': int(self._gyro_fallback_counter),
+                'slew_fusion_enabled': False,
+                'slew_fusion_active': False,
+                'slew_fusion_gyro_z_degps': 0.0,
+                'slew_fusion_alpha': 0.0,
             }
 
             # Add IK limiter telemetry in deg/s for easier interpretation
@@ -904,6 +1148,27 @@ class ExcavatorController:
         if hasattr(self.ik_controller, 'verbose'):
             self.ik_controller.verbose = ik_verbose
 
+    def set_velocity_mode(self, mode: str) -> None:
+        """Set joint velocity estimation mode: 'fd_only', 'gyro_only', or 'fused'."""
+        valid = ('fd_only', 'gyro_only', 'fused')
+        mode = mode.strip().lower()
+        if mode not in valid:
+            raise ValueError(f"velocity mode must be one of {valid}, got {mode!r}")
+        if mode == self._gyro_velocity_mode:
+            return
+        self._gyro_velocity_mode = mode
+        self._last_gyro_device_ts_us = None
+        self._last_gyro_wall_t = None
+        self._gyro_fallback_counter = 0
+        self._gyro_bias_radps = np.zeros(3, dtype=np.float32)
+        self.logger.info("Joint velocity mode set to %s", mode)
+
+    def get_joint_velocities_with_age(self) -> tuple:
+        """Return (velocities_degps, age_s). age=inf if never computed."""
+        if self._last_joint_vel_radps is None or self._last_joint_vel_time is None:
+            return None, float('inf')
+        return list(np.degrees(self._last_joint_vel_radps)), time.perf_counter() - self._last_joint_vel_time
+
     def get_last_pid_outputs(self):
         """Return last per-joint PID outputs [slew, boom, arm, bucket] or None if not captured."""
         return None if self._last_pi_outputs is None else list(self._last_pi_outputs)
@@ -920,13 +1185,13 @@ class ExcavatorController:
             self._direct_commands = {}
         for pid in self.joint_pids:
             pid.reset()
-        self._direct_mode = True
+        with self._lock:
+            self._direct_mode = True
         self._outputs_zeroed = False
         self.logger.info("Entered direct control mode")
 
     def exit_direct_mode(self) -> None:
         """Switch back to IK mode, syncing targets to current measured pose."""
-        self._direct_mode = False
         with self._direct_lock:
             self._direct_commands = {}
 
@@ -949,6 +1214,8 @@ class ExcavatorController:
         # Set raw target to current pose so give_pose() starts from reality
         self.give_pose(self._current_position, self._current_orientation_y_deg)
 
+        with self._lock:
+            self._direct_mode = False
         self._outputs_zeroed = False
         self.logger.info("Exited direct control mode (synced to measured pose)")
 
@@ -982,6 +1249,7 @@ class ExcavatorController:
         return {
             'adaptive_lambda': float(self.ik_controller.last_adaptive_lambda),
             'condition_number': float(self.ik_controller.last_condition_number),
+            'cond_reject_count': self._cond_reject_count,
         }
 
     def get_joint_velocities_degps(self):
@@ -989,6 +1257,120 @@ class ExcavatorController:
         if self._last_joint_vel_radps is None:
             return None
         return list(np.degrees(self._last_joint_vel_radps))
+
+    def _compute_fd_joint_velocity(self, current_joint_angles: np.ndarray, now_t: float) -> Optional[np.ndarray]:
+        """Estimate joint velocity from finite-difference angle derivative (rad/s)."""
+        fd_joint_vel = None
+        if self._prev_joint_angles is not None and self._prev_joint_time is not None:
+            dtj = max(1e-6, now_t - self._prev_joint_time)
+            fd_joint_vel = (current_joint_angles - self._prev_joint_angles) / dtj
+        self._prev_joint_angles = current_joint_angles.copy()
+        self._prev_joint_time = now_t
+        return fd_joint_vel
+
+    def _compute_gyro_joint_velocity(self, now_t: float) -> Optional[np.ndarray]:
+        """Estimate joint velocity from IMU gyro and project to joint axes (rad/s)."""
+        if self._gyro_velocity_mode == 'fd_only':
+            return None
+
+        payload = None
+        try:
+            if self._hw_has_try_read_imu_gyro:
+                payload = self.hardware.try_read_imu_gyro()
+            else:
+                gyro = self.hardware.read_imu_gyro()
+                if gyro is not None:
+                    payload = {'gyro': gyro, 'device_timestamp_us': None}
+        except Exception:
+            payload = None
+
+        if not payload:
+            return None
+
+        gyro_packets = payload.get('gyro')
+        if gyro_packets is None or len(gyro_packets) < 3:
+            return None
+
+        dev_ts = payload.get('device_timestamp_us')
+        if isinstance(dev_ts, (int, float)):
+            if self._last_gyro_device_ts_us != dev_ts:
+                self._last_gyro_device_ts_us = dev_ts
+                self._last_gyro_wall_t = now_t
+            elif self._last_gyro_wall_t is not None and self._gyro_timeout_s > 0.0:
+                if (now_t - self._last_gyro_wall_t) > self._gyro_timeout_s:
+                    return None
+
+        joint_rates = self._gyro_joint_rates
+        joint_rates[:] = 0.0
+        for i in range(3):
+            gyro_vec_dps = np.asarray(gyro_packets[i], dtype=np.float32)
+            gyro_vec_rad = np.radians(gyro_vec_dps)
+
+            axis = self.robot_config.rotation_axes[i + 1]
+            axis_norm = axis / (np.linalg.norm(axis) + 1e-12)
+            joint_rates[i] = float(np.dot(gyro_vec_rad, axis_norm))
+
+        if self._gyro_bias_enabled:
+            if np.max(np.abs(joint_rates)) <= self._gyro_bias_stationarity_radps:
+                k = self._gyro_bias_adaptation_rate
+                self._gyro_bias_radps = (1.0 - k) * self._gyro_bias_radps + k * joint_rates
+            joint_rates = joint_rates - self._gyro_bias_radps
+
+        joint_rates = np.clip(joint_rates, -self._gyro_max_abs_radps, self._gyro_max_abs_radps)
+
+        out = np.zeros(4, dtype=np.float32)
+        out[1:] = joint_rates
+        return out
+
+    def _select_joint_velocity(
+        self,
+        fd_joint_vel: Optional[np.ndarray],
+        gyro_joint_vel: Optional[np.ndarray]
+    ) -> Optional[np.ndarray]:
+        """Select/control fusion of joint velocity estimate by configured mode."""
+        mode = self._gyro_velocity_mode
+
+        if mode == 'fd_only':
+            self._last_joint_vel_source = 'fd'
+            return None if fd_joint_vel is None else fd_joint_vel.astype(np.float32)
+
+        if gyro_joint_vel is None:
+            self._gyro_fallback_counter += 1
+            if self._gyro_fallback_counter % 200 == 1:
+                self.logger.warning("Gyro velocity unavailable; falling back to finite-difference estimate")
+            self._last_joint_vel_source = 'fd_fallback'
+            return None if fd_joint_vel is None else fd_joint_vel.astype(np.float32)
+
+        # Gyro provides boom/arm/bucket; slew remains finite-difference based.
+        out = np.zeros(4, dtype=np.float32)
+        if fd_joint_vel is not None:
+            out[:] = fd_joint_vel
+        elif self._last_joint_vel_radps is not None:
+            out[:] = self._last_joint_vel_radps
+
+        if mode == 'gyro_only':
+            out[1:] = gyro_joint_vel[1:]
+            self._last_joint_vel_source = 'gyro'
+            return out
+
+        alpha = self._gyro_blend_alpha
+        if fd_joint_vel is None:
+            out[1:] = gyro_joint_vel[1:]
+            self._last_joint_vel_source = 'gyro_fallback'
+            return out
+
+        out[1:] = alpha * gyro_joint_vel[1:] + (1.0 - alpha) * fd_joint_vel[1:]
+        self._last_joint_vel_source = 'fused'
+        return out
+
+    def _update_joint_velocity_estimate(self, current_joint_angles: np.ndarray, now_t: float) -> None:
+        """Update joint velocity telemetry/control estimate from current state and IMU gyro."""
+        fd_joint_vel = self._compute_fd_joint_velocity(current_joint_angles, now_t)
+        gyro_joint_vel = self._compute_gyro_joint_velocity(now_t=now_t)
+        selected_joint_vel = self._select_joint_velocity(fd_joint_vel, gyro_joint_vel)
+        if selected_joint_vel is not None:
+            self._last_joint_vel_radps = selected_joint_vel
+            self._last_joint_vel_time = now_t
 
     def reset_performance_stats(self) -> None:
         """Reset performance statistics."""
@@ -999,32 +1381,45 @@ class ExcavatorController:
         except Exception:
             pass
 
-    def _get_raw_quaternions(self) -> Optional[np.ndarray]:
+    def _get_sensor_quaternions(self) -> Optional[np.ndarray]:
         """
-        Read raw sensor data and combine into quaternion array.
+        Read corrected configured IMU sensor data.
 
         Returns:
-            Raw quaternions [slew, boom, arm, bucket] or None if hardware not ready
+            Corrected physical IMU quaternions in configured role order, or None if hardware not ready
         """
         try:
-            # Read IMU data (3 IMUs: boom, arm, bucket)
-            quaternions = self.hardware.read_imu_data()
-            if quaternions is None or len(quaternions) != 3:
+            quaternions = self.hardware.read_all_imu_quaternions()
+            if quaternions is None or len(quaternions) == 0:
                 return None
-
-            # Read slew quaternion directly from encoder (already computed in hardware)
-            slew_quat = self.hardware.read_slew_quaternion()
-
-            # Combine: [slew] + [boom, arm, bucket]
-            all_quaternions = np.array([slew_quat] + quaternions, dtype=np.float32)
-
-            return all_quaternions
+            return np.array(quaternions, dtype=np.float32)
 
         except Exception as e:
             self.logger.error(f"Error reading quaternions: {e}")
             return None
 
     def _control_loop(self) -> None:
+        if self._rt_priority > 0 or self._rt_lock_memory or self._rt_cpu_core is not None:
+            cpu_affinity = None if self._rt_cpu_core is None else {int(self._rt_cpu_core)}
+            success = apply_rt_to_thread(
+                priority=self._rt_priority,
+                policy=SCHED_FIFO,
+                lock_memory=self._rt_lock_memory,
+                cpu_affinity=cpu_affinity,
+                quiet=False,
+            )
+            if success:
+                details = []
+                if self._rt_priority > 0:
+                    details.append(f"SCHED_FIFO-{self._rt_priority}")
+                if self._rt_lock_memory:
+                    details.append("mlockall")
+                if self._rt_cpu_core is not None:
+                    details.append(f"core {self._rt_cpu_core}")
+                self.logger.info("Control thread: applied %s", ", ".join(details) if details else "RT settings")
+            else:
+                self.logger.warning("Control thread: Failed to apply requested RT settings")
+
         loop_period = 1.0 / self.config.control_frequency
         next_run_time = time.perf_counter()
         last_loop_start = next_run_time
@@ -1053,7 +1448,10 @@ class ExcavatorController:
                 self._update_current_state()
                 self._perf_tracker.stage_end('sensor')
 
-                if self._direct_mode:
+                with self._lock:
+                    direct_mode = self._direct_mode
+
+                if direct_mode:
                     # Direct mode: bypass smoothing, IK, and PID
                     self._perf_tracker.stage_start('pwm')
                     self._send_direct_commands()
@@ -1094,34 +1492,46 @@ class ExcavatorController:
     def _update_current_state(self) -> None:
         """Update current robot state from sensors."""
         try:
-            # Get raw quaternions from sensors
-            raw_quats = self._get_raw_quaternions()
-            if raw_quats is None:
+            # Get corrected physical IMU quaternions in configured role order.
+            sensor_quats = self._get_sensor_quaternions()
+            if sensor_quats is None:
+                # Invalidate stale cached state so _compute_control_commands()
+                # cannot proceed with old data while sensors are unavailable.
+                with self._lock:
+                    self._current_projected_quats = None
+                    self._current_fk_quats = None
+                    self._current_joint_angles = None
                 return
 
-            # Compute forward kinematics - get_pose() handles full pipeline
-            ee_pos, ee_quat = diff_ik.get_pose(raw_quats, self.robot_config)
+            # Convert sensor quats once into canonical relative joint angles.
+            joint_angles = canonical_joint_angles_from_imus(sensor_quats, self.robot_config)
+            joint_quats = joint_angles_to_absolute_quaternions(joint_angles, self.robot_config)
+            ee_pos, ee_quat = get_pose_from_joint_angles(joint_angles, self.robot_config)
 
-            # Also compute processed quaternions for joint angle extraction in control commands
-            corrected_quats = diff_ik.apply_imu_offsets(raw_quats, self.robot_config)
-            projected_quats = diff_ik.project_to_rotation_axes(corrected_quats, self.robot_config.rotation_axes)
-            propagated_quats = diff_ik.propagate_base_rotation(projected_quats, self.robot_config)
-
-            # Extract Y-axis rotation for end-effector orientation
+            # Extract Y-axis rotation for end-effector orientation in body frame.
+            # Remove slew (Z-axis) rotation so pitch is relative to the upper body,
+            # not the world frame.  This keeps the reported pitch independent of
+            # the excavator's heading.
             y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            ee_y_angle_rad = diff_ik.extract_axis_rotation(ee_quat, y_axis)
+            slew_quat_inv = quat_conjugate(joint_quats[0])
+            ee_quat_body = quat_normalize(quat_multiply(slew_quat_inv, ee_quat))
+            ee_y_angle_rad = extract_axis_rotation(ee_quat_body, y_axis)
             ee_y_angle_deg = np.degrees(ee_y_angle_rad)
 
             # Update shared state
             with self._lock:
                 self._current_position = ee_pos
                 self._current_orientation_y_deg = ee_y_angle_deg
-                self._current_projected_quats = propagated_quats  # Cache processed quats for control
-                self._current_raw_quats = raw_quats
+                self._current_projected_quats = joint_quats
+                self._current_fk_quats = joint_quats
+                self._current_sensor_quats = sensor_quats
+                self._current_joint_angles = joint_angles
                 self._current_ee_quat_full = ee_quat
 
-            # Update simple EE velocity estimates for smoother seeding
             now_t = time.perf_counter()
+            self._update_joint_velocity_estimate(joint_angles, now_t)
+
+            # Update simple EE velocity estimates for smoother seeding
             if self._prev_pose_time is not None:
                 dt = max(1e-6, now_t - self._prev_pose_time)
                 pos_delta = ee_pos - (self._prev_pose if self._prev_pose is not None else ee_pos)
@@ -1147,6 +1557,7 @@ class ExcavatorController:
             current_rot = float(self._current_orientation_y_deg)
             lin_vel = self._current_linear_velocity
             rot_vel = self._current_rot_velocity_degps
+            fk_quats = self._current_fk_quats
 
         if raw_pos is None or raw_rot is None:
             with self._lock:
@@ -1168,8 +1579,17 @@ class ExcavatorController:
             dt=loop_dt
         )
 
-        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        smoothed_quat = quat_from_axis_angle(y_axis, np.radians(smoothed_rot))
+        # Build target orientation: pitch is in body frame, so compose with
+        # the current slew rotation to express it in world frame.
+        # This ensures the target quaternion's yaw always matches the robot's
+        # actual slew yaw — the IK sees zero yaw error by construction.
+        # TODO: add orientation_mode here (pitch_follows_slew / full_pose) for tool orientation support.
+        pitch_quat = quat_from_axis_angle(_Y_AXIS, np.radians(smoothed_rot))
+        if fk_quats is not None:
+            slew_quat = fk_quats[0]
+            smoothed_quat = quat_normalize(quat_multiply(slew_quat, pitch_quat))
+        else:
+            smoothed_quat = pitch_quat
 
         with self._lock:
             self._target_position = smoothed_pos.astype(np.float32)
@@ -1191,15 +1611,15 @@ class ExcavatorController:
                 target_pos = self._target_position.copy()
                 target_quat = self._target_orientation.copy()
                 current_pos = self._current_position.copy()
-                raw_quats = self._current_raw_quats
+                joint_angles = None if self._current_joint_angles is None else self._current_joint_angles.copy()
+                joint_quats = self._current_fk_quats
                 current_ee_quat_full = self._current_ee_quat_full
                 target_lin_vel = self._target_linear_velocity.copy()
                 target_rot_vel_dps = float(self._target_rot_velocity_dps)
 
-            # Extract current joint angles using V2 helper (relative angles)
-            if raw_quats is None:
+            if joint_angles is None or joint_quats is None:
                 return
-            current_joint_angles = diff_ik.compute_relative_joint_angles(raw_quats, self.robot_config)
+            current_joint_angles = joint_angles
 
             # Outer Loop: Task-space IK control
             # Note: Using current_ee_quat_full (including Z-rotation from slew) for IK.
@@ -1208,18 +1628,15 @@ class ExcavatorController:
             if self.ik_config.use_relative_mode:
                 # Compute error w.r.t target
                 if self.ik_config.command_type == "position":
-                    pos_err = (target_pos - current_pos)
-                    delta_pos = self._relative_pos_gain * pos_err
-                    self.ik_controller.set_command(delta_pos, ee_pos=current_pos, ee_quat=current_ee_quat_full)
+                    pos_err = target_pos - current_pos
+                    self.ik_controller.set_command(pos_err, ee_pos=current_pos, ee_quat=current_ee_quat_full)
                 else:
                     # Pose: 6D delta [dx, dy, dz, rx, ry, rz]
                     # Orientation locks are now applied internally by IK controller
-                    pos_err, axis_angle_err = diff_ik.compute_pose_error(
+                    pos_err, axis_angle_err = compute_pose_error(
                         current_pos, current_ee_quat_full, target_pos, target_quat
                     )
-                    delta_pos = self._relative_pos_gain * pos_err
-                    delta_rot = self._relative_rot_gain * axis_angle_err
-                    delta_pose = np.concatenate([delta_pos, delta_rot])
+                    delta_pose = np.concatenate([pos_err, axis_angle_err])
                     self.ik_controller.set_command(delta_pose, ee_pos=current_pos, ee_quat=current_ee_quat_full)
             else:
                 if self.ik_config.command_type == "position":
@@ -1233,11 +1650,11 @@ class ExcavatorController:
                     self.ik_controller.set_command(pose_command)
 
             desired_vel = None
-            if getattr(self.ik_config, "velocity_mode", False):
+            if self._ik_velocity_mode_enabled:
                 if self.ik_config.command_type == "position":
                     desired_vel = target_lin_vel
                 else:
-                    if getattr(self.ik_config, "use_rotational_velocity", True):
+                    if self._ik_use_rotational_velocity:
                         rot_vel_rad_s = np.radians(target_rot_vel_dps)
                         desired_vel = np.concatenate([
                             target_lin_vel,
@@ -1250,9 +1667,10 @@ class ExcavatorController:
                 ee_pos=current_pos,
                 ee_quat=current_ee_quat_full,  # Full orientation incl. slew yaw
                 joint_angles=current_joint_angles,
-                joint_quats=raw_quats,  # Pass raw IMU quats; V2 handles offsets/propagation
+                joint_quats=joint_quats,
                 desired_ee_velocity=desired_vel,
                 dt=loop_dt,
+                current_joint_velocities=self._last_joint_vel_radps,
             )
 
             # DEBUG: Periodic IK output check (every ~1 second at 50Hz)
@@ -1282,33 +1700,28 @@ class ExcavatorController:
                 self._outputs_zeroed = True
             return
 
-        def angle_error(target, current):
-            return np.arctan2(np.sin(target - current), np.cos(target - current))
+        # Reject commands when Jacobian is near-singular (just skip, don't reset hardware)
+        if self._cond_threshold > 0 and self.ik_controller.last_condition_number > self._cond_threshold:
+            self._cond_reject_count += 1
+            if self._cond_reject_count % 200 == 1:
+                self.logger.warning(
+                    f"Condition number {self.ik_controller.last_condition_number:.1f} "
+                    f"exceeds threshold {self._cond_threshold:.1f}, skipping IK output"
+                )
+            return
 
-        # Inner Loop: Joint-space PID control
-        pi_outputs = []
-        for pid, target_angle, current_angle in zip(
-                self.joint_pids, target_joint_angles, current_joint_angles
+        # Inner Loop: Joint-space PID — fills pre-allocated buffer in-place.
+        pi_outputs = self._pi_outputs
+        for i, (pid, target_angle, current_angle) in enumerate(
+                zip(self.joint_pids, target_joint_angles, current_joint_angles)
         ):
-            error = angle_error(target_angle, current_angle)
-            output = pid.compute(0.0, -error, dt=loop_dt)  # setpoint=0, measurement=-error
-            pi_outputs.append(output)
+            pi_outputs[i] = pid.compute(0.0, -_angle_error(target_angle, current_angle), dt=loop_dt)
 
-        # Prefer name-based commands to avoid fragile indexing
-        named_commands = {
-            'scoop': pi_outputs[3],      # bucket
-            'lift_boom': pi_outputs[1],  # boom
-            'rotate': pi_outputs[0],     # slew
-            'tilt_boom': pi_outputs[2],  # arm
-        }
-
-        # Always update joint velocity estimate (rad/s)
-        now_t = time.perf_counter()
-        if self._prev_joint_angles is not None and self._prev_joint_time is not None:
-            dtj = max(1e-6, now_t - self._prev_joint_time)
-            self._last_joint_vel_radps = (current_joint_angles - self._prev_joint_angles) / dtj
-        self._prev_joint_angles = current_joint_angles.copy()
-        self._prev_joint_time = now_t
+        self._named_commands['scoop']     = float(pi_outputs[3])  # bucket
+        self._named_commands['lift_boom'] = float(pi_outputs[1])  # boom
+        self._named_commands['rotate']    = float(pi_outputs[0])  # slew
+        self._named_commands['tilt_boom'] = float(pi_outputs[2])  # arm
+        named_commands = self._named_commands
 
         # Debug telemetry capture (always enabled for get_last_* methods)
         self._last_pi_outputs = list(pi_outputs)

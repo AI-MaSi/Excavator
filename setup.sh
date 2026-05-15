@@ -61,7 +61,7 @@ dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=16,i2c_gpio_scl=19,i2c_gpio_delay_us=1
 dtoverlay=i2c-gpio,bus=4,i2c_gpio_sda=20,i2c_gpio_scl=21
 EOF
 
-echo "  OK: Virtual I2C bus 3 (GPIO 18/19, 200kHz) - ADC"
+echo "  OK: Virtual I2C bus 3 (GPIO 16/19, 200kHz) - ADC"
 echo "  OK: Virtual I2C bus 4 (GPIO 20/21, 100kHz) - OLED"
 
 # --- System packages ---
@@ -150,9 +150,9 @@ echo "  Setup Complete!"
 echo "========================================"
 echo ""
 echo "I2C Buses:"
-echo "  Bus 1: Hardware (GPIO 2/3)   - 1MHz    - IMU/Sensors"
-echo "  Bus 3: Virtual  (GPIO 18/19) - 200kHz  - ADC"
-echo "  Bus 4: Virtual  (GPIO 20/21) - 100kHz  - OLED"
+echo "  Bus 1: Hardware (GPIO 2/3)   - 1MHz    - PCA9685 PWM @ 0x40"
+echo "  Bus 3: Virtual  (GPIO 16/19) - 200kHz  - ADCPi @ 0x68/0x69"
+echo "  Bus 4: Virtual  (GPIO 20/21) - 100kHz  - OLED @ 0x3D"
 echo ""
 echo "OLED Wiring (corner pins 38-40):"
 echo "  Pin 38 (GPIO 20) -> SDA"

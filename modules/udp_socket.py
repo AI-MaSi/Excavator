@@ -17,7 +17,8 @@ class UDPSocket:
     - Configurable timeout for safety
     """
 
-    def __init__(self, local_id=0, max_age_seconds=0.5, data_format: str = 'b', hmac_key: Optional[str] = None):
+    def __init__(self, local_id=0, max_age_seconds=0.5, data_format: str = 'b', hmac_key: Optional[str] = None,
+                 nominal_rate_hz: Optional[float] = None):
         self.socket = None
         self.remote_addr = None
         self.local_id = local_id
@@ -26,6 +27,8 @@ class UDPSocket:
         self.max_age_seconds = max_age_seconds
         self.data_format = data_format
         self._elem_size = 1
+        self.nominal_rate_hz = float(nominal_rate_hz) if nominal_rate_hz is not None else None
+        self.remote_nominal_rate_hz: Optional[float] = None
 
         # For receiving data
         self.latest_data = None
@@ -80,6 +83,21 @@ class UDPSocket:
         self.recv_format = f'<I{self.num_inputs}{self.data_format}'
 
         return True
+
+    def set_nominal_rate_hz(self, nominal_rate_hz: Optional[float]):
+        """Set local nominal application send/update rate advertised in handshake."""
+        self.nominal_rate_hz = float(nominal_rate_hz) if nominal_rate_hz is not None else None
+
+    def get_handshake_info(self) -> dict:
+        """Return local/remote handshake metadata."""
+        return {
+            'local_id': self.local_id,
+            'local_nominal_rate_hz': self.nominal_rate_hz,
+            'remote_addr': self.remote_addr,
+            'remote_nominal_rate_hz': self.remote_nominal_rate_hz,
+            'max_age_seconds': self.max_age_seconds,
+            'data_format': self.data_format,
+        }
 
     # ================================
     # Conversion helpers (int <-> float)
@@ -137,23 +155,38 @@ class UDPSocket:
         return self.send(UDPSocket.floats_to_ints(values))
 
     def handshake(self, timeout=5.0):
-        """Enhanced handshake that includes max_age_seconds and data format."""
-        # Pack: [id, num_outputs, num_inputs, format_code] + max_age_ms
+        """Enhanced handshake that includes max_age_seconds, format, and nominal rate."""
+        # Base pack: [id, num_outputs, num_inputs, format_code] + max_age_ms
+        # Optional extension: nominal_rate_cHz (uint16, rate * 100)
         max_age_ms = int(self.max_age_seconds * 1000)
         fmt_code = ord(self.data_format)
-        our_info = struct.pack('<4BH',
-                               self.local_id,
-                               self.num_outputs,
-                               self.num_inputs,
-                               fmt_code,  # Data format (ASCII code)
-                               max_age_ms)
+        if self.nominal_rate_hz is not None and self.nominal_rate_hz > 0:
+            nominal_rate_c_hz = max(0, min(65535, int(round(self.nominal_rate_hz * 100.0))))
+            our_info = struct.pack(
+                '<4BHH',
+                self.local_id,
+                self.num_outputs,
+                self.num_inputs,
+                fmt_code,
+                max_age_ms,
+                nominal_rate_c_hz,
+            )
+        else:
+            our_info = struct.pack(
+                '<4BH',
+                self.local_id,
+                self.num_outputs,
+                self.num_inputs,
+                fmt_code,
+                max_age_ms,
+            )
 
         if self.remote_addr:  # Client mode
             self.socket.sendto(our_info, self.remote_addr)
 
             self.socket.settimeout(timeout)
             try:
-                data, addr = self.socket.recvfrom(6)
+                data, addr = self.socket.recvfrom(8)
                 self.remote_addr = addr
             except socket.timeout:
                 print("Handshake timeout!")
@@ -162,7 +195,7 @@ class UDPSocket:
             print("Waiting for handshake...")
             self.socket.settimeout(timeout)
             try:
-                data, addr = self.socket.recvfrom(6)
+                data, addr = self.socket.recvfrom(8)
                 self.remote_addr = addr
                 self.socket.sendto(our_info, self.remote_addr)
             except socket.timeout:
@@ -170,7 +203,15 @@ class UDPSocket:
                 return False
 
         # Verify match
-        remote_id, remote_outputs, remote_inputs, remote_fmt_code, remote_max_age_ms = struct.unpack('<4BH', data)
+        if len(data) >= 8:
+            remote_id, remote_outputs, remote_inputs, remote_fmt_code, remote_max_age_ms, remote_rate_c_hz = struct.unpack('<4BHH', data[:8])
+            self.remote_nominal_rate_hz = remote_rate_c_hz / 100.0 if remote_rate_c_hz > 0 else None
+        elif len(data) >= 6:
+            remote_id, remote_outputs, remote_inputs, remote_fmt_code, remote_max_age_ms = struct.unpack('<4BH', data[:6])
+            self.remote_nominal_rate_hz = None
+        else:
+            print(f"Handshake packet too short: {len(data)} bytes")
+            return False
         remote_format = chr(remote_fmt_code) if remote_fmt_code != 0 else 'b'
 
         if remote_inputs != self.num_outputs:
@@ -183,7 +224,8 @@ class UDPSocket:
             print(f"Mismatch: They use format '{remote_format}', we use '{self.data_format}'")
             return False
 
-        print(f"Handshake OK with device ID {remote_id} (max_age: {remote_max_age_ms}ms, format: {remote_format})")
+        rate_msg = f", rate: {self.remote_nominal_rate_hz:.2f}Hz" if self.remote_nominal_rate_hz is not None else ""
+        print(f"Handshake OK with device ID {remote_id} (max_age: {remote_max_age_ms}ms, format: {remote_format}{rate_msg})")
         self.socket.settimeout(1.0)
         return True
 
@@ -232,7 +274,7 @@ class UDPSocket:
                 return None
 
             # Check if data is too old
-            age = time.time() - self.latest_timestamp
+            age = time.monotonic() - self.latest_timestamp
             if age > self.max_age_seconds:
                 self.packets_expired += 1
                 #if self.packets_expired % 10 == 1:  # Log every 10th expiration
@@ -244,7 +286,7 @@ class UDPSocket:
     def get_connection_stats(self) -> dict:
         """Get connection statistics for monitoring."""
         with self.data_lock:
-            current_time = time.time()
+            current_time = time.monotonic()
             age = current_time - self.latest_timestamp if self.latest_timestamp > 0 else float('inf')
             time_since_last = current_time - self.last_packet_time if self.last_packet_time > 0 else float('inf')
 
@@ -302,7 +344,7 @@ class UDPSocket:
 
                     # Use arrival time as packet timestamp - much simpler and more reliable
                     # than trying to handle 32-bit wraparound across network
-                    arrival_time = time.time()
+                    arrival_time = time.monotonic()
 
                     with self.data_lock:
                         self.latest_data = values

@@ -35,6 +35,7 @@ from .path_utils import (
     GridConfig,
     ObstacleChecker,
     calculate_workspace_bounds,
+    quaternion_to_rotation_matrix,
     quaternion_conjugate,
     quaternion_multiply,
     rotation_matrix_to_quaternion,
@@ -55,6 +56,216 @@ ObstacleData: TypeAlias = List[Dict[str, Any]]
 # ============================================================================
 
 logger = logging.getLogger(__name__)
+
+_LAST_PLAN_STATS: Dict[str, Any] = {}
+
+
+def clear_last_plan_stats() -> None:
+    _LAST_PLAN_STATS.clear()
+
+
+def get_last_plan_stats() -> Dict[str, Any]:
+    return dict(_LAST_PLAN_STATS)
+
+
+def _set_last_plan_stats(**stats: Any) -> None:
+    _LAST_PLAN_STATS.clear()
+    _LAST_PLAN_STATS.update(stats)
+
+
+PLANAR_OBSTACLE_THICKNESS_EPS_M = 1e-3
+BOX_EDGE_CORNER_INDICES = (
+    (0, 1), (0, 2), (0, 4),
+    (1, 3), (1, 5),
+    (2, 3), (2, 6),
+    (3, 7),
+    (4, 5), (4, 6),
+    (5, 7),
+    (6, 7),
+)
+
+
+def _dedupe_planar_points(points: List[np.ndarray], tol: float = 1e-6) -> np.ndarray:
+    """Remove near-duplicate 2D points while preserving first occurrence order."""
+    unique: List[np.ndarray] = []
+    for point in points:
+        pt = np.asarray(point, dtype=np.float32)
+        if any(float(np.linalg.norm(pt - existing)) <= tol for existing in unique):
+            continue
+        unique.append(pt)
+    if not unique:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(unique, dtype=np.float32)
+
+
+def _convex_hull_2d(points: np.ndarray) -> np.ndarray:
+    """Return the convex hull of 2D points in counter-clockwise order."""
+    pts = _dedupe_planar_points([point for point in np.asarray(points, dtype=np.float32)])
+    if len(pts) <= 2:
+        return pts
+
+    sorted_pts = sorted((float(point[0]), float(point[1])) for point in pts)
+
+    def cross(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[tuple[float, float]] = []
+    for point in sorted_pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+
+    upper: List[tuple[float, float]] = []
+    for point in reversed(sorted_pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+
+    hull = lower[:-1] + upper[:-1]
+    return np.asarray(hull, dtype=np.float32)
+
+
+def compute_planar_obstacle_sections(
+    start_pos: Point3D,
+    goal_pos: Point3D,
+    obstacle_data: ObstacleData,
+    *,
+    safety_margin: float,
+) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]]:
+    """Compute actual plane-slice polygons and the bbox approximation used by the planner."""
+    s_w = np.asarray(start_pos, dtype=np.float32)
+    g_w = np.asarray(goal_pos, dtype=np.float32)
+
+    xp, yp, zp = basis_start_goal_plane(s_w, g_w)
+    rotation_world_from_plane = np.stack([xp, yp, zp], axis=1)
+
+    def world_to_plane(point_world: np.ndarray) -> np.ndarray:
+        return rotation_world_from_plane.T @ (point_world - s_w)
+
+    def plane_to_world(point_plane: np.ndarray) -> np.ndarray:
+        return (rotation_world_from_plane @ point_plane) + s_w
+
+    sections: List[Dict[str, Any]] = []
+    for obstacle in obstacle_data:
+        size_w = np.asarray(obstacle["size"], dtype=np.float32)
+        pos_w = np.asarray(obstacle["pos"], dtype=np.float32)
+        rot_w = np.asarray(obstacle.get("rot", [1, 0, 0, 0]), dtype=np.float32)
+
+        half_size_w = size_w * 0.5
+        local_corners = np.array(
+            [
+                [-half_size_w[0], -half_size_w[1], -half_size_w[2]],
+                [+half_size_w[0], -half_size_w[1], -half_size_w[2]],
+                [-half_size_w[0], +half_size_w[1], -half_size_w[2]],
+                [+half_size_w[0], +half_size_w[1], -half_size_w[2]],
+                [-half_size_w[0], -half_size_w[1], +half_size_w[2]],
+                [+half_size_w[0], -half_size_w[1], +half_size_w[2]],
+                [-half_size_w[0], +half_size_w[1], +half_size_w[2]],
+                [+half_size_w[0], +half_size_w[1], +half_size_w[2]],
+            ],
+            dtype=np.float32,
+        )
+        rot_matrix_w = quaternion_to_rotation_matrix(rot_w)
+        corners_w = np.array([rot_matrix_w @ corner + pos_w for corner in local_corners], dtype=np.float32)
+        corners_p = np.array([world_to_plane(corner) for corner in corners_w], dtype=np.float32)
+
+        slice_points_xz: List[np.ndarray] = []
+        plane_y = corners_p[:, 1]
+        for corner in corners_p:
+            if abs(float(corner[1])) <= 1e-6:
+                slice_points_xz.append(corner[[0, 2]])
+
+        for idx_a, idx_b in BOX_EDGE_CORNER_INDICES:
+            point_a = corners_p[idx_a]
+            point_b = corners_p[idx_b]
+            ya = float(plane_y[idx_a])
+            yb = float(plane_y[idx_b])
+            if ya * yb > 0.0:
+                continue
+            denom = yb - ya
+            if abs(denom) <= 1e-9:
+                continue
+            t = -ya / denom
+            if t < 0.0 or t > 1.0:
+                continue
+            point = point_a + t * (point_b - point_a)
+            slice_points_xz.append(point[[0, 2]])
+
+        if not slice_points_xz:
+            continue
+
+        polygon_xz = _convex_hull_2d(np.asarray(slice_points_xz, dtype=np.float32))
+        if len(polygon_xz) == 0:
+            continue
+
+        cross_section_min = np.min(polygon_xz, axis=0)
+        cross_section_max = np.max(polygon_xz, axis=0)
+        sections.append(
+            {
+                "polygon_xz": polygon_xz,
+                "min_x": float(cross_section_min[0] - safety_margin),
+                "max_x": float(cross_section_max[0] + safety_margin),
+                "min_z": float(cross_section_min[1] - safety_margin),
+                "max_z": float(cross_section_max[1] + safety_margin),
+            }
+        )
+
+    return sections, s_w, g_w, world_to_plane, plane_to_world
+
+
+def compute_planar_obstacle_rectangles(
+    start_pos: Point3D,
+    goal_pos: Point3D,
+    obstacle_data: ObstacleData,
+    *,
+    safety_margin: float,
+) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]]:
+    """Return the axis-aligned planar rectangles currently used for collision checking."""
+    sections, s_w, g_w, world_to_plane, plane_to_world = compute_planar_obstacle_sections(
+        start_pos,
+        goal_pos,
+        obstacle_data,
+        safety_margin=safety_margin,
+    )
+    rectangles = [
+        {
+            "min_x": section["min_x"],
+            "max_x": section["max_x"],
+            "min_z": section["min_z"],
+            "max_z": section["max_z"],
+        }
+        for section in sections
+    ]
+    return rectangles, s_w, g_w, world_to_plane, plane_to_world
+
+
+class PlanarWorldCollisionAdapter:
+    """Use the world obstacle checker while searching in plane coordinates."""
+
+    def __init__(self, world_checker: ObstacleChecker, plane_to_world: Callable[[np.ndarray], np.ndarray]):
+        self.world_checker = world_checker
+        self.plane_to_world = plane_to_world
+
+    def is_point_collision_free(self, point: Tuple[float, float, float]) -> bool:
+        point_plane = np.asarray(point, dtype=np.float32)
+        point_world = self.plane_to_world(point_plane)
+        return self.world_checker.is_point_collision_free(tuple(float(v) for v in point_world.tolist()))
+
+    def is_line_collision_free(
+        self,
+        start: Tuple[float, float, float],
+        end: Tuple[float, float, float],
+        num_samples: Optional[int] = None,
+    ) -> bool:
+        start_plane = np.asarray(start, dtype=np.float32)
+        end_plane = np.asarray(end, dtype=np.float32)
+        start_world = self.plane_to_world(start_plane)
+        end_world = self.plane_to_world(end_plane)
+        return self.world_checker.is_line_collision_free(
+            tuple(float(v) for v in start_world.tolist()),
+            tuple(float(v) for v in end_world.tolist()),
+            num_samples=num_samples,
+        )
 
 # ============================================================================
 # Custom Exceptions
@@ -87,8 +298,17 @@ class InvalidInputError(PathPlanningError):
 # A* Constants
 ASTAR_DEFAULT_MAX_ITERATIONS = 200000
 ASTAR_PROGRESS_LOG_INTERVAL = 5000
+
+# Shared line-collision sampling policy
+LINE_CHECK_SPACING_M = 0.01
+LINE_CHECK_MIN_SAMPLES = 2
+
+# A* per-edge oversampling — short A* edges (1 grid cell) need a higher minimum
+# sample count than the shared line-check default (2) to avoid skipping through
+# thin geometry. Restored from Oleg's tuning, which performed well in practice.
+# Effective spacing per A* edge: min(LINE_CHECK_SPACING_M, resolution * ASTAR_EDGE_SAMPLE_RESOLUTION)
 ASTAR_EDGE_SAMPLES_MIN = 5
-ASTAR_EDGE_SAMPLE_RESOLUTION = 0.5
+ASTAR_EDGE_SAMPLE_RESOLUTION = 0.5  # fraction of grid resolution = ~2 samples per cell along the edge
 
 # RRT Constants
 RRT_DEFAULT_GOAL_SAMPLE_OFFSET = 0.05
@@ -117,7 +337,6 @@ AStarPlanarParams = AStarParams
 @dataclass
 class RRTParams:
     max_iterations: int = 10000
-    max_acceptable_cost: Optional[float] = None
     max_step_size: float = 0.05
     goal_bias: float = 0.1
     goal_tolerance: float = 0.02
@@ -127,7 +346,8 @@ class RRTParams:
 class RRTStarParams(RRTParams):
     rewire_radius: float = 0.08
     minimum_iterations: int = 1000
-    cost_improvement_patience: int = 5000
+    cost_improvement_patience: int = 2000
+    min_improvement_fraction: float = 0.05  # Oleg logic: improvements smaller than this do not reset patience
 
 
 @dataclass
@@ -255,10 +475,13 @@ class AStar3D:
                 continue
 
             # --- Edge collision sampling to prevent skipping through thin geometry ---
+            # Sample ~every ASTAR_EDGE_SAMPLE_RESOLUTION * resolution along the edge,
+            # with a floor of ASTAR_EDGE_SAMPLES_MIN. Short cardinal steps still get
+            # enough samples to catch thin walls that the default 2-sample line check
+            # would slip through.
             seg_len = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_config.resolution
-            # sample ~every ASTAR_EDGE_SAMPLE_RESOLUTION * resolution along the short edge
             num_samples = max(ASTAR_EDGE_SAMPLES_MIN,
-                            int(seg_len / (self.grid_config.resolution * ASTAR_EDGE_SAMPLE_RESOLUTION)))
+                              int(seg_len / (self.grid_config.resolution * ASTAR_EDGE_SAMPLE_RESOLUTION)))
             if not self.obstacle_checker.is_line_collision_free(world_curr, world_pos, num_samples=num_samples):
                 continue
 
@@ -289,6 +512,8 @@ class AStar3D:
         # Convert to grid coordinates
         start_grid = self.world_to_grid(start)
         goal_grid = self.world_to_grid(goal)
+
+        clear_last_plan_stats()
 
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
@@ -570,8 +795,7 @@ class RRT(RRTBase):
         pass
 
     def plan_path(self, start: Point3D, goal: Point3D,
-                  max_iterations: int = 10000,
-                  max_acceptable_cost: Optional[float] = None) -> PathType:
+                  max_iterations: int = 10000) -> PathType:
         """
         Plan a path from start to goal using basic RRT.
 
@@ -579,7 +803,6 @@ class RRT(RRTBase):
             start: Start position in world coordinates
             goal: Goal position in world coordinates
             max_iterations: Maximum planning iterations
-            max_acceptable_cost: Unused in basic RRT (kept for API compatibility)
 
         Returns:
             List of waypoints in world coordinates
@@ -588,6 +811,8 @@ class RRT(RRTBase):
             CollisionError: If start or goal is in collision
             NoPathFoundError: If no valid path exists
         """
+        clear_last_plan_stats()
+
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
             raise CollisionError(f"Start position {start} is in collision")
@@ -638,6 +863,7 @@ class RRT(RRTBase):
             if self.calculate_distance(new_position, goal) <= self.goal_tolerance:
                 goal_node = new_node
                 logger.info(f"RRT goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m")
+                print(f"[RRT] Path found at iteration {iteration}/{max_iterations}, cost={goal_node.cost:.3f}m")
                 break
 
         if goal_node is None:
@@ -646,6 +872,15 @@ class RRT(RRTBase):
         # Extract and return path
         path = self.extract_path(goal_node)
         logger.info(f"RRT path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
+        _set_last_plan_stats(
+            algorithm="rrt",
+            first_solution_iteration=iteration,
+            final_iteration=iteration,
+            max_iterations=max_iterations,
+            final_cost_m=goal_node.cost,
+            waypoints=len(path),
+            tree_size=len(tree),
+        )
 
         return path
 
@@ -660,7 +895,8 @@ class RRTStar(RRTBase):
                  goal_tolerance: float = 0.02,
                  rewire_radius: float = 0.08,
                  minimum_iterations: int = 1000,
-                 cost_improvement_patience: int = 5000,
+                 cost_improvement_patience: int = 2000,
+                 min_improvement_fraction: float = 0.05,
                  verbose: bool = False):
         """
         Initialize RRT* planner with rewiring optimization.
@@ -674,7 +910,8 @@ class RRTStar(RRTBase):
             goal_tolerance: Distance to consider goal reached
             rewire_radius: Radius for rewiring optimization
             minimum_iterations: Minimum iterations before early termination
-            cost_improvement_patience: Iterations to wait for cost improvement
+            cost_improvement_patience: Iterations to wait for meaningful cost improvement
+            min_improvement_fraction: Minimum relative improvement to reset patience (0.05 = 5%)
             verbose: If True, log detailed progress information
         """
         super().__init__(grid_config, obstacle_checker, use_3d, max_step_size,
@@ -684,24 +921,23 @@ class RRTStar(RRTBase):
         self.rewire_radius = rewire_radius
         self.minimum_iterations = minimum_iterations
         self.cost_improvement_patience = cost_improvement_patience
-        self.max_acceptable_cost = None  # Set during plan_path call
+        self.min_improvement_fraction = min_improvement_fraction
 
     def should_terminate_early(self, goal_node: Optional[RRTNode], iteration: int,
                               last_improvement_iteration: int) -> bool:
-        """Check if we should terminate early based on cost threshold."""
+        """Oleg-style early stop: wait for meaningful goal-cost improvements."""
         if iteration < self.minimum_iterations:
             return False
 
         if goal_node is None:
             return False
 
-        if (self.max_acceptable_cost is not None and
-            goal_node.cost <= self.max_acceptable_cost):
-            logger.info(f"RRT* early termination: cost {goal_node.cost:.3f}m <= {self.max_acceptable_cost:.3f}m")
-            return True
-
         if iteration - last_improvement_iteration > self.cost_improvement_patience:
-            logger.info(f"RRT* early termination: no improvement for {self.cost_improvement_patience} iterations")
+            logger.info(
+                f"RRT* early termination: no meaningful improvement for "
+                f"{self.cost_improvement_patience} iterations "
+                f"(threshold: {self.min_improvement_fraction:.0%})"
+            )
             return True
 
         return False
@@ -754,8 +990,7 @@ class RRTStar(RRTBase):
             self._propagate_cost_update(child, cost_delta)
 
     def plan_path(self, start: Point3D, goal: Point3D,
-                  max_iterations: int = 10000,
-                  max_acceptable_cost: Optional[float] = None) -> PathType:
+                  max_iterations: int = 10000) -> PathType:
         """
         Plan a path from start to goal using RRT*.
 
@@ -763,7 +998,6 @@ class RRTStar(RRTBase):
             start: Start position in world coordinates
             goal: Goal position in world coordinates
             max_iterations: Maximum planning iterations
-            max_acceptable_cost: Early termination cost threshold (meters)
 
         Returns:
             List of waypoints in world coordinates
@@ -772,15 +1006,14 @@ class RRTStar(RRTBase):
             CollisionError: If start or goal is in collision
             NoPathFoundError: If no valid path exists
         """
+        clear_last_plan_stats()
+
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
             raise CollisionError(f"Start position {start} is in collision")
 
         if not self.obstacle_checker.is_point_collision_free(goal):
             raise CollisionError(f"Goal position {goal} is in collision")
-
-        # Set cost threshold
-        self.max_acceptable_cost = max_acceptable_cost
 
         # Calculate straight-line distance for reference
         straight_line_distance = self.calculate_distance(start, goal)
@@ -791,14 +1024,18 @@ class RRTStar(RRTBase):
         goal_node = None
 
         last_improvement_iteration = 0
+        last_significant_cost = float('inf')
+        first_goal_iteration: Optional[int] = None
+        final_iteration = 0
 
         logger.info(f"RRT* starting planning from {start} to {goal}")
         logger.debug(f"Straight-line distance: {straight_line_distance:.3f}m")
-        logger.debug(f"Max acceptable cost: {max_acceptable_cost}m" if max_acceptable_cost else "No cost limit set")
         logger.debug(f"Max iterations: {max_iterations}, 3D mode: {self.use_3d}")
         logger.debug(f"Parameters: step={self.max_step_size}, bias={self.goal_bias}, rewire={self.rewire_radius}")
+        logger.debug(f"Early stop: min_iters={self.minimum_iterations}, patience={self.cost_improvement_patience}, min_improv={self.min_improvement_fraction:.1%}")
 
         for iteration in range(max_iterations):
+            final_iteration = iteration
             if self.verbose and iteration % RRT_PROGRESS_LOG_INTERVAL == 0 and iteration > 0:
                 logger.info(f"RRT* iteration {iteration}, tree size: {len(tree)}")
 
@@ -843,12 +1080,29 @@ class RRTStar(RRTBase):
                 if goal_node is None or new_node.cost < goal_node.cost:
                     old_cost = goal_node.cost if goal_node else float('inf')
                     goal_node = new_node
-                    last_improvement_iteration = iteration
-                    logger.info(f"RRT* goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m (improved from {old_cost:.3f}m)")
+                    if first_goal_iteration is None:
+                        first_goal_iteration = iteration
+                        print(f"[RRT*] First path found at iteration {iteration}/{max_iterations}, cost={goal_node.cost:.3f}m")
+
+                    # Oleg logic: only reset patience for meaningful improvements.
+                    if old_cost == float('inf') or (old_cost - goal_node.cost) / old_cost >= self.min_improvement_fraction:
+                        last_improvement_iteration = iteration
+                        last_significant_cost = goal_node.cost
+                        logger.info(
+                            f"RRT* significant improvement at iteration {iteration}: "
+                            f"{old_cost:.3f}m -> {goal_node.cost:.3f}m"
+                        )
+                    else:
+                        logger.debug(
+                            f"RRT* minor improvement at iteration {iteration}: "
+                            f"{old_cost:.4f}m -> {goal_node.cost:.4f}m "
+                            f"(< {self.min_improvement_fraction:.0%} threshold)"
+                        )
 
             # Check for early termination
             if self.should_terminate_early(goal_node, iteration, last_improvement_iteration):
-                logger.info(f"RRT* early termination at iteration {iteration}")
+                logger.info(f"RRT* early termination at iteration {iteration}, final cost: {goal_node.cost:.3f}m")
+                print(f"[RRT*] Stopped at iteration {iteration}/{max_iterations}, final cost={goal_node.cost:.3f}m")
                 break
 
         if goal_node is None:
@@ -857,6 +1111,23 @@ class RRTStar(RRTBase):
         # Extract and return path
         path = self.extract_path(goal_node)
         logger.info(f"RRT* path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
+        if first_goal_iteration is not None:
+            print(
+                f"[RRT*] Path found iteration={first_goal_iteration}, returned after iteration={final_iteration}, "
+                f"waypoints={len(path)}, cost={goal_node.cost:.3f}m"
+            )
+        _set_last_plan_stats(
+            algorithm="rrt_star",
+            first_solution_iteration=first_goal_iteration,
+            final_iteration=final_iteration,
+            max_iterations=max_iterations,
+            final_cost_m=goal_node.cost,
+            waypoints=len(path),
+            tree_size=len(tree),
+            last_significant_cost_m=last_significant_cost,
+            min_improvement_fraction=self.min_improvement_fraction,
+            cost_improvement_patience=self.cost_improvement_patience,
+        )
 
         return path
 
@@ -1219,7 +1490,12 @@ def setup_planner_environment(
         safety_margin=safety_margin
     )
 
-    obstacle_checker = ObstacleChecker(obstacle_data, safety_margin)
+    obstacle_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
 
     return grid_config, obstacle_checker
 
@@ -1292,14 +1568,12 @@ def create_astar_plane_trajectory(
     to world coordinates. This is useful for scenarios where the robot moves
     primarily in a plane defined by its start and goal positions.
 
-    Note: This planner uses only the FIRST obstacle in obstacle_data as the
-    wall to navigate around. For multi-obstacle scenarios, use the full 3D A*.
-
     Args:
         start_pos: Start position (x, y, z) in world coordinates
         goal_pos: Goal position (x, y, z) in world coordinates
-        obstacle_data: List of obstacle dictionaries. Only the first obstacle
-            is used as the wall for planar planning. Each should have:
+        obstacle_data: List of world-space obstacle dictionaries. The planar
+            planner searches in the start→goal plane but validates collisions
+            against these original world obstacles. Each should have:
             - "size": np.array([x, y, z]) - obstacle dimensions
             - "pos": np.array([x, y, z]) - obstacle center position
             - "rot": np.array([w, x, y, z]) - quaternion rotation (optional)
@@ -1315,90 +1589,22 @@ def create_astar_plane_trajectory(
         CollisionError: If start or goal is in collision
         TimeoutError: If max iterations exceeded
         NoPathFoundError: If no valid path exists on the plane
-        InvalidInputError: If obstacle_data is empty
     """
-    # Validate input
-    if not obstacle_data:
-        raise InvalidInputError("Planar A* requires at least one obstacle (wall) in obstacle_data")
-
-    # Use first obstacle as the wall
-    wall_obstacle = obstacle_data[0]
-
-    # Convert to numpy arrays
-    s_w = np.asarray(start_pos, dtype=np.float32)
-    g_w = np.asarray(goal_pos, dtype=np.float32)
-
-    # Build orthonormal basis for the start→goal plane
-    # Xp = along start→goal, Yp = plane normal, Zp = in-plane vertical
-    Xp, Yp, Zp = basis_start_goal_plane(s_w, g_w)
-    R_wp = np.stack([Xp, Yp, Zp], axis=1)  # Rotation matrix: plane→world
-
-    def world_to_plane(p_w: np.ndarray) -> np.ndarray:
-        """Transform point from world frame to plane frame."""
-        return R_wp.T @ (p_w - s_w)
-
-    def plane_to_world(p_p: np.ndarray) -> np.ndarray:
-        """Transform point from plane frame to world frame."""
-        return (R_wp @ p_p) + s_w
-
-    # Transform wall obstacle into plane frame
-    size_w = np.asarray(wall_obstacle["size"], dtype=np.float32)
-    pos_w = np.asarray(wall_obstacle["pos"], dtype=np.float32)
-    rot_w = np.asarray(wall_obstacle.get("rot", [1, 0, 0, 0]), dtype=np.float32)
-
-    # Use obstacle size in plane frame.
-    size_p = size_w.astype(np.float32).copy()
-    # Keep plane-normal thickness minimal but non-zero so 2D planning stays stable.
-    size_p[1] = max(size_p[1], 1e-3)
-    # Inflate only in-plane axes (X/Z). We avoid inflating the plane-normal axis
-    # so the start/goal are not marked colliding solely due to margin padding.
-    size_p[0] += 2.0 * safety_margin
-    size_p[2] += 2.0 * safety_margin
-
-    # Transform position to plane frame
-    pos_p = world_to_plane(pos_w)
-
-    # Transform rotation to plane frame
-    # q_plane = (q_wp)^* ⊗ q_wall
-    q_wp = rotation_matrix_to_quaternion(R_wp)
-    q_wp_conj = quaternion_conjugate(q_wp)
-    rot_p = quaternion_multiply(q_wp_conj, rot_w)
-
-    # Build obstacle list in plane frame
-    wall_plane = [{
-        "size": size_p,
-        "pos": pos_p.astype(np.float32),
-        "rot": rot_p.astype(np.float32)
-    }]
-
-    # Transform start/goal to plane frame
-    # Y (plane normal) is index 1 and must be ~0 in planning
-    s_p = world_to_plane(s_w)
-    s_p[1] = 0.0
-    g_p = world_to_plane(g_w)
-    g_p[1] = 0.0
-
-    # Calculate bounds in plane frame (pad generously). Include obstacle extents so inflated
-    # geometry fits inside the search grid.
-    half_size = size_p * 0.5
-    obs_min = pos_p - half_size
-    obs_max = pos_p + half_size
-    pts = np.stack([s_p, g_p, obs_min, obs_max], axis=0)
-    pad = np.array([0.20, 0.05, 0.20], dtype=np.float32)
-    bmin = np.min(pts, axis=0) - pad
-    bmax = np.max(pts, axis=0) + pad
-
-    # Create grid configuration in plane frame
-    grid_cfg = GridConfig(
-        resolution=float(grid_resolution),
-        bounds_min=(float(bmin[0]), float(bmin[1]), float(bmin[2])),
-        bounds_max=(float(bmax[0]), float(bmax[1]), float(bmax[2])),
-        safety_margin=float(safety_margin),
+    grid_cfg, _, s_p, g_p, _, plane_to_world = _build_planar_environment(
+        start_pos,
+        goal_pos,
+        obstacle_data,
+        grid_resolution=grid_resolution,
+        safety_margin=safety_margin,
     )
 
-    # Create obstacle checker and planner
-    # Safety margin already baked into size_p for X/Z; keep checker margin at 0.
-    obs_checker = ObstacleChecker(wall_plane, safety_margin=0.0)
+    world_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin=safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
+    obs_checker = PlanarWorldCollisionAdapter(world_checker, plane_to_world)
     planner = AStar3D(grid_cfg, obs_checker, use_3d=False, verbose=verbose)
 
     logger.info(f"Planar A* starting on start→goal plane")
@@ -1407,11 +1613,20 @@ def create_astar_plane_trajectory(
     logger.debug(f"Grid resolution: {grid_resolution}m, Safety margin: {safety_margin}m")
 
     # Plan path in plane frame
-    path_plane = planner.plan_path(
-        tuple(s_p.tolist()),
-        tuple(g_p.tolist()),
-        max_iterations=max_iterations
-    )
+    try:
+        path_plane = planner.plan_path(
+            tuple(s_p.tolist()),
+            tuple(g_p.tolist()),
+            max_iterations=max_iterations
+        )
+    except CollisionError as err:
+        _rethrow_planar_collision_error(
+            err,
+            start_world=start_pos,
+            goal_world=goal_pos,
+            start_plane=s_p,
+            goal_plane=g_p,
+        )
 
     # Transform path back to world frame
     path_world = []
@@ -1431,7 +1646,7 @@ def create_astar_plane_trajectory(
 def _build_planar_environment(
     start_pos: Point3D,
     goal_pos: Point3D,
-    wall_obstacle: Dict[str, Any],
+    obstacle_data: ObstacleData,
     *,
     grid_resolution: float,
     safety_margin: float,
@@ -1445,48 +1660,42 @@ def _build_planar_environment(
     Callable[[np.ndarray], np.ndarray],
 ]:
     """Build plane-frame environment and transforms for start-goal plane planning."""
-    s_w = np.asarray(start_pos, dtype=np.float32)
-    g_w = np.asarray(goal_pos, dtype=np.float32)
-
-    Xp, Yp, Zp = basis_start_goal_plane(s_w, g_w)
-    R_wp = np.stack([Xp, Yp, Zp], axis=1)
-
-    def world_to_plane(p_w: np.ndarray) -> np.ndarray:
-        return R_wp.T @ (p_w - s_w)
-
-    def plane_to_world(p_p: np.ndarray) -> np.ndarray:
-        return (R_wp @ p_p) + s_w
-
-    size_w = np.asarray(wall_obstacle["size"], dtype=np.float32)
-    pos_w = np.asarray(wall_obstacle["pos"], dtype=np.float32)
-    rot_w = np.asarray(wall_obstacle.get("rot", [1, 0, 0, 0]), dtype=np.float32)
-
-    size_p = size_w.astype(np.float32).copy()
-    size_p[1] = max(size_p[1], 1e-3)
-    size_p[0] += 2.0 * safety_margin
-    size_p[2] += 2.0 * safety_margin
-
-    pos_p = world_to_plane(pos_w)
-
-    q_wp = rotation_matrix_to_quaternion(R_wp)
-    q_wp_conj = quaternion_conjugate(q_wp)
-    rot_p = quaternion_multiply(q_wp_conj, rot_w)
-
-    wall_plane = [{
-        "size": size_p,
-        "pos": pos_p.astype(np.float32),
-        "rot": rot_p.astype(np.float32),
-    }]
+    planar_rects, s_w, g_w, world_to_plane, plane_to_world = compute_planar_obstacle_rectangles(
+        start_pos,
+        goal_pos,
+        obstacle_data,
+        safety_margin=safety_margin,
+    )
 
     s_p = world_to_plane(s_w)
     s_p[1] = 0.0
     g_p = world_to_plane(g_w)
     g_p[1] = 0.0
 
-    half_size = size_p * 0.5
-    obs_min = pos_p - half_size
-    obs_max = pos_p + half_size
-    pts = np.stack([s_p, g_p, obs_min, obs_max], axis=0)
+    bounds_points = [s_p, g_p]
+    for rect in planar_rects:
+        pos_p = np.array(
+            [
+                0.5 * (rect["min_x"] + rect["max_x"]),
+                0.0,
+                0.5 * (rect["min_z"] + rect["max_z"]),
+            ],
+            dtype=np.float32,
+        )
+        size_p = np.array(
+            [
+                max(float(rect["max_x"] - rect["min_x"]), PLANAR_OBSTACLE_THICKNESS_EPS_M),
+                PLANAR_OBSTACLE_THICKNESS_EPS_M,
+                max(float(rect["max_z"] - rect["min_z"]), PLANAR_OBSTACLE_THICKNESS_EPS_M),
+            ],
+            dtype=np.float32,
+        )
+
+        half_size = size_p * 0.5
+        bounds_points.append(pos_p - half_size)
+        bounds_points.append(pos_p + half_size)
+
+    pts = np.stack(bounds_points, axis=0)
     pad = np.asarray(pad_xyz, dtype=np.float32)
     bmin = np.min(pts, axis=0) - pad
     bmax = np.max(pts, axis=0) + pad
@@ -1498,7 +1707,32 @@ def _build_planar_environment(
         safety_margin=float(safety_margin),
     )
 
-    return grid_cfg, wall_plane, s_p, g_p, world_to_plane, plane_to_world
+    return grid_cfg, planar_rects, s_p, g_p, world_to_plane, plane_to_world
+
+
+def _rethrow_planar_collision_error(
+    err: CollisionError,
+    *,
+    start_world: Point3D,
+    goal_world: Point3D,
+    start_plane: np.ndarray,
+    goal_plane: np.ndarray,
+) -> None:
+    """Add both plane-frame and world-frame coordinates to planar collision errors."""
+    message = str(err)
+    if message.startswith("Start position"):
+        raise CollisionError(
+            "Planar start is in collision: "
+            f"plane={tuple(float(v) for v in start_plane.tolist())}, "
+            f"world={tuple(float(v) for v in start_world)}"
+        ) from err
+    if message.startswith("Goal position"):
+        raise CollisionError(
+            "Planar goal is in collision: "
+            f"plane={tuple(float(v) for v in goal_plane.tolist())}, "
+            f"world={tuple(float(v) for v in goal_world)}"
+        ) from err
+    raise err
 
 
 def create_rrt_plane_trajectory(
@@ -1508,25 +1742,26 @@ def create_rrt_plane_trajectory(
     grid_resolution: float = 0.01,
     safety_margin: float = 0.02,
     max_iterations: int = 10000,
-    max_acceptable_cost: Optional[float] = None,
     max_step_size: float = 0.05,
     goal_bias: float = 0.1,
     goal_tolerance: float = 0.02,
 ) -> np.ndarray:
     """Plan RRT path on the vertical plane containing start-goal and return world-frame waypoints."""
-    if not obstacle_data:
-        raise InvalidInputError("Planar RRT requires at least one obstacle (wall) in obstacle_data")
-
-    wall_obstacle = obstacle_data[0]
-    grid_cfg, wall_plane, s_p, g_p, _, plane_to_world = _build_planar_environment(
+    grid_cfg, _, s_p, g_p, _, plane_to_world = _build_planar_environment(
         start_pos,
         goal_pos,
-        wall_obstacle,
+        obstacle_data,
         grid_resolution=grid_resolution,
         safety_margin=safety_margin,
     )
 
-    obs_checker = ObstacleChecker(wall_plane, safety_margin=0.0)
+    world_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin=safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
+    obs_checker = PlanarWorldCollisionAdapter(world_checker, plane_to_world)
     planner = RRT(
         grid_cfg,
         obs_checker,
@@ -1537,12 +1772,20 @@ def create_rrt_plane_trajectory(
         verbose=False,
     )
 
-    path_plane = planner.plan_path(
-        tuple(s_p.tolist()),
-        tuple(g_p.tolist()),
-        max_iterations=max_iterations,
-        max_acceptable_cost=max_acceptable_cost,
-    )
+    try:
+        path_plane = planner.plan_path(
+            tuple(s_p.tolist()),
+            tuple(g_p.tolist()),
+            max_iterations=max_iterations,
+        )
+    except CollisionError as err:
+        _rethrow_planar_collision_error(
+            err,
+            start_world=start_pos,
+            goal_world=goal_pos,
+            start_plane=s_p,
+            goal_plane=g_p,
+        )
 
     path_world = []
     for p in path_plane:
@@ -1560,28 +1803,30 @@ def create_rrt_star_plane_trajectory(
     grid_resolution: float = 0.01,
     safety_margin: float = 0.02,
     max_iterations: int = 10000,
-    max_acceptable_cost: Optional[float] = None,
     max_step_size: float = 0.05,
     goal_bias: float = 0.1,
     rewire_radius: float = 0.08,
     goal_tolerance: float = 0.02,
     minimum_iterations: int = 1000,
-    cost_improvement_patience: int = 5000,
+    cost_improvement_patience: int = 2000,
+    min_improvement_fraction: float = 0.05,
 ) -> np.ndarray:
     """Plan RRT* path on the vertical plane containing start-goal and return world-frame waypoints."""
-    if not obstacle_data:
-        raise InvalidInputError("Planar RRT* requires at least one obstacle (wall) in obstacle_data")
-
-    wall_obstacle = obstacle_data[0]
-    grid_cfg, wall_plane, s_p, g_p, _, plane_to_world = _build_planar_environment(
+    grid_cfg, _, s_p, g_p, _, plane_to_world = _build_planar_environment(
         start_pos,
         goal_pos,
-        wall_obstacle,
+        obstacle_data,
         grid_resolution=grid_resolution,
         safety_margin=safety_margin,
     )
 
-    obs_checker = ObstacleChecker(wall_plane, safety_margin=0.0)
+    world_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin=safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
+    obs_checker = PlanarWorldCollisionAdapter(world_checker, plane_to_world)
     planner = RRTStar(
         grid_cfg,
         obs_checker,
@@ -1592,14 +1837,23 @@ def create_rrt_star_plane_trajectory(
         goal_tolerance=goal_tolerance,
         minimum_iterations=minimum_iterations,
         cost_improvement_patience=cost_improvement_patience,
+        min_improvement_fraction=min_improvement_fraction,
     )
 
-    path_plane = planner.plan_path(
-        tuple(s_p.tolist()),
-        tuple(g_p.tolist()),
-        max_iterations=max_iterations,
-        max_acceptable_cost=max_acceptable_cost,
-    )
+    try:
+        path_plane = planner.plan_path(
+            tuple(s_p.tolist()),
+            tuple(g_p.tolist()),
+            max_iterations=max_iterations,
+        )
+    except CollisionError as err:
+        _rethrow_planar_collision_error(
+            err,
+            start_world=start_pos,
+            goal_world=goal_pos,
+            start_plane=s_p,
+            goal_plane=g_p,
+        )
 
     path_world = []
     for p in path_plane:
@@ -1621,20 +1875,22 @@ def create_prm_plane_trajectory(
     max_connections_per_node: int = 15,
 ) -> np.ndarray:
     """Plan PRM path on the vertical plane containing start-goal and return world-frame waypoints."""
-    if not obstacle_data:
-        raise InvalidInputError("Planar PRM requires at least one obstacle (wall) in obstacle_data")
-
-    wall_obstacle = obstacle_data[0]
-    grid_cfg, wall_plane, s_p, g_p, _, plane_to_world = _build_planar_environment(
+    grid_cfg, _, s_p, g_p, _, plane_to_world = _build_planar_environment(
         start_pos,
         goal_pos,
-        wall_obstacle,
+        obstacle_data,
         grid_resolution=grid_resolution,
         safety_margin=safety_margin,
         pad_xyz=(0.25, 0.05, 0.25),
     )
 
-    obs_checker = ObstacleChecker(wall_plane, safety_margin=0.0)
+    world_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin=safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
+    obs_checker = PlanarWorldCollisionAdapter(world_checker, plane_to_world)
     planner = PRM(
         grid_cfg,
         obs_checker,
@@ -1644,7 +1900,16 @@ def create_prm_plane_trajectory(
         max_connections_per_node=max_connections_per_node,
     )
 
-    path_plane = planner.plan_path(tuple(s_p.tolist()), tuple(g_p.tolist()))
+    try:
+        path_plane = planner.plan_path(tuple(s_p.tolist()), tuple(g_p.tolist()))
+    except CollisionError as err:
+        _rethrow_planar_collision_error(
+            err,
+            start_world=start_pos,
+            goal_world=goal_pos,
+            start_plane=s_p,
+            goal_plane=g_p,
+        )
 
     path_world = []
     for p in path_plane:
@@ -1662,13 +1927,13 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
                               safety_margin: float = 0.02,
                               use_3d: bool = True,
                               max_iterations: int = 10000,
-                              max_acceptable_cost: Optional[float] = None,
                               max_step_size: float = 0.05,
                               goal_bias: float = 0.1,
                               rewire_radius: float = 0.08,
                               goal_tolerance: float = 0.02,
                               minimum_iterations: int = 1000,
-                              cost_improvement_patience: int = 5000) -> np.ndarray:
+                              cost_improvement_patience: int = 2000,
+                              min_improvement_fraction: float = 0.05) -> np.ndarray:
     """
     High-level interface to create RRT* trajectory with obstacle avoidance.
 
@@ -1680,7 +1945,6 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
         safety_margin: Additional clearance around obstacles
         use_3d: Use full 3D planning or just X-Z plane
         max_iterations: Maximum RRT* iterations
-        max_acceptable_cost: Early termination cost threshold (meters)
         max_step_size: Maximum tree extension distance
         goal_bias: Probability of sampling toward goal (0.0-1.0)
         rewire_radius: Radius for tree rewiring
@@ -1703,7 +1967,12 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
     )
 
     # Create obstacle checker
-    obstacle_checker = ObstacleChecker(obstacle_data, safety_margin)
+    obstacle_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
 
     # Create RRT* planner with all tuning parameters
     planner = RRTStar(
@@ -1713,13 +1982,13 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
         rewire_radius=rewire_radius,
         goal_tolerance=goal_tolerance,
         minimum_iterations=minimum_iterations,
-        cost_improvement_patience=cost_improvement_patience
+        cost_improvement_patience=cost_improvement_patience,
+        min_improvement_fraction=min_improvement_fraction,
     )
 
     # Plan path
     path = planner.plan_path(start_pos, goal_pos,
-                             max_iterations=max_iterations,
-                             max_acceptable_cost=max_acceptable_cost)
+                             max_iterations=max_iterations)
 
     if not path:
         raise RuntimeError("RRT* failed to find a path")
@@ -1742,7 +2011,6 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
                          safety_margin: float = 0.02,
                          use_3d: bool = True,
                          max_iterations: int = 10000,
-                         max_acceptable_cost: Optional[float] = None,
                          max_step_size: float = 0.05,
                          goal_bias: float = 0.1,
                          goal_tolerance: float = 0.02) -> np.ndarray:
@@ -1757,7 +2025,6 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
         safety_margin: Additional clearance around obstacles
         use_3d: Use full 3D planning or just X-Z plane
         max_iterations: Maximum RRT iterations
-        max_acceptable_cost: Early termination cost threshold (meters)
         max_step_size: Maximum tree extension distance
         goal_bias: Probability of sampling toward goal (0.0-1.0)
         goal_tolerance: Distance threshold to reach goal
@@ -1777,7 +2044,12 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
     )
 
     # Create obstacle checker
-    obstacle_checker = ObstacleChecker(obstacle_data, safety_margin)
+    obstacle_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
 
     # Create RRT planner (no rewiring)
     planner = RRT(
@@ -1790,8 +2062,7 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
 
     # Plan path
     path = planner.plan_path(start_pos, goal_pos,
-                             max_iterations=max_iterations,
-                             max_acceptable_cost=max_acceptable_cost)
+                             max_iterations=max_iterations)
 
     if not path:
         raise RuntimeError("RRT failed to find a path")
@@ -1845,7 +2116,12 @@ def create_prm_trajectory(start_pos: Tuple[float, float, float],
     )
 
     # Create obstacle checker
-    obstacle_checker = ObstacleChecker(obstacle_data, safety_margin)
+    obstacle_checker = ObstacleChecker(
+        obstacle_data,
+        safety_margin,
+        line_check_spacing_m=LINE_CHECK_SPACING_M,
+        min_line_samples=LINE_CHECK_MIN_SAMPLES,
+    )
 
     # Create PRM planner with all tuning parameters
     planner = PRM(

@@ -110,10 +110,6 @@ class ADCConfig:
                 "input": ["b1", 7],
             },
 
-            "Slew encoder rot": {
-                "input": ["b1", 8],
-            },
-
         }
 
         # Validate configuration on initialization

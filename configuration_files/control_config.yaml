@@ -3,61 +3,152 @@
 
 rates:
   # Controller (IK) loop frequency in Hz
-  control_hz: 200.0
+  control_hz: 100.0
 
 imu:
-  # IMU sampling rate (Hz) - Pico AHRS loop frequency
-  sample_rate: 200
-  # Gyroscope full-scale range (125/250/500/1000/2000 dps)
-  gyro_dps: 500 # 500
-  # AHRS filter gain (higher = faster response, more noise)
-  ahrs_gain: 0.75 # 0.5
-  # Accelerometer rejection threshold (degrees) - reject accel when orientation deviates
-  accel_rejection: 10.0 #10.0
-  # Recovery period (seconds) - time before re-enabling accel after rejection
-  recovery_s: 0.5 #1.0
-  # Gyro offset tracking timeout (seconds)
-  offset_s: 0.5 # 1.0
+  # IMU output is fixed at 200 Hz in Pico firmware. AHRS settings (gyro_dps, gain,
+  # accel_rejection, recovery_s) are hardcoded in firmware — no Python handshake needed.
+  # The Pico self-calibrates for ~30 s after power-on, then streams autonomously.
+  # Startup gyro-bias calibration is automatic in Pico firmware: 30 s stationary
+  # measurement, firmware-owned thresholds, and a host calibration report.
+  # Named IMU mapping: logical role -> physical sensor index
+  # Joint roles (boom, arm, bucket) feed the IK pipeline; base is supplementary
+  # The mapping length defines the expected IMU count from firmware
+  imu_mapping:
+    base: 1
+    boom: 2
+    arm: 0
+    bucket: 3
+  # IMU role chain and extraction rules for canonical controller joints.
+  # imu_mapping above can be changed when sensors are wired/enumerated differently.
+  # Use parent_role: null for a gravity/level parent. If base is omitted from
+  # imu_mapping, lift falls back to that same level-gravity parent.
+  chain:
+    - joint: slew
+      output_index: 0
+      source: all
+      axis: z
+      extraction: average_z_yaw
+    - joint: lift
+      role: boom
+      parent_role: base
+      output_index: 1
+      axis: y
+      extraction: gravity_pitch_delta
+    - joint: arm
+      role: arm
+      parent_role: boom
+      output_index: 2
+      axis: y
+      extraction: gravity_pitch_delta
+    - joint: bucket
+      role: bucket
+      parent_role: arm
+      output_index: 3
+      axis: y
+      extraction: gravity_pitch_delta
+    # Future rototilt sketch:
+    # - joint: tool_tilt
+    #   role: tool_tilt
+    #   parent_role: bucket
+    #   output_index: 4
+    #   axis: y
+    #   extraction: relative_axis_twist
+    # - joint: tool_rotate
+    #   role: tool_rotate
+    #   parent_role: tool_tilt
+    #   output_index: 5
+    #   axis: z
+    #   extraction: relative_axis_twist
+  # Mounting correction quaternions by logical IMU role [w, x, y, z]
+  # Hardware layer removes these offsets before publishing quats/gyro.
+  mounting_offsets_quat:
+    base: [1.0, 0.0, 0.0, 0.0]
+    boom: [0.9927048, 0.0, 0.12057, 0.0]
+    arm: [0.9999619, 0.0, 0.0087265, 0.0]
+    bucket: [1.0, 0.0, 0.0, 0.0]
+
+robot:
+  frame:
+    # Ground to slew/cabin rotation origin
+    origin_height_m: 0.07 #0.075
+  links:
+    # Vector from slew origin to first boom pivot in slew-local coordinates
+    boom_mount_offset_m: [0.0165, 0.0, 0.0645]
+    boom_length_m: 0.468
+    arm_length_m: 0.250
+    # Link from arm joint to tool coupler center
+    coupler_length_m: 0.031
+  tools:
+    active: default_bucket_tip
+    presets:
+      default_bucket_tip:
+        # Local-frame offset from coupler center to tool tip / working point
+        tip_offset_m: [0.0, 0.0, -0.142]
 
 pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 2.0 #5.0
-    ki: 0.250 #0.5
-    kd: 0.0
+    kp: 5.500 #6
+    ki: 0.200
+    kd: 0.250 # try to increase?
 
   # Joint 1: Boom (lift arm)
   joint1:
-    kp: 5.0
-    ki: 0.1
-    kd: 0.0
+    kp: 10.000
+    ki: 0.400
+    kd: 0.000
 
   # Joint 2: Arm (tilt)
   joint2:
-    kp: 6.0
-    ki: 0.1
-    kd: 0.0
+    kp: 10.000
+    ki: 0.400
+    kd: 0.000
 
   # Joint 3: Bucket (scoop)
   joint3:
-    kp: 5.0
-    ki: 0.1
-    kd: 0.0
+    kp: 5.000
+    ki: 0.250
+    kd: 0.000
 
 controller:
-  # PID output limits (normalized -1.0 to 1.0)
+  # PID output limits (normalized to)
   output_limits_min: -1.0
   output_limits_max: 1.0
 
-  # Joint velocity limiting (applied at IK level for cleaner architecture)
+  # Joint velocity limiting (applied at IK level)
   # Set to False to disable velocity limiting entirely
-  enable_velocity_limiting: true
+  enable_velocity_limiting: False
 
   # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
   # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
-  per_joint_max_velocity: [0.10, 0.25, 0.25, 0.25]
+  per_joint_max_velocity: [0.10, 0.12, 0.12, 0.12]
 
+  # Joint velocity estimation mode for controller telemetry/velocity-aware IK
+  # - fd_only: stock behavior (finite-difference from joint angles)
+  # - gyro_only: use IMU gyro rates for boom/arm/bucket (slew remains FD)
+  # - fused: blend gyro + FD for boom/arm/bucket (slew remains FD)
+  gyro_velocity_mode: "fd_only"
+
+  # Blend factor for fused mode: v = alpha*gyro + (1-alpha)*fd
+  # Only used when gyro_velocity_mode: "fused"
+  gyro_blend_alpha: 0.30
+
+  # Gyro data freshness timeout (seconds)
+  # If gyro sample is stale longer than this, controller falls back to FD
+  gyro_timeout_s: 0.08
+
+  # Sanity clamp for gyro-derived joint speed magnitude (deg/s)
+  gyro_max_abs_degps: 180.0
+
+  # Slow online bias compensation for gyro-derived joint velocity
+  gyro_bias_comp:
+    enabled: False
+    # Consider near-stationary below this magnitude (deg/s)
+    stationarity_degps: 1.5
+    # Bias adaptation gain per control update (0..1)
+    adaptation_rate: 0.01
 
 # Inverse Kinematics configuration
 # Used by: ExcavatorController, IKController
@@ -66,73 +157,65 @@ ik:
   command_type: "pose"
 
   # Whether commands are relative to current pose (delta commands)
-  use_relative_mode: true
-
-  # IK solving method: "pinv", "svd", "trans", or "dls" (damped least squares)
+  use_relative_mode: False
+  # IK solving method: "pinv", "svd", "trans", or "dls"
   method: "dls"
 
   # Velocity mode: interpret commands as desired EE velocities
-  velocity_mode: true
-  velocity_error_gain: 200.0  # Note: depends on hw/sim_dt!
-  use_rotational_velocity: true
+  velocity_mode: False
+  velocity_error_gain: 250.0  # Note: depends on hw/sim_dt!
+  use_rotational_velocity: False
 
   # Method/weighting parameters
   # Note: k_val and lambda_val have decreased effect when velocity_mode is enabled,
   # as velocity_error_gain and per_joint_max_velocity dominate the response.
   params:
     # For pinv, svd, trans
-    k_val: 5.0 # 1.15
+    k_val: 1.45
 
     # For svd
     min_singular_value: 1.0e-5
 
     # For dls
-    lambda_val: 0.01  # Base (min) value if adaptive damping is used
+    lambda_val: 0.001  # Base (min) value if adaptive damping is used
 
-    # General
-    position_weight: 1.0
-    rotation_weight: 1.1  #1.1,  1.2 for delta position control
-    joint_weights: [0.9, 1.0, 0.8, 1.0]  # [1.0, 1.0, 0.8, 1.0], [1.0, 1.0, 1.0, 0.8] for delta position control
-
+  # Condition number threshold — discard IK commands when Jacobian condition
+  # number exceeds this value (0 = disabled)
+  condition_number_threshold: 40
 
   # Adaptive damping (DLS method only)
   # Adjusts lambda based on Jacobian condition number for better singularity handling.
   # Formula: lambda_adaptive = lambda_val * (1 + scaling * log(1 + condition_number))
   # Clamped to: lambda_val <= lambda_adaptive <= lambda_val * max_multiplier
 
-  enable_adaptive_damping: true
-  adaptive_damping_scaling: 0.5        # How aggressively lambda increases near singularities
-  adaptive_damping_max_multiplier: 10.0  # Maximum lambda = lambda_val * max_multiplier
+  enable_adaptive_damping: True
+  adaptive_damping_max_multiplier: 2.0  # Peak lambda = lambda_val * multiplier, reached at condition_number_threshold
+  # NOTE: multiplier of 2.0 gives lambda 0.001→0.002 — likely needs increasing for real hardware
 
-  # Relative-mode gains (applied to per-step delta pose when relative mode is enabled)
-  relative_pos_gain: 1.0  # 1.0/3.0 irl/sim. Position delta control
-  relative_rot_gain: 1.0
-
-  # Axes to ignore in orientation error during IK solving.
-  # Any combination of: roll, pitch, yaw
-  # For excavator: roll is locked (hardware), yaw follows slew automatically.
-  # User controls position (X,Y,Z) and pitch only.
-  ignore_axes: ["roll", "yaw"]
-
-  # Use reduced Jacobian (removes uncontrollable DOFs like roll)
-  # Recommended for cleaner excavator control
-  use_reduced_jacobian: true
+  # Orientation axes that cannot be physically produced are auto-detected from
+  # joint rotation axes and always excluded from IK solving. No manual ignore_axes
+  # needed: target orientation is constructed in the robot's local frame by the
+  # controller (pitch composed with current slew quaternion), so yaw error is
+  # zero by construction.
+  # TODO: add orientation_mode config here (pitch_follows_slew / full_pose) for rototilt support.
 
   # Relative joint limits (degrees) for [slew, boom, arm, bucket]
-  # Leave empty [] to use default [-π, π] for all joints
-  # Example: [[-30.0, 30.0], [-45.0, 60.0], [-90.0, 90.0], [-90.0, 90.0]]
-  joint_limits_relative: []
+  # Leave empty [] to use default [-π, π] for all joints.
+  # Per-joint null = unbounded (np.clip with ±inf, joint-limit-avoidance skipped).
+  # Example: [[-30.0, 30.0], [-65.0, 25.0], [-15.0, 140.0], [-130.0, 75.0]]
+  joint_limits_relative:
+    - null              # slew: unbounded — allows continuous cab rotation across ±180°
+    - [-50.0, 30.0]   # boom
+    - [28.0, 144.0]   # arm
+    - [-120.0, 20.0]   # bucket
 
-  # Joint weight scheduling - dynamically adjust joint weights based on EE position
-  # Formula: scale = (r_nominal / clamp(r, r_min, r_max))^exponent
-  # where r = sqrt(x² + y²) is horizontal radial distance from slew axis
-  # At r_nominal: scale = 1.0 (base weight applies - set this to typical working distance)
-  # At r < r_nominal: scale > 1.0 (more slew allowed when close)
-  # At r > r_nominal: scale < 1.0 (less slew allowed when extended)
-  joint_weight_scheduling:
-    enabled: true
-    joint0:  # slew
-      r_min: 0.35          # clamp reach below this (m) - prevents extreme scaling
-      r_max: 0.7          # clamp reach above this (m) - ~max working radius
-      r_nominal: 0.5      # typical working distance where base weight applies
-      exponent: 1.8       # power law (1.0 = linear, 2.0 = square)
+
+# Pre-flight reachability check (modules/reachability.py).
+# Runs a simulated IK rollout when give_pose() is called and rejects targets
+# that the geometry cannot satisfy before any hydraulic motion starts.
+# Returns the closest reachable position so the GUI can snap the target.
+reachability:
+  enabled: true
+  pos_tol_m: 0.005          # Convergence tolerance (m)
+  max_iters: 80             # Hard iteration cap per check
+  min_target_delta_m: 0.002 # Skip re-check when joystick moves less than this

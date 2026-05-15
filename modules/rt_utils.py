@@ -1,21 +1,10 @@
-"""
-Real-time utilities for Linux RT kernels.
+# pyright: reportAttributeAccessIssue=false
 
-Provides optional RT enhancements (priority scheduling, memory locking, CPU affinity)
-that can be enabled/disabled at runtime. Designed for stability over performance.
+"""Real-time utilities for Linux RT kernels.
 
-Usage:
-    from modules.rt_utils import RTConfig, apply_rt_to_thread
-
-    # Apply RT settings to current thread (safe - no-op if RT unavailable)
-    apply_rt_to_thread(priority=50, lock_memory=True)
-
-    # Or use RTConfig for more control
-    rt = RTConfig(enabled=True, priority=50)
-    rt.apply_to_current_thread()
-
-    # Check what's available
-    print(RTConfig.get_system_info())
+Provides optional RT enhancements such as scheduler priority, memory locking,
+and CPU affinity. Helpers are conservative by default and safe to call when RT
+support is unavailable.
 """
 
 import os
@@ -24,7 +13,14 @@ import threading
 import ctypes
 from typing import Optional, Dict, Any, Set
 
-__all__ = ['RTConfig', 'apply_rt_to_thread', 'is_rt_capable', 'get_system_info']
+__all__ = [
+    'RTConfig',
+    'apply_rt_to_thread',
+    'is_rt_capable',
+    'get_system_info',
+    'get_thread_info',
+    'scheduler_name',
+]
 
 
 # Priority ranges (conservative defaults)
@@ -37,15 +33,49 @@ SCHED_OTHER = 0  # Normal (non-RT)
 SCHED_FIFO = 1   # RT: First-in-first-out
 SCHED_RR = 2     # RT: Round-robin
 
+_sched_getscheduler = getattr(os, 'sched_getscheduler', None)
+_sched_setscheduler = getattr(os, 'sched_setscheduler', None)
+_sched_getparam = getattr(os, 'sched_getparam', None)
+_sched_param = getattr(os, 'sched_param', None)
+_sched_getaffinity = getattr(os, 'sched_getaffinity', None)
+_sched_setaffinity = getattr(os, 'sched_setaffinity', None)
+_geteuid_func = getattr(os, 'geteuid', None)
+
+
+def _geteuid() -> int:
+    """Best-effort effective uid."""
+    if _geteuid_func is None:
+        return -1
+    try:
+        return int(_geteuid_func())
+    except Exception:
+        return -1
+
+
+def scheduler_name(policy: int) -> str:
+    """Return human-readable scheduler name."""
+    return {
+        SCHED_OTHER: 'SCHED_OTHER',
+        SCHED_FIFO: 'SCHED_FIFO',
+        SCHED_RR: 'SCHED_RR',
+    }.get(int(policy), f'UNKNOWN({policy})')
+
+
+def _resolve_target_id(target_id: Optional[int]) -> int:
+    """Translate None to the calling thread/process target id expected by os.*."""
+    return 0 if target_id is None else int(target_id)
+
 
 def is_rt_capable() -> bool:
     """Check if the system supports RT scheduling for this process."""
     try:
         # Try to query current scheduler - if this works, we have basic sched support
-        os.sched_getscheduler(0)
+        if _sched_getscheduler is None:
+            return False
+        _sched_getscheduler(0)
         # Check if we have permission (need CAP_SYS_NICE or root)
         # We don't actually set anything, just check if we could
-        return os.geteuid() == 0 or _has_cap_sys_nice()
+        return _geteuid() == 0 or _has_cap_sys_nice()
     except (AttributeError, OSError):
         return False
 
@@ -69,11 +99,11 @@ def get_system_info() -> Dict[str, Any]:
     """Get system RT capability information."""
     info = {
         'rt_capable': is_rt_capable(),
-        'euid': os.geteuid(),
-        'is_root': os.geteuid() == 0,
+        'euid': _geteuid(),
+        'is_root': _geteuid() == 0,
         'has_cap_sys_nice': _has_cap_sys_nice(),
         'python_version': sys.version_info[:3],
-        'has_sched_module': hasattr(os, 'sched_setscheduler'),
+        'has_sched_module': _sched_setscheduler is not None,
     }
 
     # Check for RT kernel
@@ -88,49 +118,107 @@ def get_system_info() -> Dict[str, Any]:
 
     # Get available CPUs
     try:
-        info['available_cpus'] = list(os.sched_getaffinity(0))
+        if _sched_getaffinity is None:
+            raise RuntimeError("sched_getaffinity unavailable")
+        info['available_cpus'] = list(_sched_getaffinity(0))
         info['cpu_count'] = os.cpu_count()
     except Exception:
         info['available_cpus'] = []
         info['cpu_count'] = os.cpu_count()
 
+    try:
+        if _sched_getscheduler is None or _sched_getparam is None:
+            raise RuntimeError("scheduler queries unavailable")
+        info['current_scheduler'] = scheduler_name(_sched_getscheduler(0))
+        info['current_priority'] = int(_sched_getparam(0).sched_priority)
+    except Exception:
+        info['current_scheduler'] = 'unknown'
+        info['current_priority'] = None
+
+    return info
+
+
+def get_thread_info(target_id: Optional[int] = None) -> Dict[str, Any]:
+    """Return scheduler, priority, affinity, and identity for a thread/task.
+
+    Args:
+        target_id: Linux task id / native thread id. None means the calling thread.
+    """
+    tid = _resolve_target_id(target_id)
+    info: Dict[str, Any] = {
+        'target_id': tid if tid != 0 else threading.get_native_id(),
+    }
+    if target_id is None:
+        info['python_thread_id'] = threading.get_ident()
+        info['python_native_id'] = threading.get_native_id()
+
+    try:
+        if _sched_getscheduler is None:
+            raise RuntimeError("sched_getscheduler unavailable")
+        policy = _sched_getscheduler(tid)
+        info['scheduler'] = scheduler_name(policy)
+        info['scheduler_id'] = int(policy)
+    except Exception:
+        info['scheduler'] = 'unknown'
+        info['scheduler_id'] = None
+
+    try:
+        if _sched_getparam is None:
+            raise RuntimeError("sched_getparam unavailable")
+        info['priority'] = int(_sched_getparam(tid).sched_priority)
+    except Exception:
+        info['priority'] = None
+
+    try:
+        if _sched_getaffinity is None:
+            raise RuntimeError("sched_getaffinity unavailable")
+        info['cpu_affinity'] = sorted(_sched_getaffinity(tid))
+    except Exception:
+        info['cpu_affinity'] = None
+
     return info
 
 
 def apply_rt_to_thread(
-    priority: int = PRIORITY_DEFAULT,
+    priority: Optional[int] = PRIORITY_DEFAULT,
     policy: int = SCHED_FIFO,
-    lock_memory: bool = False,
+    lock_memory: bool = True,
     cpu_affinity: Optional[Set[int]] = None,
-    quiet: bool = False
+    quiet: bool = False,
+    target_id: Optional[int] = None,
 ) -> bool:
     """Apply RT settings to the current thread.
 
     Safe to call even if RT is unavailable - will silently succeed with no-op.
 
     Args:
-        priority: RT priority (1-89, higher = more priority)
+        priority: RT priority (1-89, higher = more priority). If None or <= 0,
+                  scheduler policy is left unchanged.
         policy: SCHED_FIFO (default) or SCHED_RR
         lock_memory: Lock all memory to prevent page faults
         cpu_affinity: Set of CPUs to pin to (None = don't change)
         quiet: Suppress warning messages
+        target_id: Linux task id / native thread id to configure. None means
+                   the calling thread.
 
     Returns:
         True if RT settings were applied, False if unavailable/failed
     """
     success = True
-
-    # Clamp priority to safe range
-    priority = max(PRIORITY_MIN, min(PRIORITY_MAX, priority))
+    sched_target = _resolve_target_id(target_id)
 
     # Set scheduler priority
-    try:
-        param = os.sched_param(priority)
-        os.sched_setscheduler(0, policy, param)
-    except (AttributeError, PermissionError, OSError) as e:
-        if not quiet:
-            print(f"[RT] Could not set scheduler priority: {e}")
-        success = False
+    if priority is not None and priority > 0:
+        try:
+            priority = max(PRIORITY_MIN, min(PRIORITY_MAX, int(priority)))
+            if _sched_param is None or _sched_setscheduler is None:
+                raise AttributeError("sched_setscheduler unavailable")
+            param = _sched_param(priority)
+            _sched_setscheduler(sched_target, policy, param)
+        except (AttributeError, PermissionError, OSError) as e:
+            if not quiet:
+                print(f"[RT] Could not set scheduler priority: {e}")
+            success = False
 
     # Lock memory
     if lock_memory:
@@ -152,7 +240,9 @@ def apply_rt_to_thread(
     # Set CPU affinity
     if cpu_affinity is not None:
         try:
-            os.sched_setaffinity(0, cpu_affinity)
+            if _sched_setaffinity is None:
+                raise AttributeError("sched_setaffinity unavailable")
+            _sched_setaffinity(sched_target, cpu_affinity)
         except (AttributeError, PermissionError, OSError) as e:
             if not quiet:
                 print(f"[RT] Could not set CPU affinity: {e}")
@@ -161,15 +251,17 @@ def apply_rt_to_thread(
     return success
 
 
-def reset_to_normal(quiet: bool = False) -> bool:
+def reset_to_normal(quiet: bool = False, target_id: Optional[int] = None) -> bool:
     """Reset current thread to normal (non-RT) scheduling.
 
     Returns:
         True if reset succeeded, False otherwise
     """
     try:
-        param = os.sched_param(0)
-        os.sched_setscheduler(0, SCHED_OTHER, param)
+        if _sched_param is None or _sched_setscheduler is None:
+            raise AttributeError("sched_setscheduler unavailable")
+        param = _sched_param(0)
+        _sched_setscheduler(_resolve_target_id(target_id), SCHED_OTHER, param)
         return True
     except (AttributeError, PermissionError, OSError) as e:
         if not quiet:

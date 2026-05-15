@@ -23,6 +23,7 @@ Usage:
 
 import threading
 import time
+from collections import deque
 from typing import Dict, Any, Optional
 
 __all__ = ['LoopPerfTracker', 'IntervalTracker', 'ControlLoopPerfTracker']
@@ -434,11 +435,11 @@ class ControlLoopPerfTracker:
         self._lock = threading.Lock()
 
         # Ring buffers for percentile support
-        self._loop_times: list = []
-        self._compute_times: list = []
+        self._loop_times: deque = deque(maxlen=self._buffer_size)
+        self._compute_times: deque = deque(maxlen=self._buffer_size)
 
-        # Stage timing (dict of stage_name -> list of durations)
-        self._stage_times: Dict[str, list] = {}
+        # Stage timing (dict of stage_name -> deque of durations)
+        self._stage_times: Dict[str, deque] = {}
         self._stage_starts: Dict[str, float] = {}
 
         # Counters
@@ -450,9 +451,19 @@ class ControlLoopPerfTracker:
         self._rate_window_start = time.perf_counter()
         self._hz = 0.0
 
+        # Whole-process CPU usage sampling (computed on get_stats calls)
+        self._process_cpu_pct = 0.0
+        self._process_cpu_last_wall = time.perf_counter()
+        self._process_cpu_last_time = time.process_time()
+
         # Timing state
         self._last_loop_start: Optional[float] = None
         self._current_loop_start: Optional[float] = None
+
+        # Cumulative deadline/compute miss tracking
+        self._deadline_miss_count = 0
+        self._deadline_miss_1pct_count = 0
+        self._compute_overrun_count = 0
 
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable tracking at runtime."""
@@ -478,8 +489,14 @@ class ControlLoopPerfTracker:
             self._rate_count = 0
             self._rate_window_start = time.perf_counter()
             self._hz = 0.0
+            self._process_cpu_pct = 0.0
+            self._process_cpu_last_wall = time.perf_counter()
+            self._process_cpu_last_time = time.process_time()
             self._last_loop_start = None
             self._current_loop_start = None
+            self._deadline_miss_count = 0
+            self._deadline_miss_1pct_count = 0
+            self._compute_overrun_count = 0
 
     def loop_start(self) -> None:
         """Call at the start of each control loop iteration."""
@@ -502,8 +519,10 @@ class ControlLoopPerfTracker:
             if interval > 0:
                 with self._lock:
                     self._loop_times.append(interval)
-                    if len(self._loop_times) > self._buffer_size:
-                        self._loop_times.pop(0)
+                    if interval > self._target_period:
+                        self._deadline_miss_count += 1
+                    if interval > (self._target_period * 1.01):
+                        self._deadline_miss_1pct_count += 1
 
         self._last_loop_start = now
         self._current_loop_start = now
@@ -518,12 +537,10 @@ class ControlLoopPerfTracker:
 
         with self._lock:
             self._compute_times.append(compute_time)
-            if len(self._compute_times) > self._buffer_size:
-                self._compute_times.pop(0)
-
             self._loop_count += 1
             if compute_time > self._target_period:
                 self._violation_count += 1
+                self._compute_overrun_count += 1
 
         self._current_loop_start = None
 
@@ -545,10 +562,8 @@ class ControlLoopPerfTracker:
         duration = time.perf_counter() - start
         with self._lock:
             if stage_name not in self._stage_times:
-                self._stage_times[stage_name] = []
+                self._stage_times[stage_name] = deque(maxlen=self._buffer_size)
             self._stage_times[stage_name].append(duration)
-            if len(self._stage_times[stage_name]) > self._buffer_size:
-                self._stage_times[stage_name].pop(0)
 
         del self._stage_starts[stage_name]
 
@@ -559,10 +574,8 @@ class ControlLoopPerfTracker:
 
         with self._lock:
             if stage_name not in self._stage_times:
-                self._stage_times[stage_name] = []
+                self._stage_times[stage_name] = deque(maxlen=self._buffer_size)
             self._stage_times[stage_name].append(duration_s)
-            if len(self._stage_times[stage_name]) > self._buffer_size:
-                self._stage_times[stage_name].pop(0)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive performance statistics.
@@ -571,11 +584,13 @@ class ControlLoopPerfTracker:
             Dictionary with:
             - hz: Measured loop frequency
             - loop_avg_ms, loop_std_ms, loop_min_ms, loop_max_ms
-            - loop_p95_ms, loop_p99_ms: Percentile latencies
+            - loop_p95_ms, loop_p99_ms, max_step_ms: loop interval spread
             - compute_avg_ms, compute_std_ms, compute_min_ms, compute_max_ms
             - headroom_avg_ms: Average time remaining before target period
-            - cpu_usage_pct: Compute time as percentage of target period
-            - violation_pct: Percentage of loops exceeding target period
+            - loop_util_pct / cpu_usage_pct: Compute time as percentage of target period
+            - process_cpu_pct: Whole-process CPU percent since last stats sample
+            - deadline_miss_*: Loop interval misses against target period
+            - compute_overrun_* / violation_*: Compute time misses against target period
             - stages: Dict of stage_name -> {avg_ms, min_ms, max_ms}
             - samples: Number of samples in buffer
         """
@@ -583,16 +598,39 @@ class ControlLoopPerfTracker:
             return {}
 
         with self._lock:
+            now_wall = time.perf_counter()
+            now_cpu = time.process_time()
+            wall_dt = now_wall - self._process_cpu_last_wall
+            cpu_dt = now_cpu - self._process_cpu_last_time
+            if wall_dt > 0:
+                self._process_cpu_pct = (cpu_dt / wall_dt) * 100.0
+            self._process_cpu_last_wall = now_wall
+            self._process_cpu_last_time = now_cpu
+            target_ms = self._target_period * 1000.0
+
             if not self._loop_times:
                 return {
                     'hz': 0.0,
                     'loop_avg_ms': 0.0, 'loop_std_ms': 0.0,
                     'loop_min_ms': 0.0, 'loop_max_ms': 0.0,
                     'loop_p95_ms': 0.0, 'loop_p99_ms': 0.0,
+                    'max_step_ms': 0.0,
                     'compute_avg_ms': 0.0, 'compute_std_ms': 0.0,
                     'compute_min_ms': 0.0, 'compute_max_ms': 0.0,
-                    'headroom_avg_ms': 0.0, 'cpu_usage_pct': 0.0,
+                    'headroom_avg_ms': 0.0,
+                    'cpu_usage_pct': 0.0,
+                    'loop_util_pct': 0.0,
+                    'process_cpu_pct': float(self._process_cpu_pct),
                     'violation_pct': 0.0, 'violation_count': 0,
+                    'compute_overrun_pct': 0.0, 'compute_overrun_count': 0,
+                    'compute_overrun_count_recent': 0, 'compute_overrun_pct_recent': 0.0,
+                    'deadline_miss_count': 0, 'deadline_miss_pct': 0.0,
+                    'deadline_miss_count_recent': 0, 'deadline_miss_pct_recent': 0.0,
+                    'deadline_miss_1pct_count': 0, 'deadline_miss_1pct_pct': 0.0,
+                    'deadline_miss_1pct_count_recent': 0, 'deadline_miss_1pct_pct_recent': 0.0,
+                    'deadline_window_sec': 0.0,
+                    'overrun_count_recent': 0, 'overrun_pct_recent': 0.0,
+                    'overrun_window_sec': 0.0,
                     'stages': {},
                     'samples': 0,
                 }
@@ -613,14 +651,25 @@ class ControlLoopPerfTracker:
             p99_idx = int(len(sorted_loop) * 0.99)
             loop_p95 = sorted_loop[min(p95_idx, len(sorted_loop) - 1)]
             loop_p99 = sorted_loop[min(p99_idx, len(sorted_loop) - 1)]
+            max_step = max(abs(t - target_ms) for t in loop_ms) if loop_ms else 0.0
 
-            # Headroom and CPU usage
-            target_ms = self._target_period * 1000.0
             headroom_avg = target_ms - compute_avg
-            cpu_usage_pct = (compute_avg / target_ms) * 100.0 if target_ms > 0 else 0.0
+            loop_util_pct = (compute_avg / target_ms) * 100.0 if target_ms > 0 else 0.0
 
-            # Violation percentage
-            violation_pct = (self._violation_count / max(1, self._loop_count)) * 100.0
+            # Deadline / compute miss stats
+            recent_deadline_miss_count = sum(1 for t in self._loop_times if t > self._target_period)
+            recent_deadline_miss_pct = (recent_deadline_miss_count / max(1, len(self._loop_times))) * 100.0
+            recent_deadline_miss_1pct_count = sum(1 for t in self._loop_times if t > (self._target_period * 1.01))
+            recent_deadline_miss_1pct_pct = (recent_deadline_miss_1pct_count / max(1, len(self._loop_times))) * 100.0
+            deadline_window_sec = sum(self._loop_times)
+
+            recent_compute_overrun_count = sum(1 for t in self._compute_times if t > self._target_period)
+            recent_compute_overrun_pct = (recent_compute_overrun_count / max(1, len(self._compute_times))) * 100.0
+
+            deadline_total = max(1, self._loop_count - 1)
+            violation_pct = (self._compute_overrun_count / max(1, self._loop_count)) * 100.0
+            deadline_miss_pct = (self._deadline_miss_count / deadline_total) * 100.0
+            deadline_miss_1pct_pct = (self._deadline_miss_1pct_count / deadline_total) * 100.0
 
             # Stage stats
             stages = {}
@@ -641,14 +690,33 @@ class ControlLoopPerfTracker:
                 'loop_max_ms': float(max(loop_ms)),
                 'loop_p95_ms': float(loop_p95),
                 'loop_p99_ms': float(loop_p99),
+                'max_step_ms': float(max_step),
                 'compute_avg_ms': float(compute_avg),
                 'compute_std_ms': float(compute_std),
                 'compute_min_ms': float(min(compute_ms)),
                 'compute_max_ms': float(max(compute_ms)),
                 'headroom_avg_ms': float(headroom_avg),
-                'cpu_usage_pct': float(cpu_usage_pct),
+                'cpu_usage_pct': float(loop_util_pct),
+                'loop_util_pct': float(loop_util_pct),
+                'process_cpu_pct': float(self._process_cpu_pct),
                 'violation_pct': float(violation_pct),
-                'violation_count': int(self._violation_count),
+                'violation_count': int(self._compute_overrun_count),
+                'compute_overrun_pct': float(violation_pct),
+                'compute_overrun_count': int(self._compute_overrun_count),
+                'compute_overrun_count_recent': int(recent_compute_overrun_count),
+                'compute_overrun_pct_recent': float(recent_compute_overrun_pct),
+                'deadline_miss_count': int(self._deadline_miss_count),
+                'deadline_miss_pct': float(deadline_miss_pct),
+                'deadline_miss_count_recent': int(recent_deadline_miss_count),
+                'deadline_miss_pct_recent': float(recent_deadline_miss_pct),
+                'deadline_miss_1pct_count': int(self._deadline_miss_1pct_count),
+                'deadline_miss_1pct_pct': float(deadline_miss_1pct_pct),
+                'deadline_miss_1pct_count_recent': int(recent_deadline_miss_1pct_count),
+                'deadline_miss_1pct_pct_recent': float(recent_deadline_miss_1pct_pct),
+                'deadline_window_sec': float(deadline_window_sec),
+                'overrun_count_recent': int(recent_deadline_miss_count),
+                'overrun_pct_recent': float(recent_deadline_miss_pct),
+                'overrun_window_sec': float(deadline_window_sec),
                 'stages': stages,
                 'samples': len(self._loop_times),
             }
