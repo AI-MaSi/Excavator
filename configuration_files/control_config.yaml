@@ -219,3 +219,25 @@ reachability:
   pos_tol_m: 0.005          # Convergence tolerance (m)
   max_iters: 80             # Hard iteration cap per check
   min_target_delta_m: 0.002 # Skip re-check when joystick moves less than this
+
+
+# Hall-sensor slew homing (modules/hall_homing.py).
+# Wiggles the slew at startup to find the Hall-zone edges, then sets a
+# yaw offset so subsequent IMU readings have yaw=0 at the mechanical zero.
+# Replace gpio_pin with the actual BCM pin once wired; lgpio handle uses
+# chip 4 on Pi 5 (chip 0 on Pi 4/older).
+hall:
+  enabled: true               # Master switch — flip to true after wiring + pin known.
+  gpio_chip: 4                # 4 on Pi 5, 0 on Pi 4/3. Adjust per board.
+  gpio_pin: 17                # BCM GPIO17 (physical pin 11 on the 40-pin header).
+  active_high: false           # Sensor logic — true = HIGH inside zone, LOW outside.
+  pull_up: false               # Enable internal pull-up (open-collector Hall sensors need this).
+  wiggle_speed: 0.20          # Normalized slew PWM during homing (0..1). Slow!
+  search_timeout_s: 30.0      # Per-transition timeout before aborting.
+  search_limit_deg: 30.0      # Max yaw delta from search start before reversing direction.
+  settle_time_s: 0.75         # Quiet period after final centering before reading yaw.
+  poll_dt_s: 0.005            # Hall polling period — 200 Hz matches IMU rate.
+  recenter_band_factor: 1.5   # When inside on startup, must overshoot this × band before reversing.
+  # Optional cached calibration. Set null when unknown. Numeric values are used
+  # only as a sanity check against live edge-pair measurements.
+  cached_band_width_deg: 10.200

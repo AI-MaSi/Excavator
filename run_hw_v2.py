@@ -7,9 +7,9 @@ comparable with the simulation runs (same 38-column trajectory layout, same
 metrics columns where available on real hardware).
 
 Usage examples:
-    sudo python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
+    sudo python run_hw_v2.py --algorithm a_star --task in-and-out --log --num-runs 10
     sudo python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
-    sudo python run_hw_v2.py --test --once          # direct A/B, no planner
+    sudo python run_hw_v2.py --test --num-runs 1   # direct A/B, no planner
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from configuration_files.pathing_config import (
     PathExecutionConfig,
 )
 from modules.excavator_controller import ExcavatorController
+from modules.hall_homing import HallSlewHoming, load_hall_config
 from modules.hardware_interface import HardwareFaultError, HardwareInterface
 from modules.quaternion_math import quat_from_axis_angle
 from modules.rt_utils import SCHED_FIFO, apply_rt_to_thread, reset_to_normal
@@ -226,7 +227,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log", action="store_true", help="Write trajectory CSV + metrics.csv under logs_hw/.")
     parser.add_argument("--debug", action="store_true", help="Verbose logging from controller, hardware, and planning internals.")
     parser.add_argument("--debug-planning", action="store_true", help="Verbose planning logs only.")
-    parser.add_argument("--once", action="store_true", help="Run a single sweep through the task goals and stop.")
+    parser.add_argument("--control-config", type=str, default="configuration_files/control_config.yaml", help="Controller/IK/IMU config YAML path.")
+    parser.add_argument("--num-runs", type=int, default=None, metavar="N", help="Run N complete task sweeps, ending back at the first target.")
     parser.add_argument("--test", action="store_true", help="Direct A/B pose commands every 10s — no planner.")
     parser.add_argument("--rt-priority", type=int, default=75, help="RT priority for control loop (0=disable).")
     parser.add_argument("--imu-priority", type=int, default=70, help="RT priority for IMU thread (0=normal).")
@@ -236,6 +238,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args = _build_arg_parser().parse_args(argv)
+    if args.num_runs is not None and args.num_runs < 1:
+        raise SystemExit("--num-runs must be >= 1")
     args.algorithm_name = _resolve_algorithm_name(
         args.algorithm, radial=args.radial, planar=args.planar
     )
@@ -275,8 +279,10 @@ def _configure_logging(args: argparse.Namespace) -> None:
     logger.setLevel(logging.INFO)
 
 
-def _load_control_config() -> Dict[str, Any]:
-    config_path = _ROOT / "configuration_files" / "control_config.yaml"
+def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.is_absolute():
+        config_path = _ROOT / config_path
     if not config_path.exists():
         return {}
     try:
@@ -1052,13 +1058,14 @@ def _run_direct_target_test(
     path_config: PathExecutionConfig,
     *,
     dwell_seconds: float = 10.0,
-    once: bool = False,
+    num_runs: Optional[int] = None,
 ) -> None:
     pos_tol = float(path_config.final_target_tolerance)
     rot_tol = float(np.degrees(path_config.orientation_tolerance))
 
     controller.resume()
     cycle = 0
+    max_cycles = None if num_runs is None else int(num_runs) * len(targets)
     try:
         while True:
             target_idx = cycle % len(targets)
@@ -1099,8 +1106,8 @@ def _run_direct_target_test(
                 time.sleep(0.2)
 
             cycle += 1
-            if once and cycle >= len(targets):
-                logger.info("[Test] Single sweep complete (--once); stopping.")
+            if max_cycles is not None and cycle >= max_cycles:
+                logger.info("[Test] Completed %d full task run(s); stopping.", int(num_runs))
                 break
     finally:
         controller.pause()
@@ -1123,7 +1130,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("  HARDWARE PATH PLANNING RUNNER V2")
     logger.info("=" * 60)
     logger.info("Task: %s | Algorithm: %s", args.task, args.algorithm_name)
-    logger.info("Debug=%s, Log=%s, Once=%s", args.debug, args.log, args.once)
+    logger.info("Debug=%s, Log=%s, Num runs=%s", args.debug, args.log, args.num_runs)
+    logger.info("Control config: %s", args.control_config)
     logger.info("RT priorities: ctrl=%d, imu=%d", args.rt_priority, args.imu_priority)
 
     targets: List[Tuple[np.ndarray, float]] = [
@@ -1149,6 +1157,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger.info("Initializing hardware interface...")
     hardware = HardwareInterface(
+        control_config_file=args.control_config,
         perf_enabled=bool(args.debug),
         cleanup_disable_osc=False,
         enable_adc=False,
@@ -1162,6 +1171,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         enable_perf_tracking=True,
         log_level="DEBUG" if args.debug else "INFO",
         rt_priority=args.rt_priority,
+        control_config_file=args.control_config,
     )
     controller.start()
 
@@ -1212,6 +1222,36 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     controller.pause()
 
+    hall_cfg = load_hall_config(_load_control_config(args.control_config))
+    if hall_cfg is not None:
+        logger.info(
+            "Running Hall slew homing before pathing "
+            "(limit=%.1fdeg, timeout=%.1fs)...",
+            hall_cfg.search_limit_deg,
+            hall_cfg.search_timeout_s,
+        )
+        homing = HallSlewHoming(
+            controller=controller,
+            hardware=hardware,
+            config=hall_cfg,
+            on_progress=lambda msg: logger.info("[Hall] %s", msg),
+        )
+        homing_result = homing.run()
+        if not homing_result.success:
+            logger.critical("Hall homing failed; aborting pathing run: %s", homing_result.reason)
+            try:
+                controller.stop()
+            except Exception:
+                pass
+            try:
+                hardware.shutdown()
+            except Exception:
+                pass
+            reset_to_normal(quiet=True)
+            return 1
+    else:
+        logger.info("Hall homing disabled or not configured; continuing without yaw zeroing.")
+
     # Drive to first goal as start pose so planning begins from a known state.
     start_pos, start_rot = targets[0]
     _blind_move_to_start(
@@ -1240,6 +1280,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     target_index = 1 % len(targets)  # we are AT goal 0; aim at next first
     cycle = 0
+    max_cycles = None if args.num_runs is None else int(args.num_runs) * len(targets)
 
     try:
         if args.test:
@@ -1249,7 +1290,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 targets=targets,
                 path_config=path_config,
                 dwell_seconds=10.0,
-                once=bool(args.once),
+                num_runs=args.num_runs,
             )
             return 0
 
@@ -1337,8 +1378,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             time.sleep(5.0)
 
             target_index = (target_index + 1) % len(targets)
-            if args.once and cycle >= 1:
-                logger.info("Single cycle completed (--once); stopping.")
+            if max_cycles is not None and cycle >= max_cycles:
+                logger.info(
+                    "Completed %d full task run(s) (%d planned legs); stopping at %s.",
+                    int(args.num_runs), cycle, task.labels[0],
+                )
                 break
 
     except KeyboardInterrupt:

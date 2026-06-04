@@ -395,7 +395,8 @@ class ExcavatorController:
     def __init__(self, hardware_interface, config: Optional[ControllerConfig] = None,
                  enable_perf_tracking: bool = False, log_level: str = "INFO",
                  rt_priority: int = 0, rt_lock_memory: bool = False,
-                 rt_cpu_core: Optional[int] = None):
+                 rt_cpu_core: Optional[int] = None,
+                 control_config_file: str = "configuration_files/control_config.yaml"):
         """Initialize the excavator controller.
 
         Args:
@@ -406,8 +407,10 @@ class ExcavatorController:
             rt_priority: RT priority for the controller loop thread (0 = normal).
             rt_lock_memory: Whether to call mlockall() from the controller thread.
             rt_cpu_core: Optional CPU core to pin the controller loop thread to.
+            control_config_file: Path to controller/IK/robot YAML selected by the caller.
         """
         self.hardware = hardware_interface
+        self.control_config_file = control_config_file
         self._enable_perf_tracking = enable_perf_tracking
         self._rt_priority = int(rt_priority)
         self._rt_lock_memory = bool(rt_lock_memory)
@@ -437,7 +440,7 @@ class ExcavatorController:
 
         # Load controller configuration from control_config.yaml if not provided
         if config is None:
-            gc = _load_control_config()
+            gc = _load_control_config(self.control_config_file)
             if not isinstance(gc, dict) or not gc:
                 raise RuntimeError("Controller configuration requires control_config.yaml")
 
@@ -465,12 +468,12 @@ class ExcavatorController:
             self.config = config
 
         # Store full control config reference for later use (PID, IK, velocity limits, etc.)
-        self._control_config = _load_control_config()
+        self._control_config = _load_control_config(self.control_config_file)
         if not isinstance(self._control_config, dict) or not self._control_config:
             raise RuntimeError("Controller configuration requires control_config.yaml")
 
         # Robot configuration
-        self.robot_config = load_excavator_robot_config()
+        self.robot_config = load_excavator_robot_config(self.control_config_file)
         warmup_numba_functions()
 
         # IK controller setup (pull settings from control_config.yaml - fail hard if missing)

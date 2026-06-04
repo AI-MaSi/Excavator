@@ -123,6 +123,7 @@ class HardwareInterface:
     
     def __init__(self,
                  config_file: str = "configuration_files/servo_config_200.yaml",
+                 control_config_file: str = "configuration_files/control_config.yaml",
                  pump_auto_mode: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  input_rate_threshold: int = 20,
@@ -151,6 +152,7 @@ class HardwareInterface:
 
         Args:
             config_file: Path to PWM controller configuration
+            control_config_file: Path to controller/IMU configuration
             pump_auto_mode: Whether to use valve-activity-based auto pump speed (True) or static speed (False)
             toggle_channels: Whether to allow usage of "toggleable" channels (i.e. tracks + center rotation)
             input_rate_threshold: Minimum required PWM command rate (Hz). Resets valves to center
@@ -188,6 +190,7 @@ class HardwareInterface:
             self.logger.addHandler(handler)
 
         self.config_file = config_file
+        self.control_config_file = control_config_file
         self._enable_pwm = bool(enable_pwm)
         self._enable_imu = bool(enable_imu)
         self._enable_adc = bool(enable_adc)
@@ -203,78 +206,10 @@ class HardwareInterface:
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
         self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name}
 
-        # IMU mapping and chain — AHRS params are hardcoded in Pico firmware.
-        _cfg = _load_control_config()
-        _imu_cfg = _cfg.get('imu', {})
-        # Named IMU mapping: logical role -> physical sensor index
-        _imu_mapping = _imu_cfg.get('imu_mapping')
-        if _imu_mapping is None or not isinstance(_imu_mapping, dict):
-            raise ValueError("imu.imu_mapping is required in control_config.yaml (dict of role -> sensor index)")
-        self._imu_mapping = dict(_imu_mapping)
-        _imu_chain = _imu_cfg.get('chain')
-        if not isinstance(_imu_chain, list):
-            _imu_chain = [
-                {'joint': 'slew', 'output_index': 0, 'source': 'all', 'axis': 'z', 'extraction': 'average_z_yaw'},
-                {'joint': 'lift', 'role': 'boom', 'parent_role': 'base', 'output_index': 1, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
-                {'joint': 'arm', 'role': 'arm', 'parent_role': 'boom', 'output_index': 2, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
-                {'joint': 'bucket', 'role': 'bucket', 'parent_role': 'arm', 'output_index': 3, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
-            ]
-        _mounting_offsets_cfg = _imu_cfg.get('mounting_offsets_quat', {})
-        if _mounting_offsets_cfg is None:
-            _mounting_offsets_cfg = {}
-        if not isinstance(_mounting_offsets_cfg, dict):
-            raise ValueError("imu.mounting_offsets_quat must be a dict of role -> quaternion")
-        self._imu_chain = _imu_chain
-        # Sensor roles in the order the controller's canonical extraction expects.
-        _sensor_roles = []
-
-        def _add_sensor_role(role):
-            if role and role != 'all' and role in _imu_mapping and role not in _sensor_roles:
-                _sensor_roles.append(role)
-
-        for item in _imu_chain:
-            if not isinstance(item, dict):
-                continue
-            _add_sensor_role(item.get('parent_role'))
-            _add_sensor_role(item.get('role'))
-
-        _joint_roles = []
-        for item in _imu_chain:
-            if not isinstance(item, dict) or not item.get('role'):
-                continue
-            role = item['role']
-            if role not in _imu_mapping:
-                if bool(item.get('optional', False)):
-                    continue
-                raise ValueError(f"imu.imu_mapping missing required joint role '{role}'")
-            if role not in _joint_roles:
-                _joint_roles.append(role)
-        # Validate: all indices distinct and within [0, expected_count)
-        all_indices = list(_imu_mapping.values())
-        self._imu_all_indices = all_indices
-        if not all_indices:
-            raise ValueError("imu.imu_mapping must contain at least one mapped sensor role")
-        if len(set(all_indices)) != len(all_indices):
-            raise ValueError(f"imu.imu_mapping has duplicate indices: {_imu_mapping}")
-        for role, idx in _imu_mapping.items():
-            if not isinstance(idx, int) or idx < 0:
-                raise ValueError(f"imu.imu_mapping['{role}'] = {idx} must be a non-negative integer")
-        self._expected_imu_count = max(all_indices) + 1
-        for role, idx in _imu_mapping.items():
-            if idx >= self._expected_imu_count:
-                raise ValueError(f"imu.imu_mapping['{role}'] = {idx} out of range [0, {self._expected_imu_count})")
-        self._imu_sensor_roles = _sensor_roles
-        self._imu_joint_roles = _joint_roles
-        self._imu_joint_indices = [_imu_mapping[r] for r in _joint_roles]
-        self._base_imu_index = _imu_mapping.get('base')
-        self._imu_offset_inv_by_index = [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                                         for _ in range(self._expected_imu_count)]
-        for role, idx in _imu_mapping.items():
-            quat = _parse_offset_quaternion(
-                _mounting_offsets_cfg.get(role, [1.0, 0.0, 0.0, 0.0]),
-                f"imu.mounting_offsets_quat.{role}",
-            )
-            self._imu_offset_inv_by_index[idx] = quat_conjugate(quat)
+        if self._enable_imu:
+            self._init_imu_config()
+        else:
+            self._init_disabled_imu_config()
 
         # Initialize PWM controller
         # Use tri-state: PENDING -> READY or FAULT
@@ -372,7 +307,103 @@ class HardwareInterface:
                     self._start_adc_reader()
                 else:
                     self._adc_state = ReadyState.READY
-    
+
+    def _init_disabled_imu_config(self) -> None:
+        """Install neutral IMU metadata when IMU is a hard-disabled subsystem."""
+        self._imu_mapping = {}
+        self._imu_chain = []
+        self._imu_all_indices = []
+        self._expected_imu_count = 0
+        self._imu_sensor_roles = []
+        self._imu_joint_roles = []
+        self._imu_joint_indices = []
+        self._base_imu_index = None
+        self._imu_offset_inv_by_index = []
+        self._base_yaw_offset_deg = 0.0
+        self._base_yaw_offset_inv_quat = None
+
+    def _init_imu_config(self) -> None:
+        """Load and validate IMU mapping only when IMU support is enabled."""
+        # IMU mapping and chain — AHRS params are hardcoded in Pico firmware.
+        _cfg = _load_control_config(self.control_config_file)
+        _imu_cfg = _cfg.get('imu', {})
+        # Named IMU mapping: logical role -> physical sensor index
+        _imu_mapping = _imu_cfg.get('imu_mapping')
+        if _imu_mapping is None or not isinstance(_imu_mapping, dict):
+            raise ValueError("imu.imu_mapping is required in control_config.yaml (dict of role -> sensor index)")
+        self._imu_mapping = dict(_imu_mapping)
+        _imu_chain = _imu_cfg.get('chain')
+        if not isinstance(_imu_chain, list):
+            _imu_chain = [
+                {'joint': 'slew', 'output_index': 0, 'source': 'all', 'axis': 'z', 'extraction': 'average_z_yaw'},
+                {'joint': 'lift', 'role': 'boom', 'parent_role': 'base', 'output_index': 1, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+                {'joint': 'arm', 'role': 'arm', 'parent_role': 'boom', 'output_index': 2, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+                {'joint': 'bucket', 'role': 'bucket', 'parent_role': 'arm', 'output_index': 3, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+            ]
+        _mounting_offsets_cfg = _imu_cfg.get('mounting_offsets_quat', {})
+        if _mounting_offsets_cfg is None:
+            _mounting_offsets_cfg = {}
+        if not isinstance(_mounting_offsets_cfg, dict):
+            raise ValueError("imu.mounting_offsets_quat must be a dict of role -> quaternion")
+        self._imu_chain = _imu_chain
+        # Sensor roles in the order the controller's canonical extraction expects.
+        _sensor_roles = []
+
+        def _add_sensor_role(role):
+            if role and role != 'all' and role in _imu_mapping and role not in _sensor_roles:
+                _sensor_roles.append(role)
+
+        for item in _imu_chain:
+            if not isinstance(item, dict):
+                continue
+            _add_sensor_role(item.get('parent_role'))
+            _add_sensor_role(item.get('role'))
+
+        _joint_roles = []
+        for item in _imu_chain:
+            if not isinstance(item, dict) or not item.get('role'):
+                continue
+            role = item['role']
+            if role not in _imu_mapping:
+                if bool(item.get('optional', False)):
+                    continue
+                raise ValueError(f"imu.imu_mapping missing required joint role '{role}'")
+            if role not in _joint_roles:
+                _joint_roles.append(role)
+        # Validate: all indices distinct and within [0, expected_count)
+        all_indices = list(_imu_mapping.values())
+        self._imu_all_indices = all_indices
+        if not all_indices:
+            raise ValueError("imu.imu_mapping must contain at least one mapped sensor role")
+        if len(set(all_indices)) != len(all_indices):
+            raise ValueError(f"imu.imu_mapping has duplicate indices: {_imu_mapping}")
+        for role, idx in _imu_mapping.items():
+            if not isinstance(idx, int) or idx < 0:
+                raise ValueError(f"imu.imu_mapping['{role}'] = {idx} must be a non-negative integer")
+        self._expected_imu_count = max(all_indices) + 1
+        for role, idx in _imu_mapping.items():
+            if idx >= self._expected_imu_count:
+                raise ValueError(f"imu.imu_mapping['{role}'] = {idx} out of range [0, {self._expected_imu_count})")
+        self._imu_sensor_roles = _sensor_roles
+        self._imu_joint_roles = _joint_roles
+        self._imu_joint_indices = [_imu_mapping[r] for r in _joint_roles]
+        self._base_imu_index = _imu_mapping.get('base')
+        self._imu_offset_inv_by_index = [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                                         for _ in range(self._expected_imu_count)]
+        for role, idx in _imu_mapping.items():
+            quat = _parse_offset_quaternion(
+                _mounting_offsets_cfg.get(role, [1.0, 0.0, 0.0, 0.0]),
+                f"imu.mounting_offsets_quat.{role}",
+            )
+            self._imu_offset_inv_by_index[idx] = quat_conjugate(quat)
+
+        # Runtime base-yaw zeroing. Applied left-multiply to the base IMU quat
+        # inside the IMU thread so every downstream consumer (imu_by_role,
+        # snapshot.base_imu_quat, read_all_imu_quaternions) sees the corrected
+        # value. Set via set_base_yaw_offset_deg(); see HallSlewHoming.
+        self._base_yaw_offset_deg: float = 0.0
+        self._base_yaw_offset_inv_quat: Optional[np.ndarray] = None  # None == identity
+
     def _check_faults(self) -> None:
         """Check for hardware faults and raise HardwareFaultError if any subsystem has faulted.
 
@@ -494,6 +525,14 @@ class HardwareInterface:
                         self._correct_imu_quaternion(raw_quat_only[i], i)
                         for i in range(self._expected_imu_count)
                     ]
+                    # Apply runtime base-yaw zeroing if configured. Atomic read
+                    # under the GIL — no lock needed for the inverse-quat ref.
+                    if self._base_imu_index is not None:
+                        yaw_off_inv = self._base_yaw_offset_inv_quat
+                        if yaw_off_inv is not None:
+                            quat_only[self._base_imu_index] = quat_normalize(
+                                quat_multiply(yaw_off_inv, quat_only[self._base_imu_index])
+                            )
                     capture_debug = self._debug_telemetry_enabled
                     gyro_only = [
                         self._correct_imu_gyro(np.array(pkt[4:7], dtype=np.float32), i)
@@ -810,6 +849,35 @@ class HardwareInterface:
         if snapshot.base_imu_gyro is not None:
             result['gyro'] = snapshot.base_imu_gyro.copy()
         return result
+
+    def set_base_yaw_offset_deg(self, yaw_deg: float) -> None:
+        """Subtract ``yaw_deg`` from the base IMU yaw on every IMU sample.
+
+        Used by Hall-based homing to re-zero slew yaw at a known mechanical
+        reference. The offset is applied left-multiply in the world frame so
+        the corrected base quat has yaw=0 when the raw base IMU reads
+        ``yaw_deg``. Pass ``0.0`` to clear.
+        """
+        yaw_rad = float(np.radians(float(yaw_deg)))
+        if abs(yaw_rad) < 1e-9:
+            self._base_yaw_offset_deg = 0.0
+            self._base_yaw_offset_inv_quat = None
+            return
+        # Inverse Z-rotation: pre-multiplied to cancel measured yaw.
+        half = -yaw_rad / 2.0
+        self._base_yaw_offset_inv_quat = np.array(
+            [np.cos(half), 0.0, 0.0, np.sin(half)], dtype=np.float32
+        )
+        self._base_yaw_offset_deg = float(yaw_deg)
+        self.logger.info("Base yaw offset set: subtracting %.3f deg from IMU yaw", float(yaw_deg))
+
+    def get_base_yaw_offset_deg(self) -> float:
+        """Current base-yaw offset (deg) being subtracted from IMU readings."""
+        return float(self._base_yaw_offset_deg)
+
+    def clear_base_yaw_offset(self) -> None:
+        """Remove the base-yaw offset (back to raw mounting-corrected yaw)."""
+        self.set_base_yaw_offset_deg(0.0)
 
     @_safe_hardware_operation
     def read_all_imu_quaternions(self) -> Optional[List[np.ndarray]]:
