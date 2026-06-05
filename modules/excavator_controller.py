@@ -748,6 +748,9 @@ class ExcavatorController:
 
         # Engage paused state immediately so the loop stops computing commands
         self._pause_event.set()
+        # Drop perf interval baselines at the API boundary too. This avoids a
+        # pause/resume transition being reported as a synthetic long loop.
+        self._perf_tracker.mark_gap()
 
         # Wait briefly for loop to acknowledge pause (reduces racey state changes)
         if timeout_s and timeout_s > 0:
@@ -791,6 +794,9 @@ class ExcavatorController:
             rotation_deg=self._current_orientation_y_deg
         )
 
+        # Reset the perf baseline before the control thread becomes active again
+        # so the paused dwell cannot leak into loop interval statistics.
+        self._perf_tracker.mark_gap()
         self._pause_event.clear()
         if timeout_s and timeout_s > 0:
             # Wait for loop to clear pause acknowledgement
@@ -1424,6 +1430,7 @@ class ExcavatorController:
                 self.logger.warning("Control thread: Failed to apply requested RT settings")
 
         loop_period = 1.0 / self.config.control_frequency
+        pause_sleep_s = min(loop_period, 0.01)
         next_run_time = time.perf_counter()
         last_loop_start = next_run_time
 
@@ -1436,9 +1443,12 @@ class ExcavatorController:
             if self._pause_event.is_set():
                 if not self._pause_ack_event.is_set():
                     self._pause_ack_event.set()
-                next_run_time = time.perf_counter() + 0.1  # Reset timing when paused
+                    # Drop the interval baseline so the first loop_start()
+                    # after resume doesn't record the pause duration as jitter.
+                    self._perf_tracker.mark_gap()
+                next_run_time = time.perf_counter() + pause_sleep_s
                 last_loop_start = next_run_time
-                time.sleep(0.1)  # Sleep while paused
+                time.sleep(pause_sleep_s)
                 continue
             elif self._pause_ack_event.is_set():
                 self._pause_ack_event.clear()

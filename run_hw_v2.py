@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,9 +38,11 @@ from configuration_files.pathing_config import (
     DEFAULT_ENV_CONFIG,
     EnvironmentConfig,
     PathExecutionConfig,
+    TASK_PRESETS,
+    TaskPreset,
 )
 from modules.excavator_controller import ExcavatorController
-from modules.hall_homing import HallSlewHoming, load_hall_config
+from modules.hall_homing import HallReader, HallSlewHoming, _yaw_deg_from_quat, load_hall_config
 from modules.hardware_interface import HardwareFaultError, HardwareInterface
 from modules.quaternion_math import quat_from_axis_angle
 from modules.rt_utils import SCHED_FIFO, apply_rt_to_thread, reset_to_normal
@@ -101,7 +104,7 @@ logger = logging.getLogger("run_hw_v2")
 
 
 BASE_PLANNER_ALGORITHMS = ["a_star", "rrt", "rrt_star", "prm"]
-TASK_NAMES = ["in-and-out", "rotation", "empty"]
+TASK_NAMES = list(TASK_PRESETS)
 
 
 # CSV column header — must stay aligned with run_sim_v2.py:TRAJECTORY_CSV_COLUMNS.
@@ -128,46 +131,36 @@ def quat_from_y_deg(angle_deg: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Task presets
+# Task helpers (hardware-specific)
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class TaskPreset:
-    """Hardware task preset — coords match run_sim_v2.py for cross-domain comparison."""
+def _task_rotation_degs(
+    task: TaskPreset, env_config: EnvironmentConfig
+) -> List[float]:
+    """Return tool pitch (Y-axis rotation, degrees) for each goal in the task.
 
-    name: str
-    goals: Tuple[Tuple[float, float, float], ...]
-    rotations_deg: Tuple[float, ...]
-    labels: Tuple[str, ...]
-    use_wall_obstacle: bool = True
-
-
-def make_task_preset(task_name: str) -> TaskPreset:
-    if task_name == "in-and-out":
-        env = DEFAULT_ENV_CONFIG
-        return TaskPreset(
-            name="in-and-out",
-            goals=(tuple(env.point_a_pos), tuple(env.point_b_pos)),
-            rotations_deg=(env.point_a_rotation_deg, env.point_b_rotation_deg),
-            labels=("A_INSIDE", "B_OUTSIDE"),
-        )
-    if task_name == "rotation":
-        return TaskPreset(
-            name="rotation",
-            goals=((-0.55, 0.25, -0.035), (-0.55, -0.25, -0.06)),
-            rotations_deg=(0.0, 0.0),
-            labels=("A_INSIDE_BEHIND", "B_OUTSIDE_BEHIND"),
-        )
-    if task_name == "empty":
-        return TaskPreset(
-            name="empty",
-            goals=((-0.55, 0.25, -0.035), (-0.55, -0.25, -0.06)),
-            rotations_deg=(0.0, 0.0),
-            labels=("A_EMPTY_ROTATION", "B_EMPTY_ROTATION"),
-            use_wall_obstacle=False,
-        )
-    raise ValueError(f"Unsupported task preset: {task_name}")
+    Rotation is a hardware-only concept — the sim drives orientation via the
+    planner. Values are pulled from EnvironmentConfig per task so they stay
+    in sync with pathing_config.py. Tasks without explicit rotation fields
+    (e.g. ``empty``) default to 0.0 for every goal.
+    """
+    if task.name == "in-and-out":
+        return [
+            env_config.in_and_out_point_a_rotation_deg,
+            env_config.in_and_out_point_b_rotation_deg,
+        ]
+    if task.name == "xz-in-and-out":
+        return [
+            env_config.xz_point_a_rotation_deg,
+            env_config.xz_point_b_rotation_deg,
+        ]
+    if task.name == "rotation":
+        return [
+            env_config.rotation_point_a_rotation_deg,
+            env_config.rotation_point_b_rotation_deg,
+        ]
+    return [0.0] * len(task.goals)
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +215,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="Load obstacle list from a JSON file produced by run_sim_v2.py --dump-obstacles. "
-             "Replaces the default wall obstacle for the chosen task.",
+             "Replaces the default wall obstacle for the chosen task. "
+             "If omitted, auto-load <script_dir>/obstacles_<task>.json when it exists.",
     )
     parser.add_argument("--log", action="store_true", help="Write trajectory CSV + metrics.csv under logs_hw/.")
     parser.add_argument("--debug", action="store_true", help="Verbose logging from controller, hardware, and planning internals.")
     parser.add_argument("--debug-planning", action="store_true", help="Verbose planning logs only.")
     parser.add_argument("--control-config", type=str, default="configuration_files/control_config.yaml", help="Controller/IK/IMU config YAML path.")
-    parser.add_argument("--num-runs", type=int, default=None, metavar="N", help="Run N complete task sweeps, ending back at the first target.")
+    parser.add_argument("--num-runs", type=int, default=5, metavar="N", help="Run N complete task sweeps, ending back at the first target (default: 5 → 10 logged trajectories for a 2-target task).")
+    parser.add_argument(
+        "--radial-alpha",
+        type=float,
+        default=None,
+        metavar="A",
+        help="Override path_config.radial_compensation_alpha (e.g. 0.0, 0.4, 0.8, 1.0). Default: use value from pathing_config.py.",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=None,
+        metavar="MPS",
+        help="Override path_config.speed_mps in m/s (e.g. 0.015, 0.040, 0.070, 0.100). Default: use value from pathing_config.py.",
+    )
     parser.add_argument("--test", action="store_true", help="Direct A/B pose commands every 10s — no planner.")
     parser.add_argument("--rt-priority", type=int, default=75, help="RT priority for control loop (0=disable).")
     parser.add_argument("--imu-priority", type=int, default=70, help="RT priority for IMU thread (0=normal).")
@@ -342,7 +350,7 @@ def _build_obstacles_for_task(
     if obstacles_json_path:
         return _load_obstacles_json(obstacles_json_path)
 
-    if not task.use_wall_obstacle:
+    if not task.use_klt_obstacles:
         logger.info("[Obstacles] Task '%s' runs obstacle-free.", task.name)
         return []
 
@@ -750,6 +758,7 @@ class HardwareTrajectoryLogger:
             "dt": path_config.dt,
             "grid_resolution": path_config.grid_resolution,
             "safety_margin": path_config.safety_margin,
+            "radial_compensation_alpha": path_config.radial_compensation_alpha,
             "use_3d": path_config.use_3d,
             "final_target_tolerance": path_config.final_target_tolerance,
             "orientation_tolerance": path_config.orientation_tolerance,
@@ -800,6 +809,51 @@ class HardwareTrajectoryLogger:
             writer.writerow(metrics)
 
         logger.info("[Logger] Saved trajectory %d to %s", self.trajectory_counter, csv_path)
+
+
+# ---------------------------------------------------------------------------
+# Yaw-drift live correction helpers (mirrors test_yaw_drift.py)
+# ---------------------------------------------------------------------------
+
+
+def _read_yaw_live(hardware) -> Optional[float]:
+    base = hardware.read_base_imu()
+    if base is None or "quat" not in base:
+        return None
+    return _yaw_deg_from_quat(base["quat"])
+
+
+def _wrap_deg(a: float) -> float:
+    return (float(a) + 180.0) % 360.0 - 180.0
+
+
+def _yaw_velocity_dps(history: "deque") -> Optional[float]:
+    if len(history) < 2:
+        return None
+    t0, y0 = history[0]
+    t1, y1 = history[-1]
+    dt = t1 - t0
+    if dt < 0.05:
+        return None
+    return _wrap_deg(y1 - y0) / dt
+
+
+def _apply_live_yaw_correction(
+    hardware,
+    current_yaw: float,
+    *,
+    entering: bool,
+    moving_positive: bool,
+    band_half: float,
+) -> Tuple[float, float]:
+    """Shift base-yaw offset so current_yaw snaps to the expected edge position."""
+    sign = -1.0 if entering else 1.0
+    if not moving_positive:
+        sign = -sign
+    expected = sign * band_half
+    delta = current_yaw - expected
+    hardware.set_base_yaw_offset_deg(hardware.get_base_yaw_offset_deg() + delta)
+    return expected, delta
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +964,8 @@ def _execute_on_hardware(
     path_config: PathExecutionConfig,
     data_logger: Optional[HardwareTrajectoryLogger],
     enable_debug: bool,
+    hardware=None,
+    hall_cfg=None,
 ) -> Dict[str, Any]:
     path = trajectory.positions
     if path.shape[0] < 2:
@@ -941,6 +997,35 @@ def _execute_on_hardware(
     loop_period = 1.0 / update_frequency
     sim_dt = loop_period
 
+    # Live yaw-drift correction: active when hall_cfg has a calibrated band width.
+    _band_half = (hall_cfg.cached_band_width_deg or 0.0) / 2.0 if hall_cfg is not None else 0.0
+    _do_live_correct = hardware is not None and hall_cfg is not None and _band_half > 0.0
+    _yaw_history: deque = deque(maxlen=12)
+    _prev_hall_state: Optional[bool] = None
+    _live_corr_count = 0
+    _hall_ctx = (
+        HallReader(
+            gpio_pin=hall_cfg.gpio_pin,
+            active_high=hall_cfg.active_high,
+            pull_up=hall_cfg.pull_up,
+            gpio_chip=hall_cfg.gpio_chip,
+        ) if _do_live_correct else None
+    )
+    if _hall_ctx is not None:
+        _hall_ctx.__enter__()
+        logger.info("[YawCorr] Live Hall correction active (band_half=%.3fdeg).", _band_half)
+    elif hall_cfg is not None and _band_half == 0.0:
+        logger.info("[YawCorr] Live correction disabled: cached_band_width_deg not set in config. Run test_yaw_drift.py first.")
+    elif hall_cfg is None:
+        logger.info("[YawCorr] Live correction disabled: Hall sensor not configured.")
+
+    # Reset controller perf stats after Hall setup so GPIO open/claim overhead
+    # does not contaminate per-trajectory controller loop metrics.
+    try:
+        controller.reset_performance_stats()
+    except Exception:
+        pass
+
     t0 = time.perf_counter()
     next_run_time = t0
     last_debug_print = 0.0
@@ -951,6 +1036,33 @@ def _execute_on_hardware(
         elapsed = loop_start - t0
 
         ee_pos, ee_rot_y, joint_pos_rad, joint_vel_rad, cond, yoshikawa, sv = _read_controller_step(controller)
+
+        # Live Hall yaw-drift correction
+        if _do_live_correct and _hall_ctx is not None:
+            _yaw_live = _read_yaw_live(hardware)
+            if _yaw_live is not None:
+                _yaw_history.append((loop_start, _yaw_live))
+            _hall_state_now = bool(_hall_ctx.read())
+            if _prev_hall_state is not None and _hall_state_now != _prev_hall_state:
+                _vel = _yaw_velocity_dps(_yaw_history)
+                if _vel is not None and abs(_vel) > 0.3 and _yaw_live is not None:
+                    _moving_pos = _vel > 0.0
+                    _exp_yaw, _delta = _apply_live_yaw_correction(
+                        hardware, _yaw_live,
+                        entering=_hall_state_now,
+                        moving_positive=_moving_pos,
+                        band_half=_band_half,
+                    )
+                    _yaw_history.clear()
+                    _live_corr_count += 1
+                    logger.info(
+                        "[YawCorr #%d] %s dir=%s yaw=%+.3f expected=%+.3f delta=%+.3fdeg vel=%+.1fdps",
+                        _live_corr_count,
+                        "entry" if _hall_state_now else "exit",
+                        "+" if _moving_pos else "-",
+                        _yaw_live, _exp_yaw, _delta, _vel,
+                    )
+            _prev_hall_state = _hall_state_now
 
         if total_time > 1e-9:
             progress = min(elapsed / total_time, 1.0)
@@ -1041,6 +1153,12 @@ def _execute_on_hardware(
         perf_stats = controller.get_performance_stats() or {}
     except Exception:
         perf_stats = {}
+
+    if _hall_ctx is not None:
+        try:
+            _hall_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
     avg_ms = (perf_stats or {}).get("avg_loop_time_ms") or 0.0
     if avg_ms > 0.0:
         logger.info(
@@ -1124,7 +1242,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     env_config = DEFAULT_ENV_CONFIG
     path_config = DEFAULT_CONFIG
-    task = make_task_preset(args.task)
+    if args.radial_alpha is not None:
+        path_config.radial_compensation_alpha = float(args.radial_alpha)
+        logger.info("[Override] radial_compensation_alpha = %.3f", path_config.radial_compensation_alpha)
+    if args.speed is not None:
+        if args.speed <= 0.0:
+            raise SystemExit("--speed must be > 0")
+        path_config.speed_mps = float(args.speed)
+        logger.info("[Override] speed_mps = %.4f", path_config.speed_mps)
+    task = TASK_PRESETS[args.task]
 
     logger.info("=" * 60)
     logger.info("  HARDWARE PATH PLANNING RUNNER V2")
@@ -1134,9 +1260,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Control config: %s", args.control_config)
     logger.info("RT priorities: ctrl=%d, imu=%d", args.rt_priority, args.imu_priority)
 
+    rotation_degs = _task_rotation_degs(task, env_config)
     targets: List[Tuple[np.ndarray, float]] = [
         (np.asarray(g, dtype=np.float32), float(r))
-        for g, r in zip(task.goals, task.rotations_deg)
+        for g, r in zip(task.goals, rotation_degs)
     ]
     for i, (pos, rot) in enumerate(targets):
         logger.info(
@@ -1145,11 +1272,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             pos[0] * 1000.0, pos[1] * 1000.0, pos[2] * 1000.0, rot,
         )
 
+    # Auto-resolve obstacles.json from script dir if --obstacles-json not given:
+    # convention <_ROOT>/obstacles_<task>.json (matches run_sim_v2.py --dump-obstacles).
+    obstacles_json_path = args.obstacles_json
+    if obstacles_json_path is None:
+        auto_path = _ROOT / f"obstacles_{task.name}.json"
+        if auto_path.exists():
+            obstacles_json_path = str(auto_path)
+            logger.info("[Obstacles] Auto-loaded %s", auto_path.name)
+        else:
+            logger.info("[Obstacles] No --obstacles-json and %s not found; using wall fallback.", auto_path.name)
+
     obstacles = _build_obstacles_for_task(
-        task, env_config, obstacles_json_path=args.obstacles_json
+        task, env_config, obstacles_json_path=obstacles_json_path
     )
-    if args.obstacles_json:
-        obstacles_source = f"json:{os.path.basename(args.obstacles_json)}"
+    if obstacles_json_path:
+        obstacles_source = f"json:{os.path.basename(obstacles_json_path)}"
     elif obstacles:
         obstacles_source = "wall"
     else:
@@ -1265,11 +1403,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     data_logger: Optional[HardwareTrajectoryLogger] = None
     if args.log and not args.test:
         data_logger = HardwareTrajectoryLogger(algorithm_name=algorithm_log_name)
-        if args.obstacles_json:
+        if obstacles_json_path:
             import shutil
             try:
                 shutil.copy2(
-                    args.obstacles_json,
+                    obstacles_json_path,
                     os.path.join(data_logger.log_dir, "obstacles.json"),
                 )
                 logger.info("[Logger] Copied obstacles JSON into %s", data_logger.log_dir)
@@ -1354,6 +1492,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 path_config=path_config,
                 data_logger=data_logger,
                 enable_debug=bool(args.debug),
+                hardware=hardware,
+                hall_cfg=hall_cfg,
             )
 
             if data_logger is not None:
@@ -1374,9 +1514,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             final_rot_err = abs(float(final_rot) - goal_rot_y)
             logger.info("Final error: pos=%.1fmm rot=%.1fdeg", final_err * 1000.0, final_rot_err)
 
-            logger.info("Settling 5.0s before next planning cycle...")
-            time.sleep(5.0)
-
             target_index = (target_index + 1) % len(targets)
             if max_cycles is not None and cycle >= max_cycles:
                 logger.info(
@@ -1384,6 +1521,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     int(args.num_runs), cycle, task.labels[0],
                 )
                 break
+
+            logger.info("Settling 5.0s before next planning cycle...")
+            time.sleep(5.0)
 
     except KeyboardInterrupt:
         logger.info("\n\nKeyboardInterrupt — stopping.")

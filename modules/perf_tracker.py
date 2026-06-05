@@ -498,6 +498,17 @@ class ControlLoopPerfTracker:
             self._deadline_miss_1pct_count = 0
             self._compute_overrun_count = 0
 
+    def mark_gap(self) -> None:
+        """Drop the interval baseline so the next loop_start() doesn't record a gap.
+
+        Call before a known long idle period (e.g. pause, planning) so the
+        resume transition isn't logged as a multi-second loop interval.
+        """
+        if not self._enabled:
+            return
+        self._last_loop_start = None
+        self._current_loop_start = None
+
     def loop_start(self) -> None:
         """Call at the start of each control loop iteration."""
         if not self._enabled:
