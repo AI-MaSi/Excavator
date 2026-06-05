@@ -100,13 +100,12 @@ int main(void) {
     sleep_ms(250);
 
     const ScanTarget targets[] = {
-        {.label = "P28/P29", .inst = i2c0, .sda = 28, .scl = 29},
-        {.label = "P26/P27", .inst = i2c1, .sda = 26, .scl = 27},
-        {.label = "P6/P7", .inst = i2c1, .sda = 6, .scl = 7},
+        {.label = "P28/P29 (I2C0)", .inst = i2c0, .sda = 28, .scl = 29},
+        {.label = "P6/P7  (I2C1)", .inst = i2c1, .sda = 6, .scl = 7},
     };
 
     printf("\nI2C scan demo for Seeed XIAO RP2040\n");
-    printf("Scanning P28/P29, P26/P27, and P6/P7 once per second.\n");
+    printf("Scanning P28/P29 (I2C0) and P6/P7 (I2C1) once per second.\n");
 
     uint32_t iteration = 0;
     while (true) {
