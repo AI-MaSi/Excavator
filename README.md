@@ -1,5 +1,7 @@
 # Excavator
 
+(See the current proto-status here: [eetmie/kaivuriprokkis](https://github.com/eetmie/kaivuriprokkis))
+
 Hardware/IRL runner for the MASI RC excavator. The main entry point is
 `run_hw_v2.py`.
 
